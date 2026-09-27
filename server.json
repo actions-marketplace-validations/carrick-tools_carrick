@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.carrick-tools/carrick",
+  "title": "Carrick",
+  "description": "TypeScript codebase intelligence for AI agents and IDEs, across every service and repo.",
+  "version": "0.4.0",
+  "websiteUrl": "https://carrick.tools",
+  "repository": {
+    "url": "https://github.com/carrick-tools/carrick",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://api.carrick.tools/mcp"
+    }
+  ]
+}
