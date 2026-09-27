@@ -500,6 +500,9 @@ fn direction_cell(label: &str, dir: Option<&crate::cloud_storage::DirectionVerdi
         return format!("{label}: unverified");
     };
     let answer = match dir.verdict {
+        TypeVerdict::Compatible if dir.producer_wider => {
+            "compatible (producer type wider than it returns)".to_string()
+        }
         TypeVerdict::Compatible => "compatible".to_string(),
         TypeVerdict::Incompatible => format!(
             "**INCOMPATIBLE**: {}",
@@ -687,15 +690,21 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
 
     let type_checked: Vec<&_> = verified
         .iter()
-        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible))
+        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible) && !e.producer_wider)
         .collect();
     let unverifiable: Vec<&_> = verified
         .iter()
         .filter(|e| e.type_verdict == Some(TypeVerdict::Unverifiable))
         .collect();
+    // Compatible, and it agreed only on what the handler returns: its own
+    // section rather than a plain "Type-checked" (carrick#1516).
+    let producer_wider: Vec<&_> = verified
+        .iter()
+        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible) && e.producer_wider)
+        .collect();
     // Everything else: no verdict (not type-checked / non-HTTP) OR incompatible
-    // (already reported as a loud finding above; none of the three verified
-    // captions fit it, and "not compared" carries the least-wrong advice).
+    // (already reported as a loud finding above; none of the verified captions
+    // fit it, and "not compared" carries the least-wrong advice).
     let matched_only: Vec<&_> = verified
         .iter()
         .filter(|e| {
@@ -712,7 +721,7 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
 
     // No per-endpoint type verdicts anywhere: one table, structural claim only
     // — no compiler sentence for pairs nobody proved.
-    if type_checked.is_empty() && unverifiable.is_empty() {
+    if type_checked.is_empty() && unverifiable.is_empty() && producer_wider.is_empty() {
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for entry in verified {
             output.push_str(&format_verified_row(entry));
@@ -725,6 +734,11 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
         "Type-checked",
         "Request/response types were resolved and compared by the TypeScript compiler pass.",
         &type_checked,
+    ));
+    output.push_str(&format_verified_subsection(
+        "Producer type wider than it returns",
+        "The compiler pass compared these pairs. The producer's inferred type is wider than what its handler returns (TypeScript widened a literal it returns), and the consumer accepts every value the handler sends. Declaring the handler's return type removes the difference.",
+        &producer_wider,
     ));
     output.push_str(&format_verified_subsection(
         "Types not verifiable",
@@ -1443,6 +1457,7 @@ mod tests {
             resolved: true,
             unresolved_reason: None,
             notes: Vec::new(),
+            producer_wider: false,
         }
     }
 
@@ -1532,6 +1547,7 @@ mod tests {
             resolved: false,
             unresolved_reason: Some("the consumer type carries `any` at `<0>`".to_string()),
             notes: Vec::new(),
+            producer_wider: false,
         });
         let output = format_analysis_results(
             result_with_sdk(vec![edge], vec![]),
@@ -1888,6 +1904,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "POST".to_string(),
@@ -1895,6 +1912,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
         ];
 
@@ -1915,6 +1933,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "GET".to_string(),
@@ -1922,6 +1941,7 @@ mod tests {
                 provenance: EndpointProvenance::Mock,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
         ];
 
@@ -1974,6 +1994,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("Verified (1)"));
@@ -1991,6 +2012,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -2010,6 +2032,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -2040,6 +2063,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: verdict,
                 dispatch: None,
+                producer_wider: false,
             }
         };
         let mut result = result_with(vec![]);
@@ -2070,6 +2094,30 @@ mod tests {
             users_idx > type_checked_idx && refunds_idx > users_idx,
             "compatible row precedes the unverifiable row across buckets: {output}"
         );
+    }
+
+    /// carrick#1516: a pair whose producer type is wider than what its handler
+    /// returns is compared and is not a break, so it gets its own bucket, and
+    /// never "not compared".
+    #[test]
+    fn test_verified_section_gives_producer_wider_its_own_bucket() {
+        use crate::operation::TypeVerdict;
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![crate::analyzer::VerifiedEndpointEntry {
+            method: "GET".to_string(),
+            path: "/api/holidays".to_string(),
+            provenance: EndpointProvenance::Route,
+            type_verdict: Some(TypeVerdict::Compatible),
+            producer_wider: true,
+            dispatch: None,
+        }];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+        assert!(
+            output.contains("**Producer type wider than it returns (1)**"),
+            "output: {output}"
+        );
+        assert!(!output.contains("**Type-checked"), "output: {output}");
+        assert!(!output.contains("**Types not compared"), "output: {output}");
     }
 
     #[test]
@@ -2454,6 +2502,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 

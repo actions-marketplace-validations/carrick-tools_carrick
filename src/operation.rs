@@ -43,6 +43,12 @@ pub enum Protocol {
 /// `"unverifiable"`); the cloud PR-comment renderer keys the "Type-checked"
 /// and "Types not verifiable" buckets on the first and third, and treats any
 /// other value (including absent) as "Types not compared".
+///
+/// A NEW value here breaks every older scanner that reads a blob carrying it
+/// (no variant catches an unknown string, and one peer's blob failing to
+/// parse loses the whole cross-repo download). Say more about a verdict in an
+/// optional field beside it instead, as `DirectionVerdict::producer_wider`
+/// does (carrick#1516).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeVerdict {
