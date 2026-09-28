@@ -1,14 +1,14 @@
 # Carrick for VS Code
 
-**Carrick** puts the workspace index's verdicts inside your editor. It tracks cross-service routes and API calls, flags contracts that no longer hold, and gives one-click navigation between producers and consumers across repositories.
+**Carrick** puts the workspace index's verdicts inside your editor. It tracks cross-service routes and API calls, flags contracts that no longer hold, and gives one-click navigation between producers and consumers across services, in one repository or many.
 
 ---
 
 ## Features
 
 * **Diagnostics in the Problems panel.** Contract mismatches and route issues are published straight to the Problems panel. An editor-hosted agent (Cursor, Windsurf) reads that panel after its own edits, so a diagnostic reaches the agent without anyone writing a prompt.
-* **Cross-repo code lens.** A small count and contract status sits above each indexed route and call site. Clicking it lists the matching locations and jumps to one, across repositories. A row the index knows nothing about gets no lens: on a laptop index a missing consumer means "not indexed here", not "nobody calls this", so nothing ever says zero.
-* **Cross-repo definition and references.** *Go to Definition* on an API call jumps to the route handler that serves it in the other repo. On a route it lists every call site that reaches it.
+* **Cross-service code lens.** A small count and contract status sits above each indexed route and call site. Clicking it lists the matching locations and jumps to one, in any service. A row the index knows nothing about gets no lens: on a laptop index a missing consumer means "not indexed here", not "nobody calls this", so nothing ever says zero.
+* **Cross-service definition and references.** *Go to Definition* on an API call jumps to the route handler that serves it, in another service or another repository. On a route it lists every call site that reaches it.
 * **Boundary in the status bar.** Shows the indexed service and the commit the index was taken at. Hovering shows what that scan could not classify, so an empty Problems panel is readable.
 * **Editor compatibility.** Works in VS Code, Cursor, Windsurf and VSCodium. VS Code resolves it from the Visual Studio Marketplace; the others from Open VSX.
 
@@ -51,7 +51,7 @@ Each setting turns off its own surface and leaves the others standing. Changes t
 | --- | --- | --- |
 | `carrick.binary` | `""` (the `carrick` on `PATH`) | Path to the Carrick CLI the extension starts `lsp --stdio` on. |
 | `carrick.diagnostics` | `true` | Publish the workspace verdicts in the Problems panel. |
-| `carrick.definition` | `true` | Cross-repository *Go to Definition* between routes and their callers. |
+| `carrick.definition` | `true` | Cross-service *Go to Definition* between routes and their callers. |
 | `carrick.boundary` | `true` | The status bar item (service, commit) and its tooltip. |
 | `carrick.codeLens` | `true` | The lens above a route or call the index holds a counterpart or a mismatch for. |
 
