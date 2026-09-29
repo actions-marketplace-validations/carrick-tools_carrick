@@ -23,6 +23,9 @@ shape was first reported (cloud#386, carrick#588, carrick#872):
   follow a construction, so it never proves the method sends nothing.
 - `src/negatives.ts` holds calls shaped like requests that are not: a `get`
   on a `Map`, and a route registration.
+- `findSimilar` writes its `action` BEFORE spreading the caller's params
+  into the body, and `refresh` writes it AFTER. Both send their action; the
+  scanner states only the second (see Known gaps).
 
 ## The cassette
 
@@ -43,6 +46,7 @@ one the source writes.
 | `api-client.ts:129` | `POST /types/check-or-upload`, no action: the body is the caller's |
 | `api-client.ts:147` | `POST /types/check-or-upload {action=get-cross-repo-data}` |
 | `api-client.ts:163` | none: a presigned URL the source does not state |
+| `api-client.ts:171` | `POST /types/check-or-upload {action=refresh}`: written after the spread |
 | `tools/graph.ts:4` | `POST … {action=get-cross-repo-data}` |
 | `tools/check-compat.ts:4` | `POST … {action=get-cross-repo-data}` |
 | `tools/services.ts:4` | `POST … {action=get-cross-repo-data}` (two delegations) |
@@ -54,3 +58,20 @@ one the source writes.
 | `server.ts:13` | `POST … {action=get-cross-repo-data}` |
 | `server.ts:19` | the model's row, kept: `startPolling` constructs a `Poller`, whose constructor sends a request, so it is never proven to send nothing |
 | `negatives.ts`, `tools/misc.ts` | none |
+
+## Known gaps
+
+Rows the scanner states differently from the answer key above. The tests
+assert what the scanner states today and name the issue, so each gap is
+counted rather than hidden.
+
+| site | the scanner states | issue |
+|---|---|---|
+| `api-client.ts:103` | `POST /types/check-or-upload`, no action | #1585 |
+| `tools/find-similar.ts:4` | `POST …`, no action | #1585 |
+
+The body writes `action` and then spreads `params`. Only the declared type
+of `params` says the spread carries no `action`, and a type is not what the
+object holds at run time, so the scanner treats the spread as one that may
+overwrite the key. Whether to trust the declared type is the decision in
+#1585.

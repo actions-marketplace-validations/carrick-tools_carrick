@@ -117,9 +117,10 @@ struct FileDiscovery {
     import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
     function_definitions: HashMap<String, FunctionDefinition>,
     repo_name: String,
-    /// What each function's calls send, composed over the call graph
-    /// (carrick#1555).
-    request_summaries: crate::request_summary::RequestSummaryIndex,
+    /// What each function's calls send is composed from these over the call
+    /// graph (carrick#1555), once the service's library semantics are
+    /// verified ([`summarize_requests`], carrick#1564).
+    request_inputs: crate::request_summary::RequestSummaryInputs,
 }
 
 type FileDiscoveryResult = Result<FileDiscovery, Box<dyn std::error::Error>>;
@@ -750,7 +751,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             previous_generation(previous_generations, &repo_name, service)
         };
         match scan
-            .analyze(index, service, previous_data.as_ref(), &mut workspace_scan)
+            .analyze(
+                index,
+                service,
+                previous_data.as_ref(),
+                PreviousGeneration::Stored,
+                &mut workspace_scan,
+            )
             .await
         {
             Ok(run) => runs.push(run),
@@ -890,7 +897,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             // answer it holds replays, and only what it lacks is asked for.
             let this_run = runs[index].data.clone();
             match scan
-                .analyze(index, service, Some(&this_run), &mut workspace_scan)
+                .analyze(
+                    index,
+                    service,
+                    Some(&this_run),
+                    PreviousGeneration::ThisRun,
+                    &mut workspace_scan,
+                )
                 .await
             {
                 Ok(run) => runs[index] = run,
@@ -1648,6 +1661,7 @@ impl ServiceScan<'_> {
         index: usize,
         service: &Config,
         previous_data: Option<&CloudRepoData>,
+        generation: PreviousGeneration,
         workspace: &mut crate::external_call_candidates::WorkspaceScan,
     ) -> Result<ServiceRun, Box<dyn std::error::Error>> {
         // One line per service, at info, before the work starts. A scan of a
@@ -1689,6 +1703,7 @@ impl ServiceScan<'_> {
             &packages,
             self.sidecar,
             previous_data,
+            generation,
             workspace,
             self.run_intents,
             self.graphql_schemas,
@@ -2718,6 +2733,17 @@ fn reusable_model_answers(
         .collect()
 }
 
+/// Where a service's previous generation comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousGeneration {
+    /// The blob an earlier scan stored (or none at all).
+    Stored,
+    /// This run's own blob, re-entered to retry the work it still owes. What
+    /// it holds was asked for minutes ago, so nothing in it is asked again
+    /// for its own sake (carrick#1564: the library-semantics re-ask).
+    ThisRun,
+}
+
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
 #[allow(clippy::too_many_arguments)]
 async fn analyze_current_repo_incremental(
@@ -2726,6 +2752,7 @@ async fn analyze_current_repo_incremental(
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
+    generation: PreviousGeneration,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
@@ -2747,7 +2774,7 @@ async fn analyze_current_repo_incremental(
         import_facts: all_import_facts,
         function_definitions,
         repo_name,
-        request_summaries,
+        request_inputs,
     } = discover_files_and_symbols(repo_path, config, cm.clone())?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
@@ -2849,7 +2876,7 @@ async fn analyze_current_repo_incremental(
             // (cached or fresh — all three share the package_json_hash gate).
             // A fresh ask that fails defers this service's model analysis
             // instead of ending the run (see `model_setup`).
-            let setup = if crate::local_mode::no_model() {
+            let mut setup = if crate::local_mode::no_model() {
                 if !pkg_changed {
                     ModelSetup::ready(
                         prev.cached_detection.clone().unwrap_or_default(),
@@ -2873,16 +2900,51 @@ async fn analyze_current_repo_incremental(
                         .filter(|g| guidance_is_keyed(g)),
                 ) {
                     debug!("Reusing cached framework detection and guidance");
-                    // A missing cached config (older cache entry, or an earlier
-                    // failed generation) is regenerated on its own.
-                    let extraction = match &prev.cached_extraction_config {
-                        Some(config) => Some(config.clone()),
-                        None => {
-                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
-                            generate_extraction_config(&agent, det, packages).await
+                    match reask_client_semantics(
+                        det,
+                        generation,
+                        &service_scan_root(repo_path, config),
+                        Path::new(repo_path),
+                        || async {
+                            FrameworkDetector::new(reask_agent())
+                                .detect_frameworks_and_libraries(packages, &all_import_facts)
+                                .await
+                        },
+                        |notice| crate::progress::announce(&notice.line()),
+                    )
+                    .await
+                    {
+                        // The answer names other packages than the cached
+                        // one: everything keyed on those lists is asked
+                        // again, from the answer already in hand.
+                        Reask::Changed(fresh) => {
+                            debug!(
+                                "The detection asked again for its library semantics names other packages; asking for guidance again"
+                            );
+                            model_setup(
+                                packages,
+                                &all_import_facts,
+                                Some(SettledDetection {
+                                    detection: fresh,
+                                    extraction_config: None,
+                                }),
+                            )
+                            .await
                         }
-                    };
-                    ModelSetup::ready(det.clone(), guid.clone(), extraction)
+                        Reask::Kept(det) => {
+                            // A missing cached config (older cache entry, or an
+                            // earlier failed generation) is regenerated on its
+                            // own.
+                            let extraction = match &prev.cached_extraction_config {
+                                Some(config) => Some(config.clone()),
+                                None => {
+                                    let agent = FrameworkGuidanceAgent::new(AgentService::new());
+                                    generate_extraction_config(&agent, &det, packages).await
+                                }
+                            };
+                            ModelSetup::ready(det, guid.clone(), extraction)
+                        }
+                    }
                 } else {
                     // Something is missing: a first scan's cache entry, the
                     // service a previous scan deferred, or a blob whose
@@ -2905,15 +2967,28 @@ async fn analyze_current_repo_incremental(
                 debug!("package.json changed, re-running framework detection");
                 model_setup(packages, &all_import_facts, None).await
             };
+            // The in-scan schedule starts now, so it runs beside everything
+            // below (carrick#1564).
+            let settling = start_semantics_schedule(
+                &setup.detection,
+                semantics_schedule_applies(generation),
+                packages,
+                &all_import_facts,
+                &service_scan_root(repo_path, config),
+                Path::new(repo_path),
+            );
 
             // What this scan actually dispatches is decided per file inside the
             // orchestrator — a file with no cached answer still reaches the
             // model only if phase 1 raises a candidate for it — and it logs the
             // dispatched and replayed counts once it knows them.
             let agent_service = AgentService::new();
+            let (summaries_sender, summaries) = tokio::sync::oneshot::channel();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone())
                 .deferring_model(setup.deferred.is_some())
-                .with_request_summaries(request_summaries);
+                .with_request_summaries(crate::agents::file_orchestrator::SummarySource::later(
+                    summaries,
+                ));
 
             // Stage B2: GraphQL producer field-list from the service's SDL,
             // derived deterministically so the file-analyzer can emit
@@ -2954,22 +3029,36 @@ async fn analyze_current_repo_incremental(
             // no merge with the previous scan's rows below: this run states
             // them all, and a deleted file simply has no row.
             enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
-            let analysis = file_orchestrator
-                .analyze_files(
+            // The summaries are composed once the schedule started above has
+            // settled; the analysis reads them only once the model has been
+            // asked (carrick#1564).
+            let declared_dependencies = packages.declared_dependency_names();
+            let semantics_root = service_scan_root(repo_path, config);
+            let (analysis, settled) = tokio::join!(
+                file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
                     &setup.guidance,
                     &setup.detection,
                     &service_root,
                     Path::new(repo_path),
-                    &packages.declared_dependency_names(),
+                    &declared_dependencies,
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
                     &service_modules,
                     sidecar,
-                )
-                .await?;
+                ),
+                compose_summaries(
+                    &request_inputs,
+                    settling,
+                    sidecar,
+                    &semantics_root,
+                    summaries_sender,
+                ),
+            );
+            let analysis = analysis?;
+            setup.detection.client_semantics = settled;
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
             let merged_results = normalize_file_results_keys(&analysis.file_results, repo_path);
@@ -3280,7 +3369,7 @@ async fn analyze_current_repo_incremental(
             import_facts: all_import_facts,
             function_definitions,
             repo_name,
-            request_summaries,
+            request_inputs,
         },
         prev_intents,
         settled,
@@ -3294,6 +3383,87 @@ async fn analyze_current_repo_incremental(
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
 
     Ok(analysis)
+}
+
+/// What asking a cached detection again for its library semantics gave.
+#[derive(Debug)]
+enum Reask {
+    /// The detection to use with the cached guidance: the cached one, with
+    /// the new semantics when the ask answered.
+    Kept(DetectionResult),
+    /// The answer names other packages than the cached detection did.
+    Changed(DetectionResult),
+}
+
+/// Ask `/framework-detect` again for a cached detection that has no library
+/// semantics yet, or has one still `pending` (carrick#1564), when one of its
+/// data fetchers is installed and could verify an answer. This replaces a
+/// `CACHE_VERSION` bump, which would re-analyse every repo cold.
+///
+/// Best-effort: `ask` is one HTTP attempt ([`reask_agent`]) bounded by
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`], announced to the user
+/// through `notice` first, and made at most once a run, never when the
+/// cached detection is this run's own (a retry of owed work). A failure, or
+/// no answer in time, keeps the cached detection and never defers the
+/// service. When the answer names the same packages in all four lists, the
+/// cached guidance and extraction config stand and only the semantics are
+/// taken.
+async fn reask_client_semantics<Ask, AskFut>(
+    cached: &DetectionResult,
+    generation: PreviousGeneration,
+    service_root: &Path,
+    repo_root: &Path,
+    ask: Ask,
+    notice: impl FnOnce(crate::client_semantics::ScheduleNotice),
+) -> Reask
+where
+    Ask: FnOnce() -> AskFut,
+    AskFut: std::future::Future<Output = Result<DetectionResult, Box<dyn std::error::Error>>>,
+{
+    if crate::local_mode::no_model()
+        || generation == PreviousGeneration::ThisRun
+        || !crate::client_semantics::wants_reask(
+            cached.client_semantics.as_deref(),
+            &cached.data_fetchers,
+            service_root,
+            repo_root,
+        )
+    {
+        return Reask::Kept(cached.clone());
+    }
+    debug!("Asking framework detection again for this service's library semantics");
+    notice(crate::client_semantics::reask_notice(
+        cached.client_semantics.as_deref(),
+        &cached.data_fetchers,
+        service_root,
+        repo_root,
+    ));
+    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask()).await {
+        Ok(Ok(fresh)) if fresh.same_lists(cached) => Reask::Kept(DetectionResult {
+            client_semantics: fresh.client_semantics,
+            ..cached.clone()
+        }),
+        Ok(Ok(fresh)) => Reask::Changed(fresh),
+        // Nothing for the user to act on: the next scan asks again.
+        Ok(Err(error)) => {
+            debug!(
+                "Asking framework detection again for library semantics failed ({error}); keeping the cached detection"
+            );
+            Reask::Kept(cached.clone())
+        }
+        Err(_) => {
+            debug!(
+                "Asking framework detection again for library semantics ran out of time; keeping the cached detection"
+            );
+            Reask::Kept(cached.clone())
+        }
+    }
+}
+
+/// The client the library-semantics re-ask is sent with: one HTTP attempt,
+/// no retry, because a failure costs nothing the next scan does not fix.
+pub(crate) fn reask_agent() -> AgentService {
+    AgentService::new().with_retry_policy(crate::agent_service::RetryPolicy::ONCE)
 }
 
 /// A detection an earlier pass of this service already has, with the
@@ -5774,13 +5944,13 @@ fn discover_files_and_symbols(
     );
     report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
 
-    let request_summaries = crate::request_summary::summarize(&request_irs, &resolution.sites);
-    debug!(
-        "request summaries: {} row(s) at call sites, {} site(s) whose callee sends nothing, {} request(s) with no statable URL",
-        request_summaries.row_count(),
-        request_summaries.silent_count(),
-        request_summaries.undetermined
-    );
+    // Composed later, once the library semantics this service can use are
+    // verified: that needs detection and the service's sidecar, and both come
+    // after discovery (carrick#1564).
+    let request_inputs = crate::request_summary::RequestSummaryInputs {
+        files: request_irs,
+        sites: resolution.sites,
+    };
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
@@ -5794,8 +5964,225 @@ fn discover_files_and_symbols(
         import_facts: all_import_facts,
         function_definitions: all_function_definitions,
         repo_name,
-        request_summaries,
+        request_inputs,
     })
+}
+
+/// The service's request summaries (carrick#1555), composed with the library
+/// semantics its installed packages verify (carrick#1564).
+///
+/// Verification runs on every scan and is never cached: it reads
+/// `node_modules`, which the blob does not see. With no sidecar, no answered
+/// semantics, or a sidecar that fails, the semantics are empty and the
+/// summaries are exactly what they are without them.
+fn summarize_requests(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    entries: Option<&[crate::client_semantics::ClientSemanticsEntry]>,
+    sidecar: Option<&TypeSidecar>,
+    service_root: &Path,
+) -> crate::request_summary::RequestSummaryIndex {
+    let semantics = match (entries, sidecar) {
+        (Some(entries), Some(sidecar)) if !entries.is_empty() => {
+            crate::client_semantics::verify(sidecar, service_root, entries)
+        }
+        _ => crate::client_semantics::LibrarySemantics::default(),
+    };
+    let summaries = crate::request_summary::summarize(inputs, &semantics);
+    debug!(
+        "request summaries: {} row(s) at call sites ({} through library semantics), {} site(s) whose callee sends nothing, {} request(s) with no statable URL",
+        summaries.row_count(),
+        summaries.library_row_count(),
+        summaries.silent_count(),
+        summaries.undetermined
+    );
+    summaries
+}
+
+/// A service's library semantics while the in-scan schedule settles them
+/// (carrick#1564): known already, or being settled by a task that runs beside
+/// the file analysis from the moment the model setup is known.
+enum SettlingSemantics {
+    Known(Option<Vec<crate::client_semantics::ClientSemanticsEntry>>),
+    Settling {
+        task: ScheduleTask,
+        asked: Vec<crate::client_semantics::ClientSemanticsEntry>,
+    },
+}
+
+/// The spawned schedule, aborted when dropped: a scan that stops before it
+/// reads the summaries (interrupted, or failed) sends no further ask and
+/// prints no further line.
+struct ScheduleTask(tokio::task::JoinHandle<Vec<crate::client_semantics::ClientSemanticsEntry>>);
+
+impl Drop for ScheduleTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl SettlingSemantics {
+    /// The settled entries. A task that did not finish (it panicked, or the
+    /// runtime is shutting down) leaves what the first ask gave.
+    async fn settled(self) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+        match self {
+            Self::Known(entries) => entries,
+            Self::Settling { mut task, asked } => match (&mut task.0).await {
+                Ok(settled) => Some(settled),
+                Err(error) => {
+                    debug!(
+                        "The in-scan library-semantics schedule did not finish ({error}); keeping what the first ask gave"
+                    );
+                    Some(asked)
+                }
+            },
+        }
+    }
+}
+
+/// Start the in-scan schedule for `detection` where `schedule` holds and an
+/// installed package is still `pending`: every such package is asked about
+/// again on [`crate::client_semantics::settle_pending`]'s schedule, one HTTP
+/// attempt per ask, each bounded by
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An ask that fails, or
+/// answers different lists than the ones the guidance was built from,
+/// changes nothing; the next scan asks again.
+fn start_semantics_schedule(
+    detection: &DetectionResult,
+    schedule: bool,
+    packages: &Packages,
+    import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
+    service_root: &Path,
+    repo_root: &Path,
+) -> SettlingSemantics {
+    let Some(asked) = detection.client_semantics.clone() else {
+        return SettlingSemantics::Known(None);
+    };
+    if !schedule
+        || !crate::client_semantics::wants_reask(
+            Some(&asked),
+            &detection.data_fetchers,
+            service_root,
+            repo_root,
+        )
+    {
+        return SettlingSemantics::Known(Some(asked));
+    }
+    let detection = std::sync::Arc::new(detection.clone());
+    let packages = std::sync::Arc::new(packages.clone());
+    let import_facts = std::sync::Arc::new(import_facts.clone());
+    spawn_schedule(
+        asked,
+        crate::client_semantics::installed_for(service_root, repo_root),
+        crate::client_semantics::pending_reask_waits(),
+        move || {
+            let (detection, packages, import_facts) =
+                (detection.clone(), packages.clone(), import_facts.clone());
+            async move {
+                let detector = FrameworkDetector::new(reask_agent());
+                semantics_from_reask(
+                    detector.detect_frameworks_and_libraries(&packages, &import_facts),
+                    &detection,
+                )
+                .await
+            }
+        },
+        |notice| crate::progress::announce(&notice.line()),
+    )
+}
+
+/// Spawn [`crate::client_semantics::settle_pending`] over `asked`, so it runs
+/// beside the analysis whatever the analysis blocks on. Aborted when the
+/// returned value is dropped ([`ScheduleTask`]), and quiet about its own
+/// panics ([`crate::panic_report::quiet`]): the schedule is best effort, so
+/// a failure inside it keeps what the first ask gave and never reports the
+/// scan as failed.
+fn spawn_schedule<Ask, AskFut>(
+    asked: Vec<crate::client_semantics::ClientSemanticsEntry>,
+    installed: impl Fn(&str) -> bool + Send + Sync + 'static,
+    waits: Vec<std::time::Duration>,
+    ask: Ask,
+    notice: impl FnMut(crate::client_semantics::ScheduleNotice) + Send + 'static,
+) -> SettlingSemantics
+where
+    Ask: FnMut() -> AskFut + Send + 'static,
+    AskFut: std::future::Future<Output = Option<Vec<crate::client_semantics::ClientSemanticsEntry>>>
+        + Send,
+{
+    let entries = asked.clone();
+    let task = tokio::spawn(crate::panic_report::quiet(async move {
+        crate::client_semantics::settle_pending(
+            entries,
+            installed,
+            &waits,
+            ask,
+            tokio::time::sleep,
+            notice,
+        )
+        .await
+    }));
+    SettlingSemantics::Settling {
+        task: ScheduleTask(task),
+        asked,
+    }
+}
+
+/// Once the library semantics have settled, send the request summaries
+/// composed with them, and return the settled entries for the blob to keep.
+/// Runs alongside the file analysis, which reads the summaries only once the
+/// model has been asked. Always sends.
+async fn compose_summaries(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    settling: SettlingSemantics,
+    sidecar: Option<&TypeSidecar>,
+    service_root: &Path,
+    summaries: tokio::sync::oneshot::Sender<crate::request_summary::RequestSummaryIndex>,
+) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+    let settled = settling.settled().await;
+    let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
+    if summaries.send(index).is_err() {
+        debug!("The analysis ended before its request summaries were composed");
+    }
+    settled
+}
+
+/// The library semantics one in-scan re-ask gives: what `ask` answered, when
+/// it answered within [`crate::client_semantics::PENDING_REASK_TIMEOUT`] and
+/// named the same packages as `detection`, whose guidance the scan is using.
+/// Anything else gives nothing, and the next scan asks again.
+pub(crate) async fn semantics_from_reask<E: std::fmt::Display>(
+    ask: impl std::future::Future<Output = Result<DetectionResult, E>>,
+    detection: &DetectionResult,
+) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask).await {
+        Ok(Ok(fresh)) if fresh.same_lists(detection) => fresh.client_semantics,
+        Ok(Ok(_)) => {
+            debug!(
+                "Asking again for library semantics answered other packages; the next scan settles them"
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            debug!("Asking again for library semantics failed ({error})");
+            None
+        }
+        Err(_) => {
+            debug!("Asking again for library semantics ran out of time");
+            None
+        }
+    }
+}
+
+/// Whether the in-scan schedule may ask about library semantics: a model is
+/// in use, the run is not collecting prompts, and the service's previous
+/// generation is not this run's own (a retry of owed work asked minutes ago).
+///
+/// A service whose model stages were deferred needs no rule here: its setup
+/// carries the empty detection ([`ModelSetup::deferred`]), so there is
+/// nothing pending to settle (the `a_deferred_service_runs_no_schedule` test).
+fn semantics_schedule_applies(generation: PreviousGeneration) -> bool {
+    !crate::local_mode::no_model()
+        && generation == PreviousGeneration::Stored
+        && !crate::analysis_channel::dispatching()
 }
 
 /// Resolve a repo's `carrick.json` into one service config per service.
@@ -6596,7 +6983,7 @@ struct Discovered {
     import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
     function_definitions: HashMap<String, FunctionDefinition>,
     repo_name: String,
-    request_summaries: crate::request_summary::RequestSummaryIndex,
+    request_inputs: crate::request_summary::RequestSummaryInputs,
 }
 
 /// The full analysis of one service over its discovery.
@@ -6626,7 +7013,7 @@ async fn analyze_current_repo(
         import_facts: all_import_facts,
         function_definitions,
         repo_name,
-        request_summaries,
+        request_inputs,
     } = discovered;
     debug!(
         "Repository '{}': {} files, {} function definitions",
@@ -6651,6 +7038,30 @@ async fn analyze_current_repo(
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
 
+    // 3b. Settle the model stages for this service: detection and guidance
+    // (or a deferral), plus the extraction config. Local mode asks nothing.
+    let mut setup = if crate::local_mode::no_model() {
+        debug!("Local mode: skipping framework detection and guidance (no model)");
+        ModelSetup::ready(
+            DetectionResult::default(),
+            crate::local_mode::offline_guidance(),
+            None,
+        )
+    } else {
+        model_setup(packages, &all_import_facts, settled).await
+    };
+    // The in-scan schedule starts now, before the GraphQL hints below, so it
+    // runs beside everything up to the point the analysis reads the
+    // summaries (carrick#1564).
+    let settling = start_semantics_schedule(
+        &setup.detection,
+        semantics_schedule_applies(PreviousGeneration::Stored),
+        packages,
+        &all_import_facts,
+        &service_scan_root(repo_path, config),
+        Path::new(repo_path),
+    );
+
     // Stage B2: derive the GraphQL producer field-list from the service's SDL
     // (deterministic, cheap) so the file-analyzer can link resolver functions to
     // schema fields and emit `graphql_operations`. Empty (a no-op) for non-GraphQL
@@ -6671,41 +7082,44 @@ async fn analyze_current_repo(
         repo_path,
     );
 
-    // 3b. Settle the model stages for this service: detection and guidance
-    // (or a deferral), plus the extraction config. Local mode asks nothing.
-    let setup = if crate::local_mode::no_model() {
-        debug!("Local mode: skipping framework detection and guidance (no model)");
-        ModelSetup::ready(
-            DetectionResult::default(),
-            crate::local_mode::offline_guidance(),
-            None,
-        )
-    } else {
-        model_setup(packages, &all_import_facts, settled).await
-    };
-
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
     let service_root = service_scan_root(repo_path, config);
+    // Composed here rather than in discovery: the library semantics they read
+    // through exist only once detection has answered (carrick#1564).
+    let (summaries_sender, summaries) = tokio::sync::oneshot::channel();
     // One index for this service's join passes and, below, its type requests
     // and anchor stamps (carrick#1416).
     let service_modules = service_module_index(repo_path, config);
     enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
-    let analysis_result = orchestrator
-        .run_complete_analysis(
+    // The summaries are composed once the schedule started above has
+    // settled; the analysis reads them only once the model has been asked
+    // (carrick#1564).
+    let service_root_text = service_root.to_string_lossy().into_owned();
+    let (analysis_result, settled) = tokio::join!(
+        orchestrator.run_complete_analysis(
             files.clone(),
             packages,
             &setup,
-            &service_root.to_string_lossy(),
+            &service_root_text,
             Path::new(repo_path),
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
             &service_modules,
             sidecar,
-            request_summaries,
-        )
-        .await?;
+            crate::agents::file_orchestrator::SummarySource::later(summaries),
+        ),
+        compose_summaries(
+            &request_inputs,
+            settling,
+            sidecar,
+            &service_root,
+            summaries_sender,
+        ),
+    );
+    let analysis_result = analysis_result?;
+    setup.detection.client_semantics = settled;
     crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
     // 4b. Collect the function intents started after discovery. `Intents`
@@ -8746,6 +9160,7 @@ mod tests {
             // A second location on the same row (carrick#1402), written by a
             // join that reads the scan's own absolute paths.
             reaches_request: Some(abs("src/lib/search-client.ts:88")),
+            library_semantics: Vec::new(),
         });
 
         let mut function_definitions = HashMap::new();
@@ -9375,6 +9790,7 @@ mod tests {
                     dispatch: None,
                     reaches_request: None,
                     body_literals: Default::default(),
+                    library_semantics: Vec::new(),
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -9423,6 +9839,7 @@ mod tests {
                 dispatch: None,
                 role: None,
                 reaches_request: None,
+                library_semantics: Vec::new(),
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -9597,6 +10014,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -9933,6 +10351,7 @@ mod tests {
                     messaging_clients: vec![],
                     socket_clients: vec![],
                     notes: String::new(),
+                    client_semantics: None,
                 }),
                 cached_guidance: None,
                 cached_extraction_config: None,
@@ -10230,6 +10649,7 @@ mod tests {
                 messaging_clients: vec![],
                 socket_clients: vec![],
                 notes: "test".to_string(),
+                client_semantics: None,
             }),
             cached_guidance: None,
             cached_extraction_config: None,
@@ -10249,6 +10669,9 @@ mod tests {
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
+        // A detection never asked for library semantics writes no key for
+        // them (carrick#1564), so the blob is the shape it always was.
+        assert!(!json.contains("client_semantics"));
         let deserialized: CloudRepoData = serde_json::from_str(&json).expect("should deserialize");
 
         assert!(deserialized.file_results.is_some());
@@ -10257,14 +10680,42 @@ mod tests {
         assert_eq!(fr["src/app.ts"].endpoints[0].path, "/api/users");
 
         assert!(deserialized.cached_detection.is_some());
-        assert_eq!(
-            deserialized.cached_detection.unwrap().frameworks,
-            vec!["express"]
-        );
+        let cached = deserialized.cached_detection.unwrap();
+        assert_eq!(cached.frameworks, vec!["express"]);
+        assert_eq!(cached.client_semantics, None, "read back as never asked");
         assert_eq!(deserialized.cache_version, Some(CACHE_VERSION));
         assert_eq!(
             deserialized.package_json_hash,
             Some("abc123hash".to_string())
+        );
+    }
+
+    /// carrick#1564: the blob's `cached_detection` carries the library
+    /// semantics as detection answered them, pending and skipped entries
+    /// included, so the next scan can tell what is still unanswered.
+    #[test]
+    fn cached_detection_round_trips_its_library_semantics() {
+        let sample: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        let persisted = serde_json::to_value(&sample).unwrap();
+        let back: DetectionResult = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(back.client_semantics, sample.client_semantics);
+        let entries = back.client_semantics.unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.status).collect::<Vec<_>>(),
+            vec![
+                crate::client_semantics::SemanticsStatus::Answered,
+                crate::client_semantics::SemanticsStatus::Answered,
+                crate::client_semantics::SemanticsStatus::Pending,
+                crate::client_semantics::SemanticsStatus::Skipped,
+            ]
+        );
+        assert_eq!(
+            persisted["client_semantics"][3]["major"],
+            serde_json::Value::Null,
+            "an unknown major is written as null, as the wire writes it"
         );
     }
 
@@ -10426,6 +10877,7 @@ mod tests {
                 dispatch: None,
                 role: None,
                 reaches_request: None,
+                library_semantics: Vec::new(),
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -10444,6 +10896,7 @@ mod tests {
                 dispatch: None,
                 role: None,
                 reaches_request: None,
+                library_semantics: Vec::new(),
             },
         ];
 
@@ -10922,14 +11375,21 @@ mod tests {
         (dir, discovery)
     }
 
+    /// The summaries composed from discovery, with no library semantics.
+    fn summaries_of(discovery: &FileDiscovery) -> crate::request_summary::RequestSummaryIndex {
+        crate::request_summary::summarize(
+            &discovery.request_inputs,
+            &crate::client_semantics::LibrarySemantics::default(),
+        )
+    }
+
     /// The summary rows discovery states for `file`, flattened in site order.
     fn summary_rows_of(
         dir: &tempfile::TempDir,
         discovery: &FileDiscovery,
         file: &str,
     ) -> Vec<crate::request_summary::SummaryRow> {
-        discovery
-            .request_summaries
+        summaries_of(discovery)
             .rows(&dir.path().join(file))
             .map(|sites| sites.values().flatten().cloned().collect())
             .unwrap_or_default()
@@ -11021,8 +11481,7 @@ mod tests {
             ),
         ]);
 
-        let silent = discovery
-            .request_summaries
+        let silent = summaries_of(&discovery)
             .silent(&dir.path().join("src/use.ts"))
             .cloned()
             .unwrap_or_default();
@@ -11030,6 +11489,912 @@ mod tests {
             silent.len(),
             1,
             "only `bump()` is proven silent: {silent:?}"
+        );
+    }
+
+    /// The contract sample's semantics (carrick#1564), every claim verified.
+    fn verified_sample() -> crate::client_semantics::LibrarySemantics {
+        let detection: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .expect("the contract sample parses");
+        crate::client_semantics::LibrarySemantics::all_verified(
+            &detection.client_semantics.expect("the sample answers"),
+        )
+    }
+
+    /// Every row the summaries state for `file` with `semantics`.
+    fn library_rows_of(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+        semantics: &crate::client_semantics::LibrarySemantics,
+    ) -> Vec<crate::request_summary::SummaryRow> {
+        crate::request_summary::summarize(&discovery.request_inputs, semantics)
+            .rows(&dir.path().join(file))
+            .map(|sites| sites.values().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    const HTTP_CLIENT: &str = "import http from \"@fixture/http\";\n\
+        \n\
+        const api = http.create({ baseURL: \"/api/v1\" });\n\
+        const edge = http.create({ baseURL: process.env.EDGE_URL, timeout: 500 });\n\
+        \n\
+        export function listUsers() {\n\
+        \x20 return api.get(\"/users\");\n\
+        }\n\
+        \n\
+        export function createOrder() {\n\
+        \x20 return api.post(\"/orders\", { action: \"create\" });\n\
+        }\n\
+        \n\
+        export function ping() {\n\
+        \x20 return edge.get(\"health\");\n\
+        }\n\
+        \n\
+        export function send(path: string) {\n\
+        \x20 return api.get(path);\n\
+        }\n\
+        \n\
+        export function raw() {\n\
+        \x20 return http.request({ url: \"/raw\", method: \"post\", data: { op: \"sync\" } });\n\
+        }\n\
+        \n\
+        export function unstated() {\n\
+        \x20 return http({ url: \"/unstated\", data: { op: \"x\" } });\n\
+        }\n";
+
+    /// carrick#1564: a call through a verified client's instance states its
+    /// own row, with the base the factory was handed joined to the path, the
+    /// body read through the verified body claim, and the claims it used.
+    #[test]
+    fn a_verified_instance_joins_its_base_to_the_path_at_its_own_site() {
+        let (dir, discovery) = discover_sources(&[("src/api.ts", HTTP_CLIENT)]);
+        let rows = library_rows_of(&dir, &discovery, "src/api.ts", &verified_sample());
+        let at = |line: u32| -> Vec<&crate::request_summary::SummaryRow> {
+            rows.iter().filter(|row| row.line == line).collect()
+        };
+
+        let users = at(7);
+        assert_eq!(users.len(), 1, "{rows:#?}");
+        assert_eq!(users[0].method, "GET");
+        assert_eq!(users[0].target, "/api/v1/users");
+        assert!(
+            !users[0].own_site,
+            "claims the site over readings without the base"
+        );
+        assert_eq!(
+            users[0].library_semantics,
+            vec![
+                "@fixture/http@1:default:factory:create",
+                "@fixture/http@1:default:verb:get",
+            ]
+        );
+
+        let orders = at(11);
+        assert_eq!(orders.len(), 1, "{rows:#?}");
+        assert_eq!(orders[0].method, "POST");
+        assert_eq!(orders[0].target, "/api/v1/orders");
+        assert_eq!(
+            orders[0].body_literals.get("action").map(String::as_str),
+            Some("create")
+        );
+        assert!(
+            orders[0]
+                .library_semantics
+                .contains(&"@fixture/http@1:default:verb_body:post".to_string()),
+            "the body was read through its own claim: {:?}",
+            orders[0].library_semantics
+        );
+
+        // An opaque base leads, and a path with no slash of its own gets one.
+        let health = at(15);
+        assert_eq!(health.len(), 1, "{rows:#?}");
+        assert_eq!(health[0].target, "${process.env.EDGE_URL}/health");
+
+        // The client itself, handed a config: the method is the literal the
+        // config writes, upper-cased, and the body is its data.
+        let raw = at(23);
+        assert_eq!(raw.len(), 1, "{rows:#?}");
+        assert_eq!(
+            (raw[0].method.as_str(), raw[0].target.as_str()),
+            ("POST", "/raw")
+        );
+        assert_eq!(
+            raw[0].body_literals.get("op").map(String::as_str),
+            Some("sync")
+        );
+
+        // A config that writes no method states no row: a library's default
+        // is never assumed.
+        assert!(at(27).is_empty(), "{rows:#?}");
+        // A path the caller fills is stated where it is filled, not here.
+        assert!(at(19).is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#1564: a wrapper handed the path is stated at the call that
+    /// fills it, and a call through a declaration in another module reaches
+    /// the request line, both joined to the instance's base.
+    #[test]
+    fn a_library_request_composes_across_modules_like_any_other() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/api.ts", HTTP_CLIENT),
+            (
+                "src/use.ts",
+                "import { listUsers, send } from \"./api\";\n\nexport async function go() {\n  await listUsers();\n  return send(\"/teams\");\n}\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/use.ts", &verified_sample());
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        let through = rows.iter().find(|row| row.line == 4).expect("line 4");
+        assert_eq!(through.target, "/api/v1/users");
+        assert!(
+            through
+                .reaches_request
+                .as_deref()
+                .is_some_and(|site| site.ends_with("src/api.ts:7")),
+            "{through:#?}"
+        );
+        let filled = rows.iter().find(|row| row.line == 5).expect("line 5");
+        assert_eq!(
+            (filled.method.as_str(), filled.target.as_str()),
+            ("GET", "/api/v1/teams")
+        );
+        assert_eq!(filled.reaches_request, None, "this line states the request");
+        assert!(!filled.library_semantics.is_empty());
+    }
+
+    /// carrick#1564: the prefix-style client: a factory keyed on another
+    /// option, a path written without its leading slash, and the body under
+    /// the options' own key.
+    #[test]
+    fn a_prefix_style_instance_joins_with_one_slash_and_reads_its_body_key() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/jobs.ts",
+            "import client from \"fixture-prefix-http\";\n\nexport class Jobs {\n  private http = client.create({ prefixUrl: \"/svc/\" });\n\n  list() {\n    return this.http.get(\"jobs\");\n  }\n\n  run() {\n    return this.http.post(\"/jobs/run\", { json: { op: \"start\" }, retry: 2 });\n  }\n}\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/jobs.ts", &verified_sample());
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert_eq!(
+            (
+                rows[0].line,
+                rows[0].method.as_str(),
+                rows[0].target.as_str()
+            ),
+            (7, "GET", "/svc/jobs")
+        );
+        assert_eq!(
+            (
+                rows[1].line,
+                rows[1].method.as_str(),
+                rows[1].target.as_str()
+            ),
+            (11, "POST", "/svc/jobs/run")
+        );
+        assert_eq!(
+            rows[1].body_literals.get("op").map(String::as_str),
+            Some("start")
+        );
+    }
+
+    /// carrick#1564: what is not the client is never read as one. Without
+    /// semantics the client's own sites state nothing (the verb rule), a
+    /// `Map` built in place or bound to the client's name reaches no claim,
+    /// a field written twice holds no instance, and a factory handed
+    /// anything but one object literal builds nothing.
+    #[test]
+    fn nothing_but_the_named_client_reaches_a_claim() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/api.ts", HTTP_CLIENT),
+            (
+                "src/negatives.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const options = { baseURL: \"/opts\" };\n\
+                 const indirect = http.create(options);\n\
+                 \n\
+                 export function cached() {\n\
+                 \x20 return new Map<string, string>().get(\"/r\");\n\
+                 }\n\
+                 \n\
+                 export function viaOptions() {\n\
+                 \x20 return indirect.get(\"/indirect\");\n\
+                 }\n\
+                 \n\
+                 export class Moving {\n\
+                 \x20 private api = http.create({ baseURL: \"/one\" });\n\
+                 \x20 reset() {\n\
+                 \x20   this.api = http.create({ baseURL: \"/two\" });\n\
+                 \x20 }\n\
+                 \x20 load() {\n\
+                 \x20   return this.api.get(\"/moving\");\n\
+                 \x20 }\n\
+                 }\n",
+            ),
+            (
+                "src/shadow.ts",
+                "import http from \"@fixture/http\";\n\nexport function shadowed() {\n  const http = new Map<string, string>();\n  return http.get(\"/shadow\");\n}\n\nexport function looped(keys: string[]) {\n  for (const http of [new Map<string, string>()]) {\n    http.get(\"/loop\");\n  }\n}\n",
+            ),
+            // A block inside the function declares the instance's name again:
+            // nothing tracks which one a use means, so neither is read.
+            (
+                "src/block.ts",
+                "import http from \"@fixture/http\";\n\nexport function block() {\n  const api = http.create({ baseURL: \"/outer\" });\n  {\n    const api = new Map<string, string>();\n    api.get(\"/inner-map\");\n  }\n  return api.get(\"/outer-ok\");\n}\n",
+            ),
+        ]);
+        // Without verified semantics a verb call states no row at its own
+        // site; the config-object call at line 23 is a request by its own
+        // shape, as it always was, and none is read through a claim.
+        let unverified = crate::client_semantics::LibrarySemantics::default();
+        let plain = library_rows_of(&dir, &discovery, "src/api.ts", &unverified);
+        assert_eq!(
+            plain.iter().map(|row| row.line).collect::<Vec<_>>(),
+            vec![23],
+            "{plain:#?}"
+        );
+        assert!(plain.iter().all(|row| row.library_semantics.is_empty()));
+        for file in ["src/negatives.ts", "src/shadow.ts", "src/block.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+    }
+
+    /// carrick#1564 review, findings 1 and 3: wherever the source may set the
+    /// base itself, nothing is read through the client. A base key written
+    /// through the client after the factory ran, options open to a spread,
+    /// and an options or config object that names a base key or is open, all
+    /// leave the call as it reads without the semantics. The data a `(path,
+    /// body)` verb sends is not options, so a spread there changes nothing.
+    #[test]
+    fn a_base_the_source_may_set_elsewhere_reads_nothing_through_the_client() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/overrides.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             declare const overrides: { baseURL?: string };\n\
+             const api = http.create({ baseURL: \"/v1\" });\n\
+             const mutated = http.create({ baseURL: \"/v1\" });\n\
+             (mutated as any).defaults.baseURL = \"/v2\";\n\
+             const spread = http.create({ baseURL: \"/v1\", ...overrides });\n\
+             \n\
+             export function a() { return mutated.get(\"/mutated\"); }\n\
+             export function b() { return api.get(\"/users\", { baseURL: \"/override\" } as any); }\n\
+             export function c() { return http.get(\"/plain\", { baseURL: \"/elsewhere\" } as any); }\n\
+             export function d() { return spread.get(\"/spread\"); }\n\
+             export function e(cfg: object) { return http.request({ url: \"/cfg\", method: \"post\", ...cfg }); }\n\
+             export function f(d: unknown) { return api.post(\"/body\", d, { baseURL: \"/over\" } as any); }\n\
+             export function g(order: object) { return api.post(\"/orders\", { ...order, status: \"new\" }); }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/overrides.ts", &verified_sample());
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(15, "POST", "/v1/orders")],
+            "only the call whose body alone is spread reads through the client: {rows:#?}"
+        );
+        assert_eq!(
+            rows[0].body_literals.get("status").map(String::as_str),
+            Some("new"),
+            "a key written after the spread is the body's own"
+        );
+    }
+
+    /// carrick#1564 re-review, R1: a base key the factory options write after
+    /// every entry that could overwrite it is read, however open the options
+    /// are; one a later spread, a getter, a computed key or a disagreeing
+    /// conditional spread may overwrite is not. `cond && {…}` may spread
+    /// nothing, so the key it carries is not the only value the base can hold.
+    #[test]
+    fn a_base_written_after_everything_that_could_overwrite_it_is_read() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/options.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             declare const defaults: { timeout?: number };\n\
+             declare const a: object;\n\
+             declare const b: object;\n\
+             declare const prod: boolean;\n\
+             const KEY = \"baseURL\";\n\
+             const after = http.create({ ...defaults, baseURL: \"/after\" });\n\
+             const between = http.create({ ...a, baseURL: \"/between\", ...b });\n\
+             const cond = http.create({ baseURL: \"/dev\", ...(prod ? { baseURL: \"/prod\" } : {}) });\n\
+             const same = http.create({ baseURL: \"/x\", ...(prod ? { timeout: 1 } : { timeout: 2 }) });\n\
+             const agree = http.create({ ...(prod ? { baseURL: \"/same\" } : { baseURL: \"/same\" }) });\n\
+             const andSpread = http.create({ baseURL: \"/and\", ...(prod && { baseURL: \"/and-prod\" }) });\n\
+             const getter = http.create({ baseURL: \"/g1\", get baseURL() { return \"/g2\"; } } as any);\n\
+             const computed = http.create({ baseURL: \"/c1\", [KEY]: \"/c2\" });\n\
+             const strKey = http.create({ \"baseURL\": \"/s1\" });\n\
+             const methodProp = http.create({ baseURL: \"/m1\", timeout() { return 1; } } as any);\n\
+             \n\
+             export function n1() { return after.get(\"/stated\"); }\n\
+             export function n2() { return between.get(\"/between\"); }\n\
+             export function n3a() { return cond.get(\"/cond\"); }\n\
+             export function n3b() { return same.get(\"/keep\"); }\n\
+             export function n3c() { return agree.get(\"/agree\"); }\n\
+             export function n3d() { return andSpread.get(\"/and\"); }\n\
+             export function n4a() { return getter.get(\"/getter\"); }\n\
+             export function n4b() { return computed.get(\"/computed\"); }\n\
+             export function n4c() { return strKey.get(\"/string-key\"); }\n\
+             export function n4d() { return methodProp.get(\"/method-prop\"); }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/options.ts", &verified_sample());
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (19, "GET", "/after/stated"),
+                (22, "GET", "/x/keep"),
+                (23, "GET", "/same/agree"),
+                (27, "GET", "/s1/string-key"),
+                (28, "GET", "/m1/method-prop"),
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    /// carrick#1564 re-review, R6: a client binding the file uses for
+    /// anything but calls through it, or exporting it, holds no client: an
+    /// alias, an argument, a member read that is not called, or a write
+    /// through a function-local instance may each change its base. A write
+    /// through the export before the factory runs reaches the instance too.
+    /// In a static arrow property `this` is the class, which holds no
+    /// instance field.
+    #[test]
+    fn a_client_used_other_than_to_call_through_it_holds_no_client() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/uses.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/v1\" });\n\
+                 const defaults = (api as any).defaults;\n\
+                 defaults.baseURL = \"/v2\";\n\
+                 \n\
+                 const api2 = http.create({ baseURL: \"/w1\" });\n\
+                 Object.assign((api2 as any).defaults, { baseURL: \"/w2\" });\n\
+                 \n\
+                 const passed = http.create({ baseURL: \"/p1\" });\n\
+                 configure(passed);\n\
+                 \n\
+                 const kept = http.create({ baseURL: \"/kept\" });\n\
+                 export default kept;\n\
+                 \n\
+                 declare function configure(client: unknown): void;\n\
+                 \n\
+                 export function n8a() { return api.get(\"/alias-write\"); }\n\
+                 export function n8b() { return api2.get(\"/assign-write\"); }\n\
+                 export function passedOn() { return passed.get(\"/passed\"); }\n\
+                 export function exported() { return kept.get(\"/exported\"); }\n\
+                 \n\
+                 export function local() {\n\
+                 \x20 const scoped = http.create({ baseURL: \"/local\" });\n\
+                 \x20 scoped.defaults.baseURL = \"/elsewhere\";\n\
+                 \x20 return scoped.get(\"/local-write\");\n\
+                 }\n\
+                 \n\
+                 export class Holder {\n\
+                 \x20 private api = http.create({ baseURL: \"/inst\" });\n\
+                 \x20 static load = () => this.api.get(\"/static-arrow\");\n\
+                 \x20 run() { return this.api.get(\"/ran\"); }\n\
+                 }\n\
+                 \n\
+                 export class Retarget {\n\
+                 \x20 private svc = http.create({ baseURL: \"/dw\" });\n\
+                 \x20 retarget() { this.svc.defaults.baseURL = \"/elsewhere\"; }\n\
+                 \x20 list() { return this.svc.get(\"/dw-list\"); }\n\
+                 }\n\
+                 \n\
+                 const short = http.create({ baseURL: \"/short\" });\n\
+                 register({ short });\n\
+                 declare function register(clients: object): void;\n\
+                 export function viaShort() { return short.get(\"/shorthand\"); }\n\
+                 \n\
+                 const cjs = http.create({ baseURL: \"/cjs\" });\n\
+                 module.exports.cjs = cjs;\n\
+                 export function viaCjs() { return cjs.get(\"/commonjs\"); }\n\
+                 \n\
+                 const opt = http.create({ baseURL: \"/opt\" });\n\
+                 export function maybe() { return opt?.get(\"/optional\"); }\n\
+                 export function plainCall() { return opt.get(\"/plain-call\"); }\n",
+            ),
+            (
+                "src/export-defaults.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 http.defaults.baseURL = \"/configured\";\n\
+                 const built = http.create({ timeout: 5 });\n\
+                 \n\
+                 export function plain() { return http.get(\"/plain\"); }\n\
+                 export function fromBuilt() { return built.get(\"/built\"); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/uses.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (21, "/kept/exported"),
+                (32, "/inst/ran"),
+                (48, "/cjs/commonjs"),
+                (52, "/opt/plain-call"),
+            ],
+            "{rows:#?}"
+        );
+        let rows = library_rows_of(
+            &dir,
+            &discovery,
+            "src/export-defaults.ts",
+            &verified_sample(),
+        );
+        assert!(rows.is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#1564, third review: a call through an instance to a member
+    /// outside its verified surface may change its base, so the instance
+    /// holds no client; one that only calls verified verbs still does.
+    #[test]
+    fn a_call_outside_the_instance_surface_holds_no_client() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/surface.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             const setter = http.create({ baseURL: \"/r5\" });\n\
+             (setter as any).setBaseURL(\"/elsewhere\");\n\
+             const keyed = http.create({ baseURL: \"/keyed\" });\n\
+             declare const name: string;\n\
+             (keyed as any)[name]();\n\
+             const verbs = http.create({ baseURL: \"/verbs\" });\n\
+             \n\
+             export function r5() { return setter.get(\"/setter\"); }\n\
+             export function viaKey() { return keyed.get(\"/keyed-call\"); }\n\
+             export function other() { return verbs.post(\"/other\", {}); }\n\
+             export function viaVerbs() { return verbs.get(\"/verbs-only\"); }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/surface.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(12, "/verbs/other"), (13, "/verbs/verbs-only")],
+            "{rows:#?}"
+        );
+    }
+
+    /// carrick#1564, third review: an object constant the file writes
+    /// through holds keys its literal does not state, read directly as well
+    /// as spread. A clean constant still states its keys.
+    #[test]
+    fn a_constant_the_file_writes_through_states_no_key_read_directly() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/direct.ts",
+            "const U1 = \"/api/p1\";\n\
+             const U4 = \"/api/p4\";\n\
+             const U6 = \"/api/p6\";\n\
+             const U7 = \"/api/p7\";\n\
+             const WRITTEN = { method: \"POST\" };\n\
+             WRITTEN.method = \"PUT\";\n\
+             const CLEAN = { method: \"PATCH\" };\n\
+             const NOMETHOD = { headers: { a: \"b\" } };\n\
+             const READ = { method: \"POST\" };\n\
+             delete (READ as any).method;\n\
+             \n\
+             export function p1() { return fetch(U1, WRITTEN); }\n\
+             export function p4() { return fetch(U4, CLEAN); }\n\
+             export function p6() { return fetch(U6, NOMETHOD); }\n\
+             export function p7() { return fetch(U7, { method: READ.method }); }\n",
+        )]);
+        let rows = summary_rows_of(&dir, &discovery, "src/direct.ts");
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(13, "PATCH", "/api/p4"), (14, "GET", "/api/p6")],
+            "{rows:#?}"
+        );
+    }
+
+    /// carrick#1564 re-review, R2: a spread of a constant puts in place
+    /// exactly the keys its object literal writes only while the file never
+    /// writes through it, passes it to a call or aliases it; otherwise it may
+    /// hold any key, on the library path and in a plain request alike.
+    #[test]
+    fn a_spread_constant_the_file_can_change_states_no_key() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/library.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 declare const prod: boolean;\n\
+                 const overrides: { baseURL?: string } = {};\n\
+                 if (prod) {\n\
+                 \x20 overrides.baseURL = \"/prod\";\n\
+                 }\n\
+                 const api = http.create({ baseURL: \"/dev\", ...overrides });\n\
+                 const FIXED = { timeout: 5 };\n\
+                 const fixed = http.create({ baseURL: \"/fixed\", ...FIXED });\n\
+                 \n\
+                 export function n7() { return api.get(\"/mutated-const\"); }\n\
+                 export function kept() { return fixed.get(\"/kept\"); }\n",
+            ),
+            (
+                "src/plain.ts",
+                "const KNOWN = \"/api/known\";\n\
+                 const SENT_URL = \"/api/sent\";\n\
+                 const ALIASED_URL = \"/api/aliased\";\n\
+                 const WRITTEN_URL = \"/api/written\";\n\
+                 const OPTS = { method: \"POST\" };\n\
+                 const SENT = { method: \"PUT\" };\n\
+                 const ALIASED = { method: \"PATCH\" };\n\
+                 const WRITTEN = { method: \"DELETE\" };\n\
+                 const alias = ALIASED;\n\
+                 WRITTEN.method = \"GET\";\n\
+                 declare function prepare(init: object): void;\n\
+                 prepare(SENT);\n\
+                 \n\
+                 export function known() { return fetch(KNOWN, { ...OPTS }); }\n\
+                 export function sent() { return fetch(SENT_URL, { ...SENT }); }\n\
+                 export function aliased() { return fetch(ALIASED_URL, { ...ALIASED }); }\n\
+                 export function written() { return fetch(WRITTEN_URL, { ...WRITTEN }); }\n\
+                 \n\
+                 const DELETED_URL = \"/api/deleted\";\n\
+                 const BUMPED_URL = \"/api/bumped\";\n\
+                 const TAKEN_URL = \"/api/taken\";\n\
+                 const SHADOWED_URL = \"/api/shadowed\";\n\
+                 const DELETED = { method: \"POST\", count: 1 };\n\
+                 const BUMPED = { method: \"POST\", count: 1 };\n\
+                 const TAKEN = { method: \"POST\" };\n\
+                 const SHADOWED = { method: \"POST\" };\n\
+                 delete (DELETED as any).method;\n\
+                 BUMPED.count++;\n\
+                 declare const source: { method: string };\n\
+                 ({ method: TAKEN.method } = source);\n\
+                 export function deleted() { return fetch(DELETED_URL, { ...DELETED }); }\n\
+                 export function bumped() { return fetch(BUMPED_URL, { ...BUMPED }); }\n\
+                 export function taken() { return fetch(TAKEN_URL, { ...TAKEN }); }\n\
+                 export function shadowed() {\n\
+                 \x20 let SHADOWED = { method: \"PUT\" };\n\
+                 \x20 return fetch(SHADOWED_URL, { ...SHADOWED });\n\
+                 }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/library.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(stated, vec![(13, "/fixed/kept")], "{rows:#?}");
+
+        let rows = summary_rows_of(&dir, &discovery, "src/plain.ts");
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(stated, vec![(14, "POST", "/api/known")], "{rows:#?}");
+    }
+
+    /// carrick#1564 review, findings 2 and 4 on the library path: a field a
+    /// constructor branch writes again, a field a subclass in the file
+    /// declares again, and a static member reading `this` hold no instance;
+    /// an instance field read by an instance method still does.
+    #[test]
+    fn a_field_written_twice_or_read_statically_holds_no_client() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/fields.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             export class Gateway {\n\
+             \x20 private api;\n\
+             \x20 constructor(beta: boolean) {\n\
+             \x20   this.api = http.create({ baseURL: \"/stable\" });\n\
+             \x20   if (beta) {\n\
+             \x20     this.api = http.create({ baseURL: \"/beta\" });\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 list() { return this.api.get(\"/items\"); }\n\
+             }\n\
+             \n\
+             export class Both {\n\
+             \x20 static api = http.create({ baseURL: \"/static\" });\n\
+             \x20 api = http.create({ baseURL: \"/instance\" });\n\
+             \x20 static load() { return this.api.get(\"/loaded\"); }\n\
+             \x20 run() { return this.api.get(\"/ran\"); }\n\
+             }\n\
+             \n\
+             export class BaseApi {\n\
+             \x20 protected api = http.create({ baseURL: \"/default\" });\n\
+             \x20 list() { return this.api.get(\"/items\"); }\n\
+             }\n\
+             \n\
+             export class UsersApi extends BaseApi {\n\
+             \x20 protected api = http.create({ baseURL: \"/users-svc\" });\n\
+             }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/fields.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(stated, vec![(18, "/instance/ran")], "{rows:#?}");
+    }
+
+    /// The review's Phase 1 shapes with no library at all (carrick#1564
+    /// review, findings 1 and 2, in code carrick#1555 shipped): a method or a
+    /// body key written before a spread the source cannot read, a URL field
+    /// a constructor branch writes again, a URL field a subclass redeclares,
+    /// and a static method reading `this.url`. None states a row, while a key
+    /// written after a spread, and a spread whose keys the source states,
+    /// keep theirs.
+    #[test]
+    fn a_value_the_source_may_overwrite_states_nothing_in_a_request_summary() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/phase1.ts",
+            "const BASE = process.env.API_URL;\n\
+             \n\
+             export class Sender {\n\
+             \x20 private url = `${BASE}/rpc`;\n\
+             \x20 before(opts: object) { return fetch(this.url, { method: \"POST\", ...opts }); }\n\
+             \x20 after(opts: object) { return fetch(this.url, { ...opts, method: \"PUT\" }); }\n\
+             \x20 body(extra: object) {\n\
+             \x20   return fetch(this.url, { method: \"POST\", body: JSON.stringify({ action: \"sync\", ...extra }) });\n\
+             \x20 }\n\
+             \x20 known(flag: boolean) {\n\
+             \x20   return fetch(this.url, { method: \"POST\", body: JSON.stringify({ action: \"poll\", ...(flag ? { limit: 1 } : {}) }) });\n\
+             \x20 }\n\
+             \x20 spreadOnly(opts: object) { return fetch(this.url, { ...opts }); }\n\
+             }\n\
+             \n\
+             export class Branchy {\n\
+             \x20 private url: string;\n\
+             \x20 constructor(beta: boolean) {\n\
+             \x20   this.url = `${BASE}/v1/items`;\n\
+             \x20   if (beta) {\n\
+             \x20     this.url = `${BASE}/beta/items`;\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 list() { return fetch(this.url, { method: \"GET\" }); }\n\
+             }\n\
+             \n\
+             export class Parent {\n\
+             \x20 protected url = `${BASE}/parent/items`;\n\
+             \x20 list() { return fetch(this.url, { method: \"GET\" }); }\n\
+             }\n\
+             \n\
+             export class Child extends Parent {\n\
+             \x20 protected url = `${BASE}/child/items`;\n\
+             }\n\
+             \n\
+             export class Statics {\n\
+             \x20 url = `${BASE}/instance/items`;\n\
+             \x20 static load() { return fetch(this.url, { method: \"GET\" }); }\n\
+             }\n",
+        )]);
+        let rows = summary_rows_of(&dir, &discovery, "src/phase1.ts");
+        let stated: Vec<(u32, &str, &str, Option<&str>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.line,
+                    row.method.as_str(),
+                    row.target.as_str(),
+                    row.body_literals.get("action").map(String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (6, "PUT", "${process.env.API_URL}/rpc", None),
+                (8, "POST", "${process.env.API_URL}/rpc", None),
+                (11, "POST", "${process.env.API_URL}/rpc", Some("poll")),
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    /// The contract sample's entries: `fixture-slow-http` pending.
+    fn sample_entries() -> Vec<crate::client_semantics::ClientSemanticsEntry> {
+        let detection: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        detection.client_semantics.unwrap()
+    }
+
+    /// carrick#1564, third review: a scan that stops before it reads the
+    /// summaries drops the schedule, and the dropped schedule sends no
+    /// further ask and prints no further line.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_schedule_asks_nothing_further() {
+        let asks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (counted, printed) = (asks.clone(), lines.clone());
+        let settling = spawn_schedule(
+            sample_entries(),
+            |_| true,
+            crate::client_semantics::PENDING_REASK_WAITS.to_vec(),
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { None }
+            },
+            move |notice| printed.lock().unwrap().push(notice.line()),
+        );
+        // The task prints its first line and sleeps out the first wait.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(lines.lock().unwrap().len(), 1, "the schedule started");
+        drop(settling);
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            lines.lock().unwrap().len(),
+            1,
+            "{:?}",
+            lines.lock().unwrap()
+        );
+    }
+
+    fn broken_ask() -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+        panic!("the schedule broke")
+    }
+
+    /// carrick#1564, third review: a panic inside the schedule is the
+    /// schedule's own. It is raised inside a quiet poll, which the
+    /// process-wide hook neither reports as the scan failing nor prints
+    /// (`tests/panic_hook_test.rs` proves that half), and the scan keeps what
+    /// the first ask gave.
+    #[tokio::test]
+    async fn a_panic_in_the_schedule_is_quiet_and_keeps_the_first_answer() {
+        let quiet = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = quiet.clone();
+        let asked = sample_entries();
+        let settling = spawn_schedule(
+            asked.clone(),
+            |_| true,
+            vec![std::time::Duration::ZERO; 2],
+            move || {
+                seen.store(
+                    crate::panic_report::in_quiet_poll(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                async { broken_ask() }
+            },
+            |_| {},
+        );
+        assert_eq!(settling.settled().await, Some(asked));
+        assert!(
+            quiet.load(std::sync::atomic::Ordering::SeqCst),
+            "the ask ran inside a quiet poll"
+        );
+    }
+
+    /// carrick#1564 re-review, R4: the first re-ask, made before the analysis
+    /// for a stored detection, tells the user what it waits for and how long,
+    /// and gives up after `PENDING_REASK_TIMEOUT`, keeping the stored
+    /// detection. A detection never asked names the libraries it describes.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_reask_says_what_it_waits_for_and_gives_up_in_time() {
+        let root = tempfile::tempdir().unwrap();
+        for package in ["fixture-slow-http", "@fixture/http"] {
+            let manifest = root
+                .path()
+                .join("node_modules")
+                .join(package)
+                .join("package.json");
+            std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+            std::fs::write(&manifest, "{}").unwrap();
+        }
+        let cached: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        let never_answers =
+            || std::future::pending::<Result<DetectionResult, Box<dyn std::error::Error>>>();
+
+        let mut lines = Vec::new();
+        let started = tokio::time::Instant::now();
+        let reask = tokio::time::timeout(
+            crate::client_semantics::PENDING_REASK_TIMEOUT * 2,
+            reask_client_semantics(
+                &cached,
+                PreviousGeneration::Stored,
+                root.path(),
+                root.path(),
+                never_answers,
+                |notice| lines.push(notice.line()),
+            ),
+        )
+        .await
+        .expect("the re-ask gives up within its bound");
+        assert_eq!(
+            started.elapsed(),
+            crate::client_semantics::PENDING_REASK_TIMEOUT
+        );
+        let Reask::Kept(kept) = reask else {
+            panic!("an unanswered re-ask keeps the stored detection");
+        };
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
+            serde_json::to_value(&cached).unwrap()
+        );
+        assert_eq!(
+            lines,
+            vec!["1 of 3 client libraries still being described, waiting up to 30 s"]
+        );
+
+        let never_asked = DetectionResult {
+            client_semantics: None,
+            ..cached.clone()
+        };
+        let mut lines = Vec::new();
+        let _ = tokio::time::timeout(
+            crate::client_semantics::PENDING_REASK_TIMEOUT * 2,
+            reask_client_semantics(
+                &never_asked,
+                PreviousGeneration::Stored,
+                root.path(),
+                root.path(),
+                never_answers,
+                |notice| lines.push(notice.line()),
+            ),
+        )
+        .await
+        .expect("the re-ask gives up within its bound");
+        assert_eq!(
+            lines,
+            vec!["2 client libraries being described, waiting up to 30 s"]
+        );
+    }
+
+    /// carrick#1564: an instance is read only when its factory's own claim
+    /// verified, whatever the instance's other claims came back as; the
+    /// export's claims stand on their own.
+    #[test]
+    fn an_instance_whose_factory_did_not_verify_states_nothing() {
+        let detection: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        let entries = detection.client_semantics.unwrap();
+        let derived = crate::client_semantics::derive_claims(&entries);
+        let results: Vec<crate::services::type_sidecar::SemanticsResult> = derived
+            .checks()
+            .into_iter()
+            .map(|check| crate::services::type_sidecar::SemanticsResult {
+                verdict: if check.claim_id.ends_with(":factory:create") {
+                    crate::services::type_sidecar::SemanticsVerdict::Failed
+                } else {
+                    crate::services::type_sidecar::SemanticsVerdict::Verified
+                },
+                reason: None,
+                claim_id: check.claim_id,
+                receiver: check.receiver,
+            })
+            .collect();
+        let semantics =
+            crate::client_semantics::LibrarySemantics::from_verdicts(&derived, &results);
+
+        let (dir, discovery) = discover_sources(&[("src/api.ts", HTTP_CLIENT)]);
+        let rows = library_rows_of(&dir, &discovery, "src/api.ts", &semantics);
+        let lines: Vec<u32> = rows.iter().map(|row| row.line).collect();
+        assert_eq!(
+            lines,
+            vec![23],
+            "only the export's own request states a row: {rows:#?}"
         );
     }
 
@@ -11970,6 +13335,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }
     }
 
@@ -12030,6 +13396,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
