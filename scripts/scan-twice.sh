@@ -81,6 +81,7 @@ fixture_targets=(
   new-url-target
   nextjs-app
   nextjs-app-monorepo
+  payload-without-method
   pubsub-wrapper-monorepo
   remix-flat
   request-summary
@@ -92,6 +93,7 @@ fixture_targets=(
   socket-namespace-monorepo
   socket-service
   socket-type-alias-monorepo
+  spread-options-verb
   workspace-package-client
   xrepo-corpus-3
 )
