@@ -5855,6 +5855,9 @@ fn discover_files_and_symbols(
     // What each file's functions send, read while the module is in hand and
     // composed once call resolution has run (carrick#1555).
     let mut request_irs: HashMap<PathBuf, crate::request_summary::FileIr> = HashMap::new();
+    // The imports those summaries read the value of, per file keyed like
+    // `per_file_calls`: resolved by the call graph's own walk (carrick#1568).
+    let mut wanted_from: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
@@ -5882,14 +5885,14 @@ fn discover_files_and_symbols(
                 .keys()
                 .cloned()
                 .collect();
-            request_irs.insert(
-                file_path.clone(),
-                crate::request_summary::extract_file_ir(&module, &cm, &definition_keys),
-            );
+            let request_ir =
+                crate::request_summary::extract_file_ir(&module, &cm, &definition_keys);
 
             let canonical = file_path
                 .canonicalize()
                 .unwrap_or_else(|_| file_path.clone());
+            wanted_from.push((canonical.clone(), file_path.clone()));
+            request_irs.insert(file_path.clone(), request_ir);
             per_file_calls.insert(
                 canonical,
                 crate::call_graph::FileCallIndex {
@@ -5935,12 +5938,25 @@ fn discover_files_and_symbols(
             .as_ref()
             .map(|(directory, config)| (directory.as_path(), config.as_path())),
     );
+    // Every specifier matters only where some module holds an instance
+    // another may import: that is the only reading it can turn off.
+    let every_specifier = request_irs
+        .values()
+        .any(crate::request_summary::FileIr::holds_instances);
+    let bindings_wanted: HashMap<PathBuf, crate::call_graph::BindingsWanted> = wanted_from
+        .into_iter()
+        .map(|(canonical, walked)| {
+            let wanted = request_irs[&walked].bindings_wanted(every_specifier);
+            (canonical, wanted)
+        })
+        .collect();
     let resolution = crate::call_graph::resolve_call_edges(
         &mut all_function_definitions,
         &per_file_calls,
         &keys,
         &workspace,
         repo_root,
+        &bindings_wanted,
     );
     report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
 
@@ -5950,6 +5966,7 @@ fn discover_files_and_symbols(
     let request_inputs = crate::request_summary::RequestSummaryInputs {
         files: request_irs,
         sites: resolution.sites,
+        bindings: resolution.bindings,
     };
 
     debug!(
@@ -12004,6 +12021,1203 @@ mod tests {
             stated,
             vec![(13, "PATCH", "/api/p4"), (14, "GET", "/api/p6")],
             "{rows:#?}"
+        );
+    }
+
+    /// (line, method, target) of every library row the summaries state for
+    /// `file` with the contract sample verified.
+    fn library_stated(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+    ) -> Vec<(u32, String, String)> {
+        library_rows_of(dir, discovery, file, &verified_sample())
+            .into_iter()
+            .map(|row| {
+                assert!(
+                    !row.library_semantics.is_empty(),
+                    "{file}: only library rows are expected here: {row:#?}"
+                );
+                (row.line, row.method, row.target)
+            })
+            .collect()
+    }
+
+    fn stated(rows: &[(u32, &str, &str)]) -> Vec<(u32, String, String)> {
+        rows.iter()
+            .map(|(line, method, target)| (*line, method.to_string(), target.to_string()))
+            .collect()
+    }
+
+    /// The module the next tests import the instance from.
+    const SHARED_API: &str = "import http from \"@fixture/http\";\n\
+        \n\
+        export const api = http.create({ baseURL: \"/api/v1\" });\n\
+        \n\
+        export function health() { return api.get(\"/health\"); }\n";
+
+    /// carrick#1568: an instance one module builds and exports is the client
+    /// in every module that imports it, read with its declaring module's
+    /// options and claims.
+    #[test]
+    fn an_instance_imported_from_another_module_reads_through_its_declaration() {
+        let (dir, discovery) = discover_service(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+            (
+                "src/orders.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function createOrder() {\n\
+                 \x20 return api.post(\"/orders\", { action: \"create\" });\n\
+                 }\n",
+            ),
+        ]);
+        let users = library_rows_of(&dir, &discovery, "src/users.ts", &verified_sample());
+        assert_eq!(users.len(), 1, "{users:#?}");
+        assert_eq!(
+            (
+                users[0].line,
+                users[0].method.as_str(),
+                users[0].target.as_str()
+            ),
+            (3, "GET", "/api/v1/users")
+        );
+        assert_eq!(
+            users[0].library_semantics,
+            vec![
+                "@fixture/http@1:default:factory:create",
+                "@fixture/http@1:default:verb:get",
+            ]
+        );
+        assert!(!users[0].own_site, "claims the site like any library row");
+        let orders = library_rows_of(&dir, &discovery, "src/orders.ts", &verified_sample());
+        assert_eq!(orders.len(), 1, "{orders:#?}");
+        assert_eq!(
+            (
+                orders[0].line,
+                orders[0].method.as_str(),
+                orders[0].target.as_str()
+            ),
+            (4, "POST", "/api/v1/orders")
+        );
+        assert_eq!(
+            orders[0].body_literals.get("action").map(String::as_str),
+            Some("create")
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/lib/api.ts"),
+            stated(&[(5, "GET", "/api/v1/health")]),
+            "the declaring module still reads its own calls"
+        );
+    }
+
+    /// carrick#1568: the resolver's own hops carry the instance through a
+    /// barrel (`export { default as svc } from`, `export *`), a renaming
+    /// import, a default import of an anonymous `export default <factory>`,
+    /// an `export { client as name }`, and a module that re-exports a binding
+    /// it imports.
+    #[test]
+    fn an_instance_reached_through_a_barrel_a_rename_or_a_default_reads_through_it() {
+        let (dir, discovery) = discover_service(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/clients/svc.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export default http.create({ baseURL: \"/svc\" });\n",
+            ),
+            (
+                "src/clients/named.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const client = http.create({ baseURL: \"/named\" });\n\
+                 \n\
+                 export { client as namedClient };\n",
+            ),
+            (
+                "src/clients/index.ts",
+                "export { default as svc } from \"./svc\";\n\
+                 export * from \"./named\";\n",
+            ),
+            (
+                "src/reexport.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export { api };\n",
+            ),
+            (
+                "src/use.ts",
+                "import { svc, namedClient as nc } from \"./clients\";\n\
+                 import direct from \"./clients/svc\";\n\
+                 import { api as shared } from \"./reexport\";\n\
+                 \n\
+                 export const a = () => svc.get(\"/a\");\n\
+                 export const b = () => nc.get(\"/b\");\n\
+                 export const c = () => direct.get(\"/c\");\n\
+                 export const d = () => shared.get(\"/d\");\n",
+            ),
+        ]);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/use.ts"),
+            stated(&[
+                (5, "GET", "/svc/a"),
+                (6, "GET", "/named/b"),
+                (7, "GET", "/svc/c"),
+                (8, "GET", "/api/v1/d"),
+            ])
+        );
+    }
+
+    /// carrick#1568, must not resolve: wherever any module may change the
+    /// instance, or the export may not hold it, no module reads through it.
+    /// A write after the export, a write in a module that only imports it, a
+    /// call outside its verified surface or a hand-off in another importer,
+    /// `export let`, an export its own module contests, and one published
+    /// through `exports`.
+    #[test]
+    fn an_instance_any_module_may_change_reads_nothing_in_any_module() {
+        let importer = |from: &str, path: &str| {
+            format!(
+                "import {{ api }} from \"{from}\";\n\
+                 \n\
+                 export function call() {{ return api.get(\"{path}\"); }}\n"
+            )
+        };
+        let (dir, discovery) = discover_service(&[
+            // Written through after the export, in its own module.
+            (
+                "src/written/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/w\" });\n\
+                 (api as any).defaults.baseURL = \"/v2\";\n",
+            ),
+            ("src/written/use.ts", &importer("./api", "/written")),
+            // Written through in a module that never calls it: the
+            // declaring module's own call and the other importer's go too.
+            (
+                "src/elsewhere/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/e\" });\n\
+                 \n\
+                 export function own() { return api.get(\"/own\"); }\n",
+            ),
+            ("src/elsewhere/use.ts", &importer("./api", "/elsewhere")),
+            (
+                "src/elsewhere/configure.ts",
+                "import { api } from \"./api\";\n\
+                 \n\
+                 (api as any).defaults.baseURL = \"/v2\";\n",
+            ),
+            // A member outside the verified surface called by an importer.
+            (
+                "src/setter/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/s\" });\n",
+            ),
+            ("src/setter/use.ts", &importer("./api", "/setter")),
+            (
+                "src/setter/retarget.ts",
+                "import { api } from \"./api\";\n\
+                 \n\
+                 export function retarget() { (api as any).setBaseURL(\"/v2\"); }\n",
+            ),
+            // Handed to a helper by an importer.
+            (
+                "src/passed/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/p\" });\n",
+            ),
+            ("src/passed/use.ts", &importer("./api", "/passed")),
+            (
+                "src/passed/register.ts",
+                "import { api } from \"./api\";\n\
+                 \n\
+                 declare function register(client: unknown): void;\n\
+                 register(api);\n",
+            ),
+            // `export let`: the binding may hold something else by the time
+            // an importer calls through it.
+            (
+                "src/mutable/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export let api = http.create({ baseURL: \"/m\" });\n",
+            ),
+            ("src/mutable/use.ts", &importer("./api", "/mutable")),
+            // Contested in its defining module: the export's nested member.
+            (
+                "src/contested/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 (http as any).interceptors.request.use((c: unknown) => c);\n\
+                 export const api = http.create({ baseURL: \"/c\" });\n",
+            ),
+            ("src/contested/use.ts", &importer("./api", "/contested")),
+            // Published through `exports`, which a write anywhere in the
+            // module may replace.
+            (
+                "src/commonjs/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/cjs\" });\n\
+                 module.exports.api = api;\n\
+                 \n\
+                 export function own() { return api.get(\"/own\"); }\n",
+            ),
+            ("src/commonjs/use.ts", &importer("./api", "/commonjs")),
+        ]);
+        for file in [
+            "src/written/use.ts",
+            "src/elsewhere/api.ts",
+            "src/elsewhere/use.ts",
+            "src/setter/use.ts",
+            "src/passed/use.ts",
+            "src/mutable/use.ts",
+            "src/contested/use.ts",
+            "src/commonjs/use.ts",
+        ] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/commonjs/api.ts"),
+            stated(&[(6, "GET", "/cjs/own")]),
+            "a module publishing through `exports` still reads its own calls"
+        );
+    }
+
+    /// carrick#1568: a file that declares the imported name again anywhere
+    /// below module scope reads no call through it, since nothing says which
+    /// binding a use means; the other importers are unaffected.
+    #[test]
+    fn an_imported_name_declared_again_reads_nothing_in_that_file() {
+        let (dir, discovery) = discover_service(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/shadowed.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 interface Getter { get(path: string): unknown }\n\
+                 export function viaParam(api: Getter) { return api.get(\"/shadowed\"); }\n\
+                 export function viaImport() { return api.get(\"/import\"); }\n",
+            ),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/shadowed.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/users.ts"),
+            stated(&[(3, "GET", "/api/v1/users")])
+        );
+    }
+
+    /// carrick#1568, known gaps: a client reached through a namespace import
+    /// (`lib.api.get()`) is read through nothing, and reaching it that way
+    /// reads a member of the namespace that is not called, which may change
+    /// it: no module reads through it. Nor does a module outside the
+    /// service's own files, whose other importers the scan cannot see.
+    #[test]
+    fn a_client_reached_through_a_namespace_reads_nothing_anywhere() {
+        let (dir, discovery) = discover_service(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+            (
+                "src/namespace.ts",
+                "import * as lib from \"./lib/api\";\n\
+                 \n\
+                 export function viaNamespace() { return lib.api.get(\"/ns\"); }\n",
+            ),
+        ]);
+        for file in ["src/namespace.ts", "src/users.ts", "src/lib/api.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+
+        // A namespace only called through (`lib.health()`) changes nothing.
+        let (dir, discovery) = discover_service(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+            (
+                "src/namespace.ts",
+                "import * as lib from \"./lib/api\";\n\
+                 \n\
+                 export function ping() { return lib.health(); }\n",
+            ),
+        ]);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/users.ts"),
+            stated(&[(3, "GET", "/api/v1/users")])
+        );
+    }
+
+    /// carrick#1568: an `instanceof`, `typeof` or comparison read of the
+    /// export, or of an instance, keeps nothing of it and contests nothing
+    /// (the #1571 review's `r4b-instanceof.ts`). A nested member call, a read
+    /// handed on and a write still do.
+    #[test]
+    fn a_compared_read_of_a_client_contests_nothing() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/compared.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/r4b\" });\n\
+                 \n\
+                 export function isHttpError(e: unknown): boolean { return e instanceof (http as any).HttpError; }\n\
+                 export function kind(): string { return typeof http; }\n\
+                 export function same(other: unknown): boolean { return api === other || (api as any).defaults !== other; }\n\
+                 export function r4b(): unknown { return api.get(\"/instanceof\"); }\n",
+            ),
+            (
+                "src/nested.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/nested\" });\n\
+                 (api as any).interceptors.request.use((c: unknown) => c);\n\
+                 \n\
+                 export function nested(): unknown { return api.get(\"/nested\"); }\n",
+            ),
+            (
+                "src/handed.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/handed\" });\n\
+                 console.log(typeof api, (api as any).defaults);\n\
+                 \n\
+                 export function handed(): unknown { return api.get(\"/handed\"); }\n",
+            ),
+        ]);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/compared.ts"),
+            stated(&[(8, "GET", "/r4b/instanceof")])
+        );
+        for file in ["src/nested.ts", "src/handed.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+    }
+
+    /// A module that builds an instance for others to import, and one that
+    /// imports it and calls it, under `dir`.
+    fn api_and_reader(dir: &str, base: &str) -> [(String, String); 2] {
+        [
+            (
+                format!("src/{dir}/api.ts"),
+                format!(
+                    "import http from \"@fixture/http\";\n\
+                     export const api = http.create({{ baseURL: \"{base}\" }});\n\
+                     export function own() {{ return api.get(\"/own\"); }}\n"
+                ),
+            ),
+            (
+                format!("src/{dir}/reader.ts"),
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n"
+                    .to_string(),
+            ),
+        ]
+    }
+
+    /// The manifest a service using the contract sample's packages declares
+    /// them in. Without it they are undeclared packages, which name nothing
+    /// the scan can find and turn imported reading off (carrick#1568).
+    const SAMPLE_MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"fixture-prefix-http\": \"^2.1.0\" } }\n";
+
+    /// A tsconfig mapping `@/*` onto `src/`.
+    const PATHS_TSCONFIG: &str =
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"./src/*\"] } } }\n";
+
+    /// Discovery over `files`, owned strings, in a service whose manifest
+    /// declares the contract sample's packages unless `files` bring one.
+    fn discover_owned(files: &[(String, String)]) -> (tempfile::TempDir, FileDiscovery) {
+        let mut borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+        if !borrowed.iter().any(|(name, _)| *name == "package.json") {
+            borrowed.push(("package.json", SAMPLE_MANIFEST));
+        }
+        discover_sources(&borrowed)
+    }
+
+    /// [`discover_owned`] over borrowed sources.
+    fn discover_service(files: &[(&str, &str)]) -> (tempfile::TempDir, FileDiscovery) {
+        let owned: Vec<(String, String)> = files
+            .iter()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect();
+        discover_owned(&owned)
+    }
+
+    /// carrick#1568 fix round 1, F2: a module loaded other than through an
+    /// import binding may do anything to what it publishes, so every client
+    /// it publishes reads nothing, in its own module and in every importer:
+    /// `import()` inside a function or chained, `require` inline, inside a
+    /// function, bound by `let`, `var` or `export const`, a no-hole template
+    /// specifier, and a `require` a factory made (`req("./api")`). A
+    /// specifier the source computes names no module and contests nothing,
+    /// a stated limit.
+    #[test]
+    fn a_module_loaded_other_than_by_an_import_binding_contests_what_it_publishes() {
+        let loaders: [(&str, &str); 8] = [
+            (
+                "g01",
+                "export async function boot() {\n  const m = await import(\"./api\");\n  (m.api as any).defaults.baseURL = \"https://elsewhere.example\";\n}\n",
+            ),
+            (
+                "g02",
+                "import(\"./api\").then((m) => { (m.api as any).defaults.baseURL = \"https://elsewhere.example\"; });\nexport {};\n",
+            ),
+            (
+                "g03",
+                "declare const require: (s: string) => any;\nrequire(\"./api\").api.defaults.baseURL = \"https://elsewhere.example\";\nexport {};\n",
+            ),
+            (
+                "g04",
+                "declare const require: (s: string) => any;\nexport function setup() {\n  const { api } = require(\"./api\");\n  api.defaults.baseURL = \"https://elsewhere.example\";\n}\n",
+            ),
+            (
+                "g35",
+                "let { api } = require(\"./api\");\napi.defaults.baseURL = \"https://elsewhere.example\";\n",
+            ),
+            (
+                "g36",
+                "var m = require(\"./api\");\nm.api.defaults.baseURL = \"https://elsewhere.example\";\n",
+            ),
+            (
+                "g37",
+                "declare const require: (s: string) => any;\nexport const { api } = require(\"./api\");\napi.defaults.baseURL = \"https://elsewhere.example\";\n",
+            ),
+            (
+                "g41",
+                "export async function boot() {\n  const { api } = await import(`./api`);\n  api.defaults.baseURL = \"https://elsewhere.example\";\n}\n",
+            ),
+        ];
+        let mut files: Vec<(String, String)> = Vec::new();
+        for (dir, boot) in loaders {
+            files.extend(api_and_reader(dir, &format!("/{dir}")));
+            let extension = if dir == "g35" || dir == "g36" {
+                "js"
+            } else {
+                "ts"
+            };
+            files.push((format!("src/{dir}/boot.{extension}"), boot.to_string()));
+        }
+        files.extend(api_and_reader("g42", "/g42"));
+        files.push((
+            "src/g42/boot.ts".to_string(),
+            "import { createRequire } from \"module\";\nconst req = createRequire(import.meta.url);\nreq(\"./api\").api.defaults.baseURL = \"https://elsewhere.example\";\n".to_string(),
+        ));
+        // Bound by `let` and only called through: its uses are followed like
+        // an import's, so it takes nothing away.
+        files.extend(api_and_reader("letcalls", "/letcalls"));
+        files.push((
+            "src/letcalls/boot.js".to_string(),
+            "let { api } = require(\"./api\");\napi.get(\"/boot\");\n".to_string(),
+        ));
+        files.extend(api_and_reader("computed", "/computed"));
+        files.push((
+            "src/computed/boot.ts".to_string(),
+            "export async function boot(name: string) {\n  const m = await import(name);\n  m.api.defaults.baseURL = \"https://elsewhere.example\";\n}\n".to_string(),
+        ));
+        let (dir, discovery) = discover_owned(&files);
+        for case in [
+            "g01", "g02", "g03", "g04", "g35", "g36", "g37", "g41", "g42",
+        ] {
+            for file in ["api", "reader"] {
+                let path = format!("src/{case}/{file}.ts");
+                let rows = library_rows_of(&dir, &discovery, &path, &verified_sample());
+                assert!(rows.is_empty(), "{path}: {rows:#?}");
+            }
+        }
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/computed/reader.ts"),
+            stated(&[(2, "GET", "/computed/read")]),
+            "a computed specifier names no module (a stated limit)"
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/letcalls/reader.ts"),
+            stated(&[(2, "GET", "/letcalls/read")]),
+            "a require bound by `let` and only called through changes nothing"
+        );
+    }
+
+    /// carrick#1568 fix round 1, F2: where the resolver stops at a cap
+    /// before it can say what a use names (a re-export chain past its hop
+    /// limit, a module re-exporting a binding it imports past this pass's
+    /// own limit, an `export *` fan-out past its visit limit), the use may be
+    /// of any instance, so no import in the service reads through one. The
+    /// declaring modules still read their own calls, as they did before any
+    /// import was followed.
+    #[test]
+    fn a_use_the_resolver_cannot_follow_turns_imported_reading_off() {
+        let chain = |dir: &str, hop: &dyn Fn(usize) -> String| -> Vec<(String, String)> {
+            let mut files: Vec<(String, String)> = api_and_reader(dir, &format!("/{dir}")).into();
+            for n in 1..=10 {
+                files.push((format!("src/{dir}/h{n}.ts"), hop(n)));
+            }
+            files.push((
+                format!("src/{dir}/boot.ts"),
+                "import { api } from \"./h10\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n".to_string(),
+            ));
+            files
+        };
+        let from = |n: usize| {
+            if n == 1 {
+                "./api".to_string()
+            } else {
+                format!("./h{}", n - 1)
+            }
+        };
+        let forwarded = chain("g10", &|n| {
+            format!("export {{ api }} from \"{}\";\n", from(n))
+        });
+        let reexported = chain("g11", &|n| {
+            format!(
+                "import {{ api }} from \"{}\";\nexport {{ api }};\n",
+                from(n)
+            )
+        });
+        // A default import takes the value walk alone, with no namespace
+        // probe ahead of it.
+        let mut defaulted: Vec<(String, String)> = api_and_reader("g10d", "/g10d").into();
+        for n in 1..=10 {
+            let hop = if n == 1 {
+                "export { api as default } from \"./api\";\n".to_string()
+            } else {
+                format!("export {{ default }} from \"./h{}\";\n", n - 1)
+            };
+            defaulted.push((format!("src/g10d/h{n}.ts"), hop));
+        }
+        defaulted.push((
+            "src/g10d/boot.ts".to_string(),
+            "import api from \"./h10\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n"
+                .to_string(),
+        ));
+        let mut fanned: Vec<(String, String)> = api_and_reader("g13", "/g13").into();
+        let mut index = String::new();
+        for n in 0..70 {
+            fanned.push((
+                format!("src/g13/f{n}.ts"),
+                format!("export const v{n} = {n};\n"),
+            ));
+            index.push_str(&format!("export * from \"./f{n}\";\n"));
+        }
+        index.push_str("export * from \"./api\";\n");
+        fanned.push(("src/g13/index.ts".to_string(), index));
+        let with_boot = |boot: &str| -> Vec<(String, String)> {
+            let mut files = fanned.clone();
+            files.push(("src/g13/boot.ts".to_string(), boot.to_string()));
+            files
+        };
+        let named = with_boot(
+            "import { api } from \"./index\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n",
+        );
+        let namespace = with_boot(
+            "import * as all from \"./index\";\n(all as any).api.defaults.baseURL = \"https://elsewhere.example\";\n",
+        );
+        let loaded = with_boot(
+            "import(\"./index\").then((m: any) => { m.api.defaults.baseURL = \"https://elsewhere.example\"; });\nexport {};\n",
+        );
+        for (case, mut files) in [
+            ("g10", forwarded),
+            ("g10d", defaulted),
+            ("g11", reexported),
+            ("g13", named),
+            ("g13", namespace),
+            ("g13", loaded),
+        ] {
+            // A clean importer beside it, in the same service.
+            files.extend(api_and_reader("clean", "/clean"));
+            let (dir, discovery) = discover_owned(&files);
+            for reader in [
+                format!("src/{case}/reader.ts"),
+                "src/clean/reader.ts".to_string(),
+            ] {
+                let rows = library_rows_of(&dir, &discovery, &reader, &verified_sample());
+                assert!(rows.is_empty(), "{case}: {reader}: {rows:#?}");
+            }
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/clean/api.ts"),
+                stated(&[(3, "GET", "/clean/own")]),
+                "{case}: a declaring module still reads its own calls"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 2, W1: an import the scan cannot follow to a
+    /// file may name an instance under an alias it does not know. A use of
+    /// one that would take a client away turns imported reading off: a
+    /// tsconfig whose `paths` sit in a referenced project, a bundler-only
+    /// alias in a `.js` file, an alias nothing maps, a computed call through
+    /// one, and a `require` or `import()` of one. Each declaring module still
+    /// reads its own calls.
+    #[test]
+    fn a_use_through_an_import_the_scan_cannot_follow_turns_imported_reading_off() {
+        let write = "(api as any).defaults.baseURL = \"https://elsewhere.example\";\n";
+        let cases: [(&str, Vec<(String, String)>); 6] = [
+            (
+                "re-exported",
+                vec![
+                    (
+                        "src/w/barrel.ts".to_string(),
+                        "import { api } from \"@/w/api\";\nexport { api };\n".to_string(),
+                    ),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        format!("import {{ api }} from \"./barrel\";\n{write}"),
+                    ),
+                ],
+            ),
+            (
+                "references",
+                vec![
+                    (
+                        "tsconfig.json".to_string(),
+                        "{ \"files\": [], \"references\": [{ \"path\": \"./tsconfig.app.json\" }] }\n"
+                            .to_string(),
+                    ),
+                    (
+                        "tsconfig.app.json".to_string(),
+                        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"./src/*\"] } }, \"include\": [\"src\"] }\n"
+                            .to_string(),
+                    ),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        format!("import {{ api }} from \"@/w/api\";\n{write}"),
+                    ),
+                ],
+            ),
+            (
+                "bundler alias",
+                vec![(
+                    "src/w/boot.js".to_string(),
+                    "import { api } from \"~w/api\";\napi.defaults.baseURL = \"x\";\n".to_string(),
+                )],
+            ),
+            (
+                "unmapped alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!("import {{ api }} from \"@/w/api\";\n{write}"),
+                )],
+            ),
+            (
+                "computed call",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\ndeclare const name: string;\n(api as any)[name]();\n"
+                        .to_string(),
+                )],
+            ),
+            (
+                "load",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!("export async function boot() {{\n  const {{ api }} = await import(\"@/w/api\");\n  {write}}}\n"),
+                )],
+            ),
+        ];
+        for (case, extra) in cases {
+            let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+            files.extend(extra);
+            let (dir, discovery) = discover_owned(&files);
+            let rows = library_rows_of(&dir, &discovery, "src/w/reader.ts", &verified_sample());
+            assert!(rows.is_empty(), "{case}: {rows:#?}");
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/w/api.ts"),
+                stated(&[(3, "GET", "/w/own")]),
+                "{case}: the declaring module still reads its own calls"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 3: a module that names a specifier nothing
+    /// resolves, in any position that loads a module at run time, turns
+    /// imported reading off, however the binding is then used: each
+    /// re-export form through a barrel, a side-effect import, a call by name
+    /// (on or off the verified surface), an `instanceof` read, a JSX tag, a
+    /// subpath of a builtin's name the runtime does not list (`http/client`)
+    /// and a `node:` name that is no builtin. A clean importer beside it
+    /// reads nothing either; the declaring module keeps its own calls.
+    #[test]
+    fn a_module_naming_a_specifier_nothing_resolves_turns_imported_reading_off() {
+        let write = "(api as any).defaults.baseURL = \"https://elsewhere.example\";\n";
+        let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+            (
+                "export from",
+                vec![
+                    ("src/w/barrel.ts".to_string(), "export { api } from \"@/w/api\";\n".to_string()),
+                    ("src/w/boot.ts".to_string(), format!("import {{ api }} from \"./barrel\";\n{write}")),
+                ],
+            ),
+            (
+                "export star",
+                vec![
+                    ("src/w/barrel.ts".to_string(), "export * from \"@/w/api\";\n".to_string()),
+                    ("src/w/boot.ts".to_string(), format!("import {{ api }} from \"./barrel\";\n{write}")),
+                ],
+            ),
+            (
+                "export star as",
+                vec![
+                    ("src/w/barrel.ts".to_string(), "export * as ns from \"@/w/api\";\n".to_string()),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        "import { ns } from \"./barrel\";\n(ns.api as any).defaults.baseURL = \"x\";\n".to_string(),
+                    ),
+                ],
+            ),
+            // A barrel no file imports through: only the specifier it names
+            // can say anything.
+            (
+                "export renamed, barrel alone",
+                vec![("src/w/barrel.ts".to_string(), "export { api as client } from \"@/w/api\";\n".to_string())],
+            ),
+            (
+                "export star, barrel alone",
+                vec![("src/w/barrel.ts".to_string(), "export * from \"@/w/api\";\n".to_string())],
+            ),
+            (
+                "export star as, barrel alone",
+                vec![("src/w/barrel.ts".to_string(), "export * as ns from \"@/w/api\";\n".to_string())],
+            ),
+            ("side effect", vec![("src/w/boot.ts".to_string(), "import \"@/w/setup\";\n".to_string())]),
+            (
+                "call by name off the surface",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\n(api as any).setBaseURL(\"https://elsewhere.example\");\n".to_string(),
+                )],
+            ),
+            (
+                "call by name on the surface",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\nexport function f() { return api.get(\"/boot\"); }\n".to_string(),
+                )],
+            ),
+            (
+                "instanceof",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { HttpError } from \"@/w/errors\";\nexport const isErr = (e: unknown): boolean => e instanceof HttpError;\n".to_string(),
+                )],
+            ),
+            (
+                "jsx",
+                vec![(
+                    "src/w/view.tsx".to_string(),
+                    "import { Button } from \"@/w/button\";\nexport const v = <Button />;\n".to_string(),
+                )],
+            ),
+            (
+                "builtin-named subpath",
+                vec![("src/w/boot.ts".to_string(), format!("import {{ api }} from \"http/client\";\n{write}"))],
+            ),
+            (
+                "node: name that is no builtin",
+                vec![("src/w/boot.ts".to_string(), format!("import {{ api }} from \"node:w-api\";\n{write}"))],
+            ),
+            // Positions that name a binding in no expression of their own.
+            (
+                "import-equals alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/api\";\nimport client = lib.api;\n(client as any).defaults.baseURL = \"x\";\n".to_string(),
+                )],
+            ),
+            (
+                "export import alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/api\";\nexport import client = lib.api;\n".to_string(),
+                )],
+            ),
+            (
+                "class extends a member",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/base\";\nexport class S extends lib.Base {}\n".to_string(),
+                )],
+            ),
+            (
+                "decorator member chain",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/decorators\";\n@lib.tag()\nexport class S {}\n".to_string(),
+                )],
+            ),
+            (
+                "jsx member root",
+                vec![(
+                    "src/w/view.tsx".to_string(),
+                    "import * as ui from \"@/w/ui\";\nexport const v = <ui.Button />;\n".to_string(),
+                )],
+            ),
+            (
+                "export =",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\nexport = api;\n".to_string(),
+                )],
+            ),
+            (
+                "an alias onto a file that is not there",
+                vec![
+                    ("tsconfig.json".to_string(), PATHS_TSCONFIG.to_string()),
+                    ("src/w/boot.ts".to_string(), "import \"@/styles/missing.css\";\n".to_string()),
+                ],
+            ),
+        ];
+        for (case, extra) in cases {
+            let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+            files.extend(api_and_reader("ctl", "/ctl"));
+            files.extend(extra);
+            let (dir, discovery) = discover_owned(&files);
+            for reader in ["src/w/reader.ts", "src/ctl/reader.ts"] {
+                let rows = library_rows_of(&dir, &discovery, reader, &verified_sample());
+                assert!(rows.is_empty(), "{case}: {reader}: {rows:#?}");
+            }
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/ctl/api.ts"),
+                stated(&[(3, "GET", "/ctl/own")]),
+                "{case}: the declaring module still reads its own calls"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 3: what loads nothing, or loads only what the
+    /// runtime or a declared package supplies, turns nothing off. `import
+    /// type`, `type`-only specifiers, an import used only as a type (which
+    /// the compiler erases), exact runtime builtins with and without `node:`
+    /// (`fs`, `node:fs`, `fs/promises`, `node:sqlite`), a declared package,
+    /// a relative specifier handed to a call that names a directory, an
+    /// asset import with a query (`./view.css?inline`), `./helper.js`
+    /// naming the `helper.ts` beside it, `import T = ns.Type` used only as a
+    /// type, `implements` and an interface's `extends` (types), a package
+    /// declared in `devDependencies`, and a `paths` alias that lands on a
+    /// `.css` or `.json` file that is there.
+    #[test]
+    fn a_module_naming_only_erased_imports_builtins_or_declared_packages_turns_nothing_off() {
+        let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+        files.push((
+            "package.json".to_string(),
+            "{ \"name\": \"w\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"declared-package\": \"^1.0.0\" }, \"devDependencies\": { \"dev-only\": \"^1.0.0\" } }\n".to_string(),
+        ));
+        files.push(("tsconfig.json".to_string(), PATHS_TSCONFIG.to_string()));
+        files.push((
+            "src/styles/globals.css".to_string(),
+            "body {}\n".to_string(),
+        ));
+        files.push(("src/data/x.json".to_string(), "{ \"a\": 1 }\n".to_string()));
+        files.push((
+            "src/w/types-only.ts".to_string(),
+            "import * as unmapped from \"~unmapped/api\";\n\
+             import T = unmapped.Api;\n\
+             import { Shape } from \"~unmapped/types\";\n\
+             import { Base } from \"~unmapped/base\";\n\
+             export let t: T | undefined;\n\
+             export class S implements Shape { get(p: string): unknown { return p; } }\n\
+             export interface Mine extends Base { y: number }\n"
+                .to_string(),
+        ));
+        files.push((
+            "src/w/assets.ts".to_string(),
+            "import \"@/styles/globals.css\";\n\
+             import data from \"@/data/x.json\";\n\
+             import { api as devApi } from \"dev-only\";\n\
+             (devApi as any).defaults.baseURL = \"x\";\n\
+             export const d = data;\n"
+                .to_string(),
+        ));
+        files.push((
+            "src/w/boot.ts".to_string(),
+            "import type { Api } from \"@/types\";\n\
+             import { type Api as A2 } from \"@/types\";\n\
+             import { Api as A3 } from \"@/types\";\n\
+             export type { Api as A4 } from \"@/types\";\n\
+             export { type Api as A5 } from \"@/types\";\n\
+             import { EventEmitter } from \"events\";\n\
+             import fs from \"node:fs\";\n\
+             import { readFile } from \"fs/promises\";\n\
+             import { DatabaseSync } from \"node:sqlite\";\n\
+             import * as declared from \"declared-package\";\n\
+             import styles from \"./view.css?inline\";\n\
+             import { helper } from \"./helper.js\";\n\
+             declare function serve(dir: string): void;\n\
+             export const x: Api | A2 | A3 | undefined = undefined;\n\
+             export class Bus extends EventEmitter {}\n\
+             export const read = [fs.readFileSync, readFile, DatabaseSync, declared.thing, styles, helper];\n\
+             serve(\"./public\");\n"
+                .to_string(),
+        ));
+        files.push((
+            "src/w/view.css".to_string(),
+            ".a { color: red; }\n".to_string(),
+        ));
+        files.push((
+            "src/w/helper.ts".to_string(),
+            "export const helper = 1;\n".to_string(),
+        ));
+        let (dir, discovery) = discover_owned(&files);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/w/reader.ts"),
+            stated(&[(2, "GET", "/w/read")])
+        );
+    }
+
+    /// carrick#1568 fix round 4, Z1: `import client = lib.api` names `lib` in
+    /// no expression, and a write through `client` changes what `lib`
+    /// publishes. An alias used as a value, or exported, hands its root on,
+    /// through a namespace import or a namespace re-export, so no module
+    /// reads through the instance; a clean importer beside it still does.
+    #[test]
+    fn an_import_equals_alias_used_as_a_value_hands_its_root_on() {
+        let write = "(client as any).defaults.baseURL = \"https://elsewhere.example\";\n";
+        let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+            (
+                "namespace import",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!("import * as lib from \"./api\";\nimport client = lib.api;\n{write}"),
+                )],
+            ),
+            (
+                "namespace re-export",
+                vec![
+                    (
+                        "src/w/barrel.ts".to_string(),
+                        "export * as ns from \"./api\";\n".to_string(),
+                    ),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        format!(
+                            "import {{ ns }} from \"./barrel\";\nimport client = ns.api;\n{write}"
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "alias of an alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!(
+                        "import * as lib from \"./api\";\nimport inner = lib;\nimport client = inner.api;\n{write}"
+                    ),
+                )],
+            ),
+        ];
+        for (case, extra) in cases {
+            let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+            files.extend(api_and_reader("ctl", "/ctl"));
+            files.extend(extra);
+            let (dir, discovery) = discover_owned(&files);
+            let rows = library_rows_of(&dir, &discovery, "src/w/reader.ts", &verified_sample());
+            assert!(rows.is_empty(), "{case}: {rows:#?}");
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/ctl/reader.ts"),
+                stated(&[(2, "GET", "/ctl/read")]),
+                "{case}: a clean importer still reads"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 3: a barrel outside the service that re-exports
+    /// through a specifier nothing resolves answers "unresolved", not
+    /// "absent", so an import through it turns imported reading off where no
+    /// file of the service names that specifier itself.
+    #[test]
+    fn an_import_through_an_outside_barrel_that_resolves_nothing_turns_imported_reading_off() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let files: Vec<(String, String)> = [
+            ("package.json".to_string(), SAMPLE_MANIFEST.to_string()),
+            (
+                "other/barrel.ts".to_string(),
+                "export { api } from \"@/svc/lib/api\";\n".to_string(),
+            ),
+            (
+                "svc/boot.ts".to_string(),
+                "import { api } from \"../other/barrel\";\n(api as any).defaults.baseURL = \"x\";\n"
+                    .to_string(),
+            ),
+        ]
+        .into_iter()
+        .chain(api_and_reader("lib", "/svc").map(|(name, source)| {
+            (
+                name.replace("src/lib/", "svc/lib/"),
+                source,
+            )
+        }))
+        .collect();
+        for (name, source) in &files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(&path, source).expect("write");
+        }
+        let service = Config {
+            directory: Some("svc".to_string()),
+            ..Config::default()
+        };
+        let cm: Lrc<SourceMap> = Default::default();
+        let discovery =
+            discover_files_and_symbols(&dir.path().to_string_lossy(), &service, cm).unwrap();
+        let rows = library_rows_of(&dir, &discovery, "svc/lib/reader.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#1568 fix round 1, F1: a row stated in an importing module
+    /// joins a base read in the declaring module's scope only where every
+    /// piece means the same in both: text the source writes, or an
+    /// environment read. A base naming a binding (an imported config, an
+    /// imported constant) would be read by the passes after this one as
+    /// whatever the importer binds to that name.
+    #[test]
+    fn an_imported_instance_states_only_a_base_that_means_the_same_in_the_importer() {
+        let (dir, discovery) = discover_service(&[
+            (
+                "src/q06/config.ts",
+                "export const config = { apiUrl: process.env.ORDERS_API_URL };\n",
+            ),
+            (
+                "src/q06/feature-config.ts",
+                "export const config = { apiUrl: process.env.BILLING_API_URL };\n",
+            ),
+            (
+                "src/q06/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { config } from \"./config\";\n\
+                 export const api = http.create({ baseURL: config.apiUrl });\n\
+                 export function own() { return api.get(\"/own\"); }\n",
+            ),
+            (
+                "src/q06/reader.ts",
+                "import { api } from \"./api\";\n\
+                 import { config } from \"./feature-config\";\n\
+                 export const c = config;\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+            ("src/q01/config.ts", "export const BASE = \"/q01right\";\n"),
+            (
+                "src/q01/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { BASE } from \"./config\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q01/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+            (
+                "src/q04/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 const BASE = \"/q04right\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q04/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+            (
+                "src/p12/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 export const api = http.create({ baseURL: process.env.P12_URL });\n",
+            ),
+            (
+                "src/p12/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+        ]);
+        for file in ["src/q06/reader.ts", "src/q01/reader.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+        assert_eq!(
+            library_rows_of(&dir, &discovery, "src/q06/api.ts", &verified_sample())
+                .iter()
+                .map(|row| row.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["${config.apiUrl}/own"],
+            "the declaring module states its own base, which its own scope reads"
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q04/reader.ts"),
+            stated(&[(2, "GET", "/q04right/read")])
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/p12/reader.ts"),
+            stated(&[(2, "GET", "${process.env.P12_URL}/read")])
+        );
+    }
+
+    /// carrick#1568 fix round 1, F3 and the type-position gap: a named
+    /// function expression's own name is a declaration of that name, so the
+    /// import is no client in that file; and a type literal's key named like
+    /// the import is no use of it, so it takes nothing away anywhere.
+    #[test]
+    fn a_function_expression_name_shadows_and_a_type_key_does_not_use() {
+        let (dir, discovery) = discover_service(&[
+            ("src/p08/api.ts", SHARED_API),
+            (
+                "src/p08/shadow.ts",
+                "import { api } from \"./api\";\n\
+                 export function mk() {\n\
+                 \x20 const h = function api(): unknown {\n\
+                 \x20   // @ts-expect-error the function has no get\n\
+                 \x20   return api.get(\"/fnexpr\");\n\
+                 \x20 };\n\
+                 \x20 return h();\n\
+                 }\n",
+            ),
+            ("src/v02/api.ts", SHARED_API),
+            (
+                "src/v02/shadow.ts",
+                "import { api } from \"./api\";\n\
+                 export const f = ({ api }: { api: { get(p: string): string } }): unknown => api.get(\"/destructured\");\n",
+            ),
+            (
+                "src/v02/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/p08/shadow.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/v02/reader.ts"),
+            stated(&[(2, "GET", "/api/v1/read")])
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/v02/api.ts"),
+            stated(&[(5, "GET", "/api/v1/health")])
         );
     }
 

@@ -85,6 +85,13 @@
 //! semantics are verified, which is after framework detection and the
 //! service's sidecar init, so discovery hands over its inputs
 //! ([`RequestSummaryInputs`]) rather than its rows.
+//!
+//! A module-scope instance another module imports is the client there too
+//! (carrick#1568). The import is resolved by the call graph's own walk
+//! ([`crate::call_graph::ImportedBindings`]), and the instance is read where
+//! it is declared, with every module's uses of it merged ([`LinkedClients`]):
+//! one object, so a use that may change it anywhere changes it everywhere.
+//! The receiver rules are in `docs/reference/client-semantics.md`.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -94,9 +101,12 @@ use swc_common::{SourceMap, SourceMapper, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::call_graph::CallSiteTargets;
+use crate::call_graph::{
+    BindingsWanted, CallSiteTargets, ImportedBinding, ImportedBindings, PublishedBinding,
+};
 use crate::client_semantics::{LibrarySemantics, instance_receiver};
 use crate::commonjs::{require_bound_names, require_specifier};
+use crate::import_bindings::DEFAULT_EXPORT;
 use crate::services::type_sidecar::{SemanticsRequestArgs, SemanticsVerbArgs};
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::is_http_method;
@@ -259,6 +269,9 @@ struct RequestShape {
     /// A library client's base, joined to `url` only when the row is stated
     /// (see [`join_base`]). Empty for every other request.
     base: Vec<Piece>,
+    /// The file whose scope `base` was read in: the module that declares the
+    /// client (carrick#1568). A name in it means what that module binds.
+    base_scope: Option<PathBuf>,
     /// The library-semantics claim ids this reading used. Empty for every
     /// other request.
     semantics: BTreeSet<String>,
@@ -302,8 +315,28 @@ struct ClientInstance {
 /// client itself (`member: None`).
 #[derive(Debug, Clone)]
 struct CallReceiver {
-    client: ClientRef,
+    client: ClientBinding,
     member: Option<String>,
+}
+
+/// The binding a call names as its library client (carrick#1564,
+/// carrick#1568). Which client it holds is settled when the summaries are
+/// composed, because another module can import a module-scope instance and
+/// every module's uses of it count.
+#[derive(Debug, Clone)]
+enum ClientBinding {
+    /// A client no other module can reach: an instance a function or a class
+    /// field holds. Read as the file states it.
+    Own(ClientRef),
+    /// A module-scope binding of this file that holds an instance.
+    Module(String),
+    /// A binding this file imports: the instance the module that declares it
+    /// holds, when the import resolves to one, and otherwise the package
+    /// client the import names directly (`None` for a relative specifier).
+    Imported {
+        local: String,
+        package: Option<ClientRef>,
+    },
 }
 
 /// Where a call is written.
@@ -376,6 +409,55 @@ struct FnIr {
 #[derive(Debug, Default)]
 pub struct FileIr {
     functions: HashMap<String, FnIr>,
+    /// What this module's module-scope bindings hold, for this file's own
+    /// calls and for every module that imports one (carrick#1568): each
+    /// `const` a factory call built, and an anonymous `export default
+    /// <factory call>` under [`DEFAULT_EXPORT`].
+    module_clients: HashMap<String, ClientRef>,
+    /// Every import binding the file uses, with how it uses it. What a module
+    /// that declares one of them holds is changed by these uses too.
+    imported: HashMap<String, BindingUse>,
+    /// The modules the file loads other than through an import binding
+    /// ([`module_loads`]): everything each publishes may be changed here.
+    loads: BTreeSet<String>,
+    /// Every specifier this file loads a module by at run time
+    /// ([`value_specifiers`]).
+    value_specifiers: BTreeSet<String>,
+    /// The `??`/`||` defaults this module's environment reads are declared
+    /// with ([`crate::env_alias::UrlBindings::env_fallbacks`]), kept for a
+    /// module that holds a client: a row another module states through it
+    /// describes its base with them, as this module's own rows do.
+    env_fallbacks: BTreeMap<String, String>,
+    /// The file names `module.exports` or `exports`. What it publishes that
+    /// way is read only at module level, last write winning
+    /// ([`crate::commonjs::export_assignments`]), so a write anywhere else can
+    /// replace it unseen: nothing it holds is read in another module.
+    names_commonjs_exports: bool,
+}
+
+impl FileIr {
+    /// The import bindings whose declaring module the summaries read, the
+    /// modules the file loads, and, when `every_specifier`, every specifier
+    /// it loads a module by ([`crate::call_graph::resolve_call_edges`]'s
+    /// `bindings_wanted`).
+    pub fn bindings_wanted(&self, every_specifier: bool) -> BindingsWanted {
+        BindingsWanted {
+            locals: self.imported.keys().cloned().collect(),
+            loads: self.loads.clone(),
+            specifiers: if every_specifier {
+                self.value_specifiers.clone()
+            } else {
+                BTreeSet::new()
+            },
+        }
+    }
+
+    /// Whether this module holds a client another module may import. Only
+    /// then does a specifier that names nothing matter
+    /// ([`LinkedClients`]).
+    pub fn holds_instances(&self) -> bool {
+        !self.module_clients.is_empty()
+    }
 }
 
 /// Runtime globals whose calls send nothing, by receiver. Not client
@@ -393,16 +475,28 @@ pub fn extract_file_ir(
     source_map: &Lrc<SourceMap>,
     definition_keys: &HashSet<String>,
 ) -> FileIr {
+    let jsx = jsx_names(module);
     let mut uses = BindingUses::default();
     module.visit_with(&mut uses);
+    uses.settle_aliases(&jsx);
+    let (imports, bound_requires) = import_bindings(module);
+    // Every import the file uses, however it uses it: a module that declares
+    // one holds what these uses may change (carrick#1568). Kept whether or
+    // not the name is declared again below, since nothing here says which
+    // of its uses mean the import.
+    let imported: HashMap<String, BindingUse> = imports
+        .keys()
+        .filter_map(|name| Some((name.clone(), uses.uses.get(name)?.clone())))
+        .collect();
     let mut module_scope = ModuleScope {
         consts: HashMap::new(),
         receivers: HashMap::new(),
+        imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
         subclass_fields: subclass_fields(module),
     };
-    module_scope.receivers = import_receivers(module)
+    module_scope.receivers = import_receivers(&imports)
         .into_iter()
         .map(|(name, client)| {
             let client = module_scope.with_uses(client, &name);
@@ -416,7 +510,23 @@ pub fn extract_file_ir(
     module_scope
         .receivers
         .retain(|name, _| !redeclared.contains(name));
-    let mut file = FileIr::default();
+    module_scope.imports = imports
+        .iter()
+        .filter(|(name, import)| {
+            !import.namespace && !import.reassignable && !redeclared.contains(*name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let value_specifiers = value_specifiers(module, |name| {
+        module_scope.uses.contains_key(name) || jsx.contains(name)
+    });
+    let mut file = FileIr {
+        imported,
+        value_specifiers,
+        loads: module_loads(module, &bound_requires),
+        names_commonjs_exports: names_commonjs_exports(module),
+        ..FileIr::default()
+    };
     let reader = Reader { source_map };
 
     // Module constants first, in source order, so a later one can read an
@@ -438,11 +548,20 @@ pub fn extract_file_ir(
                         && !redeclared.contains(&name)
                     {
                         let client = module_scope.with_uses(client, &name);
+                        file.module_clients.insert(name.clone(), client.clone());
                         module_scope.receivers.insert(name.clone(), client);
                     }
                     module_scope.consts.insert(name, value);
                 }
             }
+        }
+        // `export default http.create({ ... })`: an instance no name in this
+        // file holds, which a module importing the default reads.
+        if let ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) = item
+            && let Some(client) = reader.factory_call(&export.expr, &Scope::module(&module_scope))
+        {
+            file.module_clients
+                .insert(DEFAULT_EXPORT.to_string(), client);
         }
     }
     let module_scope = &module_scope;
@@ -508,6 +627,15 @@ pub fn extract_file_ir(
             }
         }
     }
+    // What a row stated in another module needs to say about a client's
+    // base the way this module's own rows say it (carrick#1568). Any file
+    // that imports a package's client may build one.
+    if !module_scope.receivers.is_empty() || !file.module_clients.is_empty() {
+        file.env_fallbacks = crate::env_alias::EnvAliasExtractor::build_bindings(module)
+            .env_fallbacks
+            .into_iter()
+            .collect();
+    }
     file
 }
 
@@ -532,6 +660,10 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
 struct ModuleScope {
     consts: HashMap<String, Value>,
     receivers: HashMap<String, ClientRef>,
+    /// Import bindings no scope below declares again, other than namespace
+    /// imports: each may hold an instance the module it names declares
+    /// (carrick#1568).
+    imports: HashSet<String>,
     /// [`BindingUses`] over the whole file.
     uses: HashMap<String, BindingUse>,
     /// Names declared once in the file, by `const <name> = { … }`.
@@ -586,8 +718,17 @@ struct BindingUse {
     /// Spread into an object or array literal.
     spread: bool,
     /// Anything else: an argument, an initialiser, a property value, a
-    /// returned value, an array element, an operand, a test.
+    /// returned value, an array element, an operand, a test. An operand of
+    /// `instanceof`, `typeof` or a comparison is not: it reads the value and
+    /// keeps nothing of it (carrick#1568).
     other: bool,
+    /// Exported by name (`export { api }`, `export default api`,
+    /// `module.exports.api = api`). Not a use that changes anything; it says
+    /// another module may import the binding (carrick#1568).
+    exported: bool,
+    /// Read as an operand of `instanceof`, `typeof` or a comparison: a value
+    /// use, which keeps an import at run time, that changes nothing.
+    read: bool,
 }
 
 impl BindingUse {
@@ -611,6 +752,15 @@ impl BindingUse {
 #[derive(Default)]
 struct BindingUses {
     uses: HashMap<String, BindingUse>,
+    /// `import alias = root.a.b` declarations, settled after the walk.
+    aliases: Vec<EntityAlias>,
+}
+
+/// `import alias = root.a.b` (`export import` when `exported`).
+struct EntityAlias {
+    alias: String,
+    root: String,
+    exported: bool,
 }
 
 impl BindingUses {
@@ -689,6 +839,37 @@ impl BindingUses {
 }
 
 impl Visit for BindingUses {
+    // A type is no use of a value: a type literal's key (`{ api: T }`) and
+    // a type query (`typeof api` in a type) read nothing at run time
+    // (carrick#1568).
+    fn visit_ts_type(&mut self, _: &TsType) {}
+
+    fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
+
+    // A class's `implements` and an interface's `extends` name types, which
+    // the compiler erases.
+    fn visit_ts_expr_with_type_args(&mut self, _: &TsExprWithTypeArgs) {}
+
+    // `import client = lib.api` names `lib` in no expression. Whether that is
+    // a use depends on whether `client` is used as a value, which is known
+    // only once the whole file is read ([`BindingUses::settle_aliases`]).
+    // `import type x = …` binds a type, which no value use can reach.
+    fn visit_ts_import_equals_decl(&mut self, decl: &TsImportEqualsDecl) {
+        if let TsModuleRef::TsEntityName(entity) = &decl.module_ref {
+            let mut root = entity;
+            while let TsEntityName::TsQualifiedName(qualified) = root {
+                root = &qualified.left;
+            }
+            if let TsEntityName::Ident(ident) = root {
+                self.aliases.push(EntityAlias {
+                    alias: decl.id.sym.to_string(),
+                    root: ident.sym.to_string(),
+                    exported: decl.is_export,
+                });
+            }
+        }
+    }
+
     fn visit_expr(&mut self, expr: &Expr) {
         if let Some(key) = binding_key(expr) {
             self.mark(key, |used| used.other = true);
@@ -727,11 +908,11 @@ impl Visit for BindingUses {
         }
         // `module.exports = api`, `exports.api = api`: an export.
         if is_commonjs_export(&assign.left)
-            && binding_key(crate::graphql_document_sites::unwrap_expression(
+            && let Some(key) = binding_key(crate::graphql_document_sites::unwrap_expression(
                 &assign.right,
             ))
-            .is_some()
         {
+            self.mark(key, |used| used.exported = true);
             return;
         }
         assign.right.visit_with(self);
@@ -755,7 +936,49 @@ impl Visit for BindingUses {
             self.write_member(member);
             return;
         }
+        if unary.op == UnaryOp::TypeOf {
+            self.compared(&unary.arg);
+            return;
+        }
         unary.arg.visit_with(self);
+    }
+
+    /// `e instanceof http.HttpError`, `api === other`: each operand is read
+    /// and nothing of it is kept (carrick#1568).
+    fn visit_bin_expr(&mut self, bin: &BinExpr) {
+        if matches!(
+            bin.op,
+            BinaryOp::InstanceOf
+                | BinaryOp::EqEq
+                | BinaryOp::NotEq
+                | BinaryOp::EqEqEq
+                | BinaryOp::NotEqEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        ) {
+            self.compared(&bin.left);
+            self.compared(&bin.right);
+            return;
+        }
+        bin.visit_children_with(self);
+    }
+
+    /// `export { api }`, `export { api as client }`: the binding is published,
+    /// not used. A re-export from another module names none of this file's.
+    fn visit_named_export(&mut self, export: &NamedExport) {
+        if export.src.is_some() || export.type_only {
+            return;
+        }
+        for specifier in &export.specifiers {
+            if let ExportSpecifier::Named(named) = specifier
+                && !named.is_type_only
+                && let ModuleExportName::Ident(ident) = &named.orig
+            {
+                self.mark(ident.sym.to_string(), |used| used.exported = true);
+            }
+        }
     }
 
     /// A member in a destructuring target (`({ a: o.x } = src)`) is written.
@@ -796,21 +1019,84 @@ impl Visit for BindingUses {
     }
 
     fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
-        if binding_key(crate::graphql_document_sites::unwrap_expression(
+        match binding_key(crate::graphql_document_sites::unwrap_expression(
             &export.expr,
-        ))
-        .is_none()
-        {
-            export.expr.visit_with(self);
+        )) {
+            Some(key) => self.mark(key, |used| used.exported = true),
+            None => export.expr.visit_with(self),
         }
     }
 }
 
 impl BindingUses {
+    /// An `import alias = root.a.b` whose alias is exported or used as a value
+    /// (`uses`, or a JSX tag in `jsx`) hands `root` on: what it reaches may be
+    /// changed through the alias (carrick#1568). One used only as a type is
+    /// erased, and names nothing. Settled to a fixed point, so an alias of an
+    /// alias reaches the first root.
+    fn settle_aliases(&mut self, jsx: &HashSet<String>) {
+        let mut settled: HashSet<usize> = HashSet::new();
+        loop {
+            let ready: Vec<usize> = self
+                .aliases
+                .iter()
+                .enumerate()
+                .filter(|(index, alias)| {
+                    !settled.contains(index)
+                        && (alias.exported
+                            || self.uses.contains_key(&alias.alias)
+                            || jsx.contains(&alias.alias))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if ready.is_empty() {
+                return;
+            }
+            for index in ready {
+                settled.insert(index);
+                let root = self.aliases[index].root.clone();
+                self.mark(root, |used| used.other = true);
+            }
+        }
+    }
+
     fn spread(&mut self, expr: &Expr) {
         match binding_key(crate::graphql_document_sites::unwrap_expression(expr)) {
             Some(key) => self.mark(key, |used| used.spread = true),
             None => expr.visit_with(self),
+        }
+    }
+
+    /// An operand whose value is read and not kept: a binding, or a member
+    /// chain rooted at one (`(http as any).HttpError`), records no use of
+    /// the binding. A computed key in the chain is still visited, and any
+    /// other operand is visited as usual.
+    fn compared(&mut self, expr: &Expr) {
+        let expr = crate::graphql_document_sites::unwrap_expression(expr);
+        if let Some(key) = binding_key(expr) {
+            self.mark(key, |used| used.read = true);
+            return;
+        }
+        let Some(mut member) = as_member(expr) else {
+            expr.visit_with(self);
+            return;
+        };
+        loop {
+            if let MemberProp::Computed(key) = &member.prop {
+                key.expr.visit_with(self);
+            }
+            let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
+            if let Some(key) = binding_key(obj) {
+                self.mark(key, |used| used.read = true);
+                return;
+            }
+            match as_member(obj) {
+                Some(inner) => member = inner,
+                None => {
+                    obj.visit_with(self);
+                    return;
+                }
+            }
         }
     }
 }
@@ -999,41 +1285,58 @@ struct Captured {
     receivers: HashMap<String, ClientRef>,
 }
 
-/// Every module-scope binding a package specifier introduces, with the export
-/// it names (carrick#1564): `import x from "p"` and `const x = require("p")`
-/// name `default`; `import { a as x } from "p"`, `const { a: x } =
-/// require("p")` and `const x = require("p").a` name `a`. A namespace import
-/// names the module rather than an export, and a relative specifier names no
-/// package, so neither is a client.
-fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
-    const DEFAULT: &str = "default";
-    let mut receivers = HashMap::new();
-    let mut add = |local: String, package: String, export: String| {
-        if !package.starts_with('.') && !package.starts_with('/') {
-            receivers.insert(
+/// One module-scope binding an import introduces.
+#[derive(Debug, Clone)]
+struct ImportBinding {
+    /// The specifier, exactly as written.
+    specifier: String,
+    /// `"default"` or the named export the binding was imported as.
+    export: String,
+    /// `import * as ns`: the binding names the module, not an export.
+    namespace: bool,
+    /// Bound by `let` or `var`, so the file may assign it something else:
+    /// its uses count against what it was bound to, and no call through it is
+    /// read as that (carrick#1568).
+    reassignable: bool,
+}
+
+/// Every module-scope binding an import introduces, with the export it names:
+/// `import x from "m"` and `const x = require("m")` name `default`; `import {
+/// a as x } from "m"`, `const { a: x } = require("m")` and `const x =
+/// require("m").a` name `a`; `import * as x` names the module. A `require`
+/// bound by any declaration kind counts, exported or not, as it does for the
+/// call graph ([`crate::commonjs::require_bindings`]).
+///
+/// Also returns where each `require` call these bindings come from starts, so
+/// the module loads a file makes elsewhere ([`module_loads`]) leave them out.
+fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<u32>) {
+    let mut bindings = HashMap::new();
+    let mut require_calls = HashSet::new();
+    let mut add =
+        |local: String, specifier: String, export: String, namespace: bool, reassignable: bool| {
+            bindings.insert(
                 local,
-                ClientRef {
-                    package,
+                ImportBinding {
+                    specifier,
                     export,
-                    instance: None,
-                    contested: false,
-                    called: BTreeSet::new(),
-                    called_computed: false,
+                    namespace,
+                    reassignable,
                 },
             );
-        }
-    };
+        };
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) if !import.type_only => {
-                let package = import.src.value.to_string();
-                for specifier in &import.specifiers {
-                    match specifier {
+                let specifier = import.src.value.to_string();
+                for import_specifier in &import.specifiers {
+                    match import_specifier {
                         ImportSpecifier::Default(default) => {
                             add(
                                 default.local.sym.to_string(),
-                                package.clone(),
-                                DEFAULT.to_string(),
+                                specifier.clone(),
+                                DEFAULT_EXPORT.to_string(),
+                                false,
+                                false,
                             );
                         }
                         ImportSpecifier::Named(named) if !named.is_type_only => {
@@ -1042,7 +1345,22 @@ fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
                                 Some(ModuleExportName::Str(name)) => name.value.to_string(),
                                 None => named.local.sym.to_string(),
                             };
-                            add(named.local.sym.to_string(), package.clone(), export);
+                            add(
+                                named.local.sym.to_string(),
+                                specifier.clone(),
+                                export,
+                                false,
+                                false,
+                            );
+                        }
+                        ImportSpecifier::Namespace(namespace) => {
+                            add(
+                                namespace.local.sym.to_string(),
+                                specifier.clone(),
+                                DEFAULT_EXPORT.to_string(),
+                                true,
+                                false,
+                            );
                         }
                         _ => {}
                     }
@@ -1053,39 +1371,281 @@ fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
                     add(
                         decl.id.sym.to_string(),
                         external.expr.value.to_string(),
-                        DEFAULT.to_string(),
+                        DEFAULT_EXPORT.to_string(),
+                        false,
+                        false,
                     );
                 }
             }
-            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) if var.kind == VarDeclKind::Const => {
+            _ => {
+                let Some(var) = module_var_decl(item) else {
+                    continue;
+                };
+                let reassignable = var.kind != VarDeclKind::Const;
                 for declarator in &var.decls {
                     let Some(init) = declarator.init.as_deref() else {
                         continue;
                     };
                     if let Expr::Member(member) = init
-                        && let Some(package) = require_specifier(&member.obj)
+                        && let Some(specifier) = require_specifier(&member.obj)
                         && let MemberProp::Ident(property) = &member.prop
                         && let Pat::Ident(local) = &declarator.name
                     {
-                        add(local.id.sym.to_string(), package, property.sym.to_string());
+                        require_calls.insert(member.obj.span().lo.0);
+                        add(
+                            local.id.sym.to_string(),
+                            specifier,
+                            property.sym.to_string(),
+                            false,
+                            reassignable,
+                        );
                         continue;
                     }
-                    let Some(package) = require_specifier(init) else {
+                    let Some(specifier) = require_specifier(init) else {
                         continue;
                     };
+                    require_calls.insert(init.span().lo.0);
                     for bound in require_bound_names(&declarator.name) {
                         let export = match bound.kind {
-                            SymbolKind::Namespace => DEFAULT.to_string(),
+                            SymbolKind::Namespace => DEFAULT_EXPORT.to_string(),
                             SymbolKind::Named | SymbolKind::Default => bound.imported,
                         };
-                        add(bound.local.id.sym.to_string(), package.clone(), export);
+                        add(
+                            bound.local.id.sym.to_string(),
+                            specifier.clone(),
+                            export,
+                            false,
+                            reassignable,
+                        );
                     }
+                }
+            }
+        }
+    }
+    (bindings, require_calls)
+}
+
+/// The modules a file loads other than through a module-scope import
+/// binding, by specifier (carrick#1568): `import("./m")` and `require("./m")`
+/// anywhere, and any other call handed a relative specifier as its first
+/// argument (a `require` made by a factory, `req("./m")`). What such a load
+/// does with the module is not followed, so everything the module publishes
+/// counts as used in every way.
+///
+/// A specifier the source computes (`import(name)`, a template with a hole)
+/// names no module and is not here.
+fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<String> {
+    struct Loads<'a> {
+        bound_requires: &'a HashSet<u32>,
+        found: BTreeSet<String>,
+    }
+    impl Visit for Loads<'_> {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            let specifier = call
+                .args
+                .first()
+                .filter(|arg| arg.spread.is_none())
+                .and_then(|arg| literal_specifier(&arg.expr));
+            if let Some(specifier) = specifier {
+                let require = matches!(&call.callee, Callee::Expr(callee)
+                    if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
+                let bound = require && self.bound_requires.contains(&call.span.lo.0);
+                let relative = specifier.starts_with("./") || specifier.starts_with("../");
+                if !bound && (matches!(call.callee, Callee::Import(_)) || require || relative) {
+                    self.found.insert(specifier);
+                }
+            }
+            call.visit_children_with(self);
+        }
+    }
+    let mut loads = Loads {
+        bound_requires,
+        found: BTreeSet::new(),
+    };
+    module.visit_with(&mut loads);
+    loads.found
+}
+
+/// Every specifier `module` loads a module by at run time (carrick#1568): a
+/// static import, a side-effect import, a re-export (`export { x } from`,
+/// `export * from`, `export * as ns from`), `import x = require()`, and
+/// `import()` or `require` with a literal specifier anywhere.
+///
+/// Only what TypeScript erases is left out: an import none of whose bindings
+/// is used as a value (`used`), which the compiler drops (`import type` and
+/// `{ type x }` among them), and `export type`, or a re-export whose every
+/// specifier is `type`.
+fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(decl) = item else {
+            continue;
+        };
+        match decl {
+            // A binding `import type` or `{ type x }` brings can only be used
+            // as a type, so the one rule covers it.
+            ModuleDecl::Import(import) => {
+                let kept = import.specifiers.is_empty()
+                    || import.specifiers.iter().any(|specifier| match specifier {
+                        ImportSpecifier::Named(named) => used(named.local.sym.as_ref()),
+                        ImportSpecifier::Default(default) => used(default.local.sym.as_ref()),
+                        ImportSpecifier::Namespace(namespace) => {
+                            used(namespace.local.sym.as_ref())
+                        }
+                    });
+                if kept {
+                    found.insert(import.src.value.to_string());
+                }
+            }
+            ModuleDecl::ExportAll(export) if !export.type_only => {
+                found.insert(export.src.value.to_string());
+            }
+            ModuleDecl::ExportNamed(export) if !export.type_only => {
+                if let Some(src) = &export.src
+                    && (export.specifiers.is_empty()
+                        || export.specifiers.iter().any(|specifier| {
+                            !matches!(specifier, ExportSpecifier::Named(named) if named.is_type_only)
+                        }))
+                {
+                    found.insert(src.value.to_string());
+                }
+            }
+            ModuleDecl::TsImportEquals(decl) if !decl.is_type_only => {
+                if let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref
+                    && used(decl.id.sym.as_ref())
+                {
+                    found.insert(external.expr.value.to_string());
                 }
             }
             _ => {}
         }
     }
-    receivers
+    struct Loads {
+        found: BTreeSet<String>,
+    }
+    impl Visit for Loads {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            let loads = match &call.callee {
+                Callee::Import(_) => true,
+                Callee::Expr(callee) => {
+                    matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+                }
+                Callee::Super(_) => false,
+            };
+            if loads
+                && let Some(specifier) = call
+                    .args
+                    .first()
+                    .filter(|arg| arg.spread.is_none())
+                    .and_then(|arg| literal_specifier(&arg.expr))
+            {
+                self.found.insert(specifier);
+            }
+            call.visit_children_with(self);
+        }
+    }
+    let mut loads = Loads { found };
+    module.visit_with(&mut loads);
+    loads.found
+}
+
+/// Every name a JSX element uses as its tag (`<Button />`, the `ui` of
+/// `<ui.Button />`): a use of the binding as a value that no expression
+/// states.
+fn jsx_names(module: &Module) -> HashSet<String> {
+    #[derive(Default)]
+    struct Names {
+        found: HashSet<String>,
+    }
+    impl Visit for Names {
+        fn visit_jsx_element_name(&mut self, name: &JSXElementName) {
+            match name {
+                JSXElementName::Ident(ident) => {
+                    self.found.insert(ident.sym.to_string());
+                }
+                JSXElementName::JSXMemberExpr(member) => {
+                    let mut object = &member.obj;
+                    while let JSXObject::JSXMemberExpr(inner) = object {
+                        object = &inner.obj;
+                    }
+                    if let JSXObject::Ident(ident) = object {
+                        self.found.insert(ident.sym.to_string());
+                    }
+                }
+                JSXElementName::JSXNamespacedName(_) => {}
+            }
+        }
+    }
+    let mut names = Names::default();
+    module.visit_with(&mut names);
+    names.found
+}
+
+/// A string literal, or a template with no hole in it.
+fn literal_specifier(expr: &Expr) -> Option<String> {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() => tpl.quasis.first().map(|quasi| {
+            quasi
+                .cooked
+                .as_ref()
+                .map(|cooked| cooked.to_string())
+                .unwrap_or_else(|| quasi.raw.to_string())
+        }),
+        _ => None,
+    }
+}
+
+/// The imports that name a package's export (carrick#1564). A namespace import
+/// names the module rather than an export, and a relative specifier names no
+/// package, so neither is a client of one.
+fn import_receivers(imports: &HashMap<String, ImportBinding>) -> HashMap<String, ClientRef> {
+    imports
+        .iter()
+        .filter(|(_, import)| {
+            !import.namespace
+                && !import.specifier.starts_with('.')
+                && !import.specifier.starts_with('/')
+        })
+        .map(|(local, import)| {
+            (
+                local.clone(),
+                ClientRef {
+                    package: import.specifier.clone(),
+                    export: import.export.clone(),
+                    instance: None,
+                    contested: false,
+                    called: BTreeSet::new(),
+                    called_computed: false,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Whether the file names `module.exports` or `exports` anywhere.
+fn names_commonjs_exports(module: &Module) -> bool {
+    #[derive(Default)]
+    struct Names {
+        found: bool,
+    }
+    impl Visit for Names {
+        fn visit_expr(&mut self, expr: &Expr) {
+            match expr {
+                Expr::Ident(ident) if ident.sym == *"exports" => self.found = true,
+                Expr::Member(member)
+                    if matches!(&*member.obj, Expr::Ident(obj) if obj.sym == *"module")
+                        && member_prop(member).as_deref() == Some("exports") =>
+                {
+                    self.found = true;
+                }
+                _ => expr.visit_children_with(self),
+            }
+        }
+    }
+    let mut names = Names::default();
+    module.visit_with(&mut names);
+    names.found
 }
 
 /// Every name declared below module scope: in a function (its parameters
@@ -1143,6 +1703,22 @@ impl Visit for DeclaredNames {
         decl.visit_children_with(self);
     }
 
+    // `const h = function api() { … }`: the name is bound inside the
+    // function, where it is not the import (carrick#1568).
+    fn visit_fn_expr(&mut self, expr: &FnExpr) {
+        if let Some(ident) = &expr.ident {
+            self.declare(ident.sym.to_string());
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_class_expr(&mut self, expr: &ClassExpr) {
+        if let Some(ident) = &expr.ident {
+            self.declare(ident.sym.to_string());
+        }
+        expr.visit_children_with(self);
+    }
+
     // A parameter named in a type (`(api: Api) => void`) binds nothing.
     fn visit_ts_type(&mut self, _: &TsType) {}
 
@@ -1188,6 +1764,34 @@ impl<'a> Scope<'a> {
             return None;
         }
         self.module.receivers.get(name)
+    }
+
+    /// The binding a call through `name` names as its client, by the same
+    /// scope rules as [`receiver`](Self::receiver), with an import of another
+    /// module read as whatever that module declares (carrick#1568).
+    fn call_binding(&self, name: &str) -> Option<ClientBinding> {
+        if self.param_index(name).is_some() {
+            return None;
+        }
+        if let Some(client) = self.local_receivers.get(name) {
+            return Some(ClientBinding::Own(client.clone()));
+        }
+        if self.locals.contains_key(name) {
+            return None;
+        }
+        match self.module.receivers.get(name) {
+            Some(client) if client.instance.is_some() => {
+                Some(ClientBinding::Module(name.to_string()))
+            }
+            package => self
+                .module
+                .imports
+                .contains(name)
+                .then(|| ClientBinding::Imported {
+                    local: name.to_string(),
+                    package: package.cloned(),
+                }),
+        }
     }
 }
 
@@ -1967,6 +2571,7 @@ impl Reader<'_> {
                         )
                     })),
             base: Vec::new(),
+            base_scope: None,
             semantics: BTreeSet::new(),
         })
     }
@@ -2032,26 +2637,26 @@ impl Reader<'_> {
     fn call_receiver(&self, callee: &Expr, scope: &Scope<'_>) -> Option<CallReceiver> {
         match callee.unwrap_parens() {
             Expr::Ident(ident) => Some(CallReceiver {
-                client: scope.receiver(ident.sym.as_ref())?.clone(),
+                client: scope.call_binding(ident.sym.as_ref())?,
                 member: None,
             }),
             Expr::Member(member) => {
                 if let Expr::This(_) = &*member.obj {
                     return Some(CallReceiver {
-                        client: field_receiver(member, scope)?.clone(),
+                        client: ClientBinding::Own(field_receiver(member, scope)?.clone()),
                         member: None,
                     });
                 }
                 let member_name = member_prop(member)?;
                 let client = match member.obj.unwrap_parens() {
-                    Expr::Ident(ident) => scope.receiver(ident.sym.as_ref())?,
+                    Expr::Ident(ident) => scope.call_binding(ident.sym.as_ref())?,
                     Expr::Member(field) if matches!(&*field.obj, Expr::This(_)) => {
-                        field_receiver(field, scope)?
+                        ClientBinding::Own(field_receiver(field, scope)?.clone())
                     }
                     _ => return None,
                 };
                 Some(CallReceiver {
-                    client: client.clone(),
+                    client,
                     member: Some(member_name),
                 })
             }
@@ -2489,6 +3094,8 @@ struct Effect {
     /// stated, so a path a caller fills in is joined as it is finally
     /// written (carrick#1564).
     base: Vec<Piece>,
+    /// The file whose scope `base` was read in ([`RequestShape::base_scope`]).
+    base_scope: Option<PathBuf>,
     /// The library-semantics claim ids the request was read through.
     semantics: BTreeSet<String>,
 }
@@ -2512,6 +3119,7 @@ impl Effect {
             body_param,
             verb: shape.kind == RequestKind::Verb,
             base: shape.base.clone(),
+            base_scope: shape.base_scope.clone(),
             semantics: shape.semantics.clone(),
         }
     }
@@ -2620,6 +3228,7 @@ impl Effect {
             body_param,
             verb: self.verb,
             base: fill(&self.base),
+            base_scope: self.base_scope.clone(),
             semantics: self.semantics.clone(),
         }
     }
@@ -2688,16 +3297,244 @@ pub struct SummaryRow {
     /// The library-semantics claim ids the row was read through
     /// (carrick#1564), sorted. Empty on every other row.
     pub library_semantics: Vec<String>,
+    /// For a row whose base was read in another module's scope (carrick#1568):
+    /// that module's environment-read defaults, which describe the base as
+    /// that module's own rows describe it. The file the row sits in has
+    /// defaults of its own that say nothing about this base.
+    pub base_fallbacks: Option<BTreeMap<String, String>>,
 }
 
 /// What the summaries are composed from, as discovery leaves it: every
-/// file's functions and the call sites the call graph resolved. Held until
+/// file's functions, the call sites the call graph resolved, and the module
+/// each import the files read names ([`FileIr::bindings_wanted`]). Held until
 /// the service's library semantics are verified, which needs detection and
 /// the service's sidecar (carrick#1564).
 #[derive(Debug, Default)]
 pub struct RequestSummaryInputs {
     pub files: HashMap<PathBuf, FileIr>,
     pub sites: CallSiteTargets,
+    pub bindings: ImportedBindings,
+}
+
+/// How many modules re-exporting a binding they import are followed to the
+/// one that declares it, beyond the hops the call graph's resolver already
+/// takes. The resolver's own cap, for the same reason.
+const MAX_REEXPORT_HOPS: usize = 8;
+
+/// Every module-scope client of the service, keyed by (file as walked,
+/// binding), with every module's uses of it merged in, and the imports that
+/// read one (carrick#1568).
+///
+/// One instance is one object wherever it is imported, so a use that may
+/// change its base in any module is a use of it in every module: the merge
+/// is what makes the declaring module's own calls, and every importer's, read
+/// nothing once any module writes through it, hands it on, calls a member its
+/// verified surface does not name, or loads its module some other way
+/// (`import("./api")`, a `require` inside a function).
+///
+/// Where a use cannot be followed to what it names, because the resolver
+/// stopped at a cap, the use may be of any instance: no import reads through
+/// one anywhere in the service. The declaring modules still read their own
+/// calls, as they did before an import was followed at all.
+#[derive(Debug, Default)]
+struct LinkedClients {
+    clients: HashMap<(PathBuf, String), ClientRef>,
+    /// (importer, local) -> the client it reads, for an import that reaches
+    /// one only through modules that publish nothing through `exports`.
+    imports: HashMap<(PathBuf, String), (PathBuf, String)>,
+    /// Some use could not be followed to what it names.
+    unfollowable: bool,
+}
+
+/// What an import, followed through the modules that re-export it, reaches.
+enum Declared {
+    /// A module-scope client, and whether every module on the way publishes
+    /// nothing through `exports` ([`FileIr::names_commonjs_exports`]), which
+    /// is when another module may read through it.
+    Client((PathBuf, String), bool),
+    /// A whole module, which a namespace re-exported by name stands for.
+    Module(Vec<PublishedBinding>),
+    /// Something that is not a client.
+    Nothing,
+    /// A cap, or a hop to a module nothing resolves, stopped the walk.
+    Unfollowable,
+}
+
+impl LinkedClients {
+    fn link(files: &HashMap<PathBuf, FileIr>, bindings: &ImportedBindings) -> Self {
+        let mut linked = LinkedClients::default();
+        for (file, ir) in files {
+            for (name, client) in &ir.module_clients {
+                linked
+                    .clients
+                    .insert((file.clone(), name.clone()), client.clone());
+            }
+        }
+        for (file, ir) in files {
+            for (local, used) in &ir.imported {
+                match bindings.get(file, local) {
+                    Some(ImportedBinding::Binding { file: at, name }) => {
+                        match declared_client(files, bindings, at, name) {
+                            Declared::Client(held, readable) => {
+                                linked.merge(&held, used);
+                                if readable {
+                                    linked.imports.insert((file.clone(), local.clone()), held);
+                                }
+                            }
+                            Declared::Module(published) => {
+                                linked.merge_namespace(files, bindings, &published, used);
+                            }
+                            Declared::Nothing => {}
+                            Declared::Unfollowable => linked.unfollowable = true,
+                        }
+                    }
+                    Some(ImportedBinding::Module(published)) => {
+                        linked.merge_namespace(files, bindings, published, used);
+                    }
+                    Some(ImportedBinding::Unfollowable | ImportedBinding::Unresolved) => {
+                        linked.unfollowable = true;
+                    }
+                    None => {}
+                }
+            }
+            // A module loaded some other way: nothing says what is done with
+            // it, so every client it publishes is taken as changed.
+            for specifier in &ir.loads {
+                match bindings.load(file, specifier) {
+                    Some(ImportedBinding::Module(published)) => {
+                        linked.contest_published(files, bindings, published);
+                    }
+                    Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
+                    // A load by `import()` or `require` of a specifier that
+                    // names nothing is among the file's unresolved
+                    // specifiers below; any other call handed one names a
+                    // file or a directory, not a module.
+                    Some(ImportedBinding::Unresolved | ImportedBinding::Binding { .. }) | None => {}
+                }
+            }
+        }
+        // A module some file loads by a specifier that names nothing the
+        // scan can find may be any module of the service, and may do
+        // anything to what it publishes, however the file then uses it.
+        linked.unfollowable |= !bindings.unresolved_in().is_empty();
+        linked
+    }
+
+    /// Merge one module's uses of a binding into the client it names.
+    fn merge(&mut self, held: &(PathBuf, String), used: &BindingUse) {
+        if let Some(client) = self.clients.get_mut(held) {
+            client.contested |= used.contests_client();
+            client.called.extend(used.called.iter().cloned());
+            client.called_computed |= used.called_computed;
+        }
+    }
+
+    /// A namespace reads each binding its module publishes as a member: used
+    /// any way but calling one of them directly, it may reach any of them.
+    fn merge_namespace(
+        &mut self,
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        published: &[PublishedBinding],
+        used: &BindingUse,
+    ) {
+        let contests = used.contests_client() || used.called_computed;
+        for binding in published {
+            match declared_client(files, bindings, &binding.file, &binding.name) {
+                Declared::Client(held, _) => {
+                    if let Some(client) = self.clients.get_mut(&held) {
+                        client.contested |= contests;
+                        if used.called.contains(&Some(binding.published.clone())) {
+                            client.called.insert(None);
+                        }
+                    }
+                }
+                Declared::Module(inner) => {
+                    if contests {
+                        self.contest_published(files, bindings, &inner);
+                    }
+                }
+                Declared::Nothing => {}
+                Declared::Unfollowable => self.unfollowable = true,
+            }
+        }
+    }
+
+    /// Every client `published` reaches, taken as changed.
+    fn contest_published(
+        &mut self,
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        published: &[PublishedBinding],
+    ) {
+        let contested = BindingUse {
+            other: true,
+            ..BindingUse::default()
+        };
+        self.merge_namespace(files, bindings, published, &contested);
+    }
+
+    /// The client a call's receiver binding holds, with every module's uses,
+    /// and the file whose scope its options were read in.
+    fn client_in_scope<'c>(
+        &'c self,
+        file: &'c Path,
+        binding: &'c ClientBinding,
+    ) -> Option<(&'c ClientRef, &'c Path)> {
+        match binding {
+            ClientBinding::Own(client) => Some((client, file)),
+            ClientBinding::Module(name) => self
+                .clients
+                .get(&(file.to_path_buf(), name.clone()))
+                .map(|client| (client, file)),
+            ClientBinding::Imported { local, package } => {
+                let held = (!self.unfollowable)
+                    .then(|| self.imports.get(&(file.to_path_buf(), local.clone())))
+                    .flatten();
+                match held {
+                    Some(held) => self
+                        .clients
+                        .get(held)
+                        .map(|client| (client, held.0.as_path())),
+                    None => package.as_ref().map(|client| (client, file)),
+                }
+            }
+        }
+    }
+}
+
+/// What `name` in `file` reaches, following a module that re-exports a
+/// binding it imports (`import { api } from "./api"; export { api }`) to the
+/// module that declares it.
+fn declared_client(
+    files: &HashMap<PathBuf, FileIr>,
+    bindings: &ImportedBindings,
+    file: &Path,
+    name: &str,
+) -> Declared {
+    let mut at = (file.to_path_buf(), name.to_string());
+    let mut readable = true;
+    for _ in 0..=MAX_REEXPORT_HOPS {
+        let Some(ir) = files.get(&at.0) else {
+            return Declared::Nothing;
+        };
+        readable &= !ir.names_commonjs_exports;
+        if ir.module_clients.contains_key(&at.1) {
+            return Declared::Client(at, readable);
+        }
+        if !ir.imported.contains_key(&at.1) {
+            return Declared::Nothing;
+        }
+        match bindings.get(&at.0, &at.1) {
+            Some(ImportedBinding::Binding { file, name }) => at = (file.clone(), name.clone()),
+            Some(ImportedBinding::Module(published)) => return Declared::Module(published.clone()),
+            Some(ImportedBinding::Unfollowable | ImportedBinding::Unresolved) => {
+                return Declared::Unfollowable;
+            }
+            None => return Declared::Nothing,
+        }
+    }
+    Declared::Unfollowable
 }
 
 /// Everything the pass states, per file (keyed by the file as walked).
@@ -2747,6 +3584,7 @@ struct Composer<'a> {
     files: &'a HashMap<PathBuf, FileIr>,
     sites: &'a CallSiteTargets,
     semantics: &'a LibrarySemantics,
+    clients: LinkedClients,
     memo: HashMap<(PathBuf, String), Summary>,
     in_progress: HashSet<(PathBuf, String)>,
 }
@@ -2814,7 +3652,7 @@ impl Composer<'_> {
                     }
                 }
                 None => {
-                    if let Some(request) = shape_of(call, self.semantics) {
+                    if let Some(request) = shape_of(call, file, self.semantics, &self.clients) {
                         summary
                             .effects
                             .insert(Effect::from_shape(&request, file, call.site.line));
@@ -2850,6 +3688,7 @@ pub fn summarize(
         files,
         sites: &inputs.sites,
         semantics,
+        clients: LinkedClients::link(files, &inputs.bindings),
         memo: HashMap::new(),
         in_progress: HashSet::new(),
     };
@@ -2916,7 +3755,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         // already states it.
                         continue;
                     };
-                    match row(&instantiated, call, reaches, false) {
+                    match row(&instantiated, file, composer.files, call, reaches, false) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -2942,12 +3781,12 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                 // row, and claims the site as a summary does anywhere else:
                 // the passes that read the site's own source cannot read the
                 // client's base, so their reading is not the one to keep.
-                if let Some(request) = shape_of(call, composer.semantics) {
+                if let Some(request) = shape_of(call, file, composer.semantics, &composer.clients) {
                     let library = request.kind == RequestKind::Library;
                     if library || (request.kind != RequestKind::Verb && !request.url_inline) {
                         let effect = Effect::from_shape(&request, file, call.site.line);
                         if !effect.has_params() {
-                            match row(&effect, call, None, !library) {
+                            match row(&effect, file, composer.files, call, None, !library) {
                                 Some(row) => rows.push(row),
                                 None => index.undetermined += 1,
                             }
@@ -2975,6 +3814,8 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
 /// stated.
 fn row(
     effect: &Effect,
+    file: &Path,
+    files: &HashMap<PathBuf, FileIr>,
     call: &CallIr,
     reaches_request: Option<String>,
     own_site: bool,
@@ -2983,6 +3824,9 @@ fn row(
     let MethodValue::Lit(method) = &effect.method else {
         return None;
     };
+    if !base_reads_the_same_in(effect, file) {
+        return None;
+    }
     let target = render_target(&join_base(&effect.base, &effect.url))?;
     let body_literals = effect
         .body
@@ -3003,16 +3847,92 @@ fn row(
         reaches_request,
         own_site,
         library_semantics: effect.semantics.iter().cloned().collect(),
+        base_fallbacks: effect
+            .base_scope
+            .as_ref()
+            .filter(|scope| scope.as_path() != file)
+            .map(|scope| {
+                files
+                    .get(scope)
+                    .map(|ir| ir.env_fallbacks.clone())
+                    .unwrap_or_default()
+            }),
     })
+}
+
+/// Whether a row stated in `file` states the base `effect` was read with
+/// (carrick#1568).
+///
+/// A row's target names an opaque base by the expression that holds it
+/// (`${config.apiUrl}`), and the passes after this one read that name in the
+/// file the row sits in. A base read in another module's scope, a client that
+/// module declares, would then be read as whatever the stating file binds to
+/// that name, or as nothing. So such a row is stated only where every piece
+/// of its base means the same in every file: text the source writes, or an
+/// environment read.
+fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
+    match &effect.base_scope {
+        Some(scope) if scope != file => effect.base.iter().all(|piece| match piece {
+            Piece::Lit(_) => true,
+            Piece::Opaque(text) => reads_the_environment(text),
+            Piece::Param(..) | Piece::Unknown => false,
+        }),
+        _ => true,
+    }
+}
+
+/// Whether `text` is exactly an environment read, in one of the spellings the
+/// runtimes give it (as [`crate::env_alias`] reads them): `process.env.NAME`,
+/// `import.meta.env.NAME`, either with a string index, or `Deno.env.get("NAME")`.
+fn reads_the_environment(text: &str) -> bool {
+    let name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let quoted = |inner: &str| {
+        [('"', '"'), ('\'', '\'')].iter().any(|(open, close)| {
+            inner
+                .strip_prefix(*open)
+                .and_then(|rest| rest.strip_suffix(*close))
+                .is_some_and(name)
+        })
+    };
+    ["process.env", "import.meta.env"].iter().any(|object| {
+        text.strip_prefix(object).is_some_and(|rest| {
+            rest.strip_prefix('.').is_some_and(name)
+                || rest
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.strip_suffix(']'))
+                    .is_some_and(quoted)
+        })
+    }) || text
+        .strip_prefix("Deno.env.get(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(quoted)
 }
 
 /// What a call sends when the call graph resolves it to nothing of this
 /// service: through a verified library client, what the client's claims say
 /// (carrick#1564); otherwise the shape the call is written in.
-fn shape_of<'c>(call: &'c CallIr, semantics: &LibrarySemantics) -> Option<Cow<'c, RequestShape>> {
+fn shape_of<'c>(
+    call: &'c CallIr,
+    file: &Path,
+    semantics: &LibrarySemantics,
+    clients: &LinkedClients,
+) -> Option<Cow<'c, RequestShape>> {
     call.receiver
         .as_ref()
-        .and_then(|receiver| library_shape(receiver, &call.args, semantics))
+        .and_then(|receiver| {
+            let (client, scope) = clients.client_in_scope(file, &receiver.client)?;
+            let mut shape =
+                library_shape(client, receiver.member.as_deref(), &call.args, semantics)?;
+            if !shape.base.is_empty() {
+                shape.base_scope = Some(scope.to_path_buf());
+            }
+            Some(shape)
+        })
         .map(Cow::Owned)
         .or_else(|| call.request.as_ref().map(Cow::Borrowed))
 }
@@ -3034,14 +3954,14 @@ fn shape_of<'c>(call: &'c CallIr, semantics: &LibrarySemantics) -> Option<Cow<'c
 /// itself. Every base key detection claims for the client counts, verified
 /// or not.
 fn library_shape(
-    receiver: &CallReceiver,
+    client: &ClientRef,
+    member: Option<&str>,
     args: &[Value],
     semantics: &LibrarySemantics,
 ) -> Option<RequestShape> {
     if semantics.is_empty() {
         return None;
     }
-    let client = &receiver.client;
     if client.contested {
         return None;
     }
@@ -3084,10 +4004,7 @@ fn library_shape(
         }
     };
 
-    let verb = receiver
-        .member
-        .as_deref()
-        .and_then(|member| surface.verb(member));
+    let verb = member.and_then(|member| surface.verb(member));
     // The data a `(path, body)` verb sends is not options: a spread in it,
     // or a field that happens to share a base key's name, says nothing
     // about where the request goes.
@@ -3133,15 +4050,13 @@ fn library_shape(
             )
         }
         None => {
-            let request = surface
-                .requests(receiver.member.as_deref())
-                .find(|request| {
-                    matches!(
-                        (request.args, args.first()),
-                        (SemanticsRequestArgs::Config, Some(Value::Obj(_)))
-                            | (SemanticsRequestArgs::PathOptions, Some(Value::Str(_)))
-                    )
-                })?;
+            let request = surface.requests(member).find(|request| {
+                matches!(
+                    (request.args, args.first()),
+                    (SemanticsRequestArgs::Config, Some(Value::Obj(_)))
+                        | (SemanticsRequestArgs::PathOptions, Some(Value::Str(_)))
+                )
+            })?;
             let (url, options) = match (request.args, args.first(), args.get(1)) {
                 (SemanticsRequestArgs::Config, Some(Value::Obj(config)), _) => {
                     match config.fields.get(request.url_key.as_deref()?) {
@@ -3187,6 +4102,7 @@ fn library_shape(
         body,
         url_inline: false,
         base,
+        base_scope: None,
         semantics: used,
     })
 }
