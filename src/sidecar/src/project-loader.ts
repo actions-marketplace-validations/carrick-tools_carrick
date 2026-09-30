@@ -14,7 +14,8 @@ import { Project, type CompilerOptions } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
-import { DenoProject, findDenoConfig } from './capture/index.js';
+import { DenoProject, findDenoConfig, serviceConfigPath } from './capture/index.js';
+import { moduleFormatResolutionHost } from './module-format.js';
 
 /**
  * Options for ProjectLoader construction
@@ -146,6 +147,12 @@ export class ProjectLoader {
    * build, so it is there from the first `getProject()` onwards.
    */
   private denoProject: DenoProject | undefined;
+  /** The tsconfig the service names, when the project is built from one. */
+  private namedTsconfigPath: string | undefined;
+  /** Each file's owning config (carrick#1604), resolved on first use. */
+  private configPathFor: ((file?: string) => string) | undefined;
+  /** Programs built for owning projects other than the named tsconfig. */
+  private readonly ownerProjects = new Map<string, Project>();
   private readonly repoRoot: string;
   private readonly tsconfigPath: string | undefined;
   private readonly tsconfigSnapshot: TsconfigSnapshot | undefined;
@@ -239,11 +246,8 @@ export class ProjectLoader {
           };
         } else if (tsconfigPath) {
           this.log(`Project will load with tsconfig: ${tsconfigPath}`);
-          this.buildProject = () =>
-            new Project({
-              tsConfigFilePath: tsconfigPath,
-              skipAddingFilesFromTsConfig: false,
-            });
+          this.namedTsconfigPath = tsconfigPath;
+          this.buildProject = () => this.projectFromConfig(tsconfigPath);
         } else {
           this.log('No tsconfig.json found, using default compiler options');
           this.buildProject = () => {
@@ -344,6 +348,52 @@ export class ProjectLoader {
     }
 
     return result;
+  }
+
+  /** A ts-morph project built from one tsconfig and the files it lists. */
+  private projectFromConfig(configPath: string): Project {
+    return new Project({
+      tsConfigFilePath: configPath,
+      skipAddingFilesFromTsConfig: false,
+      // Each import resolves in its file's own module format (carrick#1619).
+      resolutionHost: moduleFormatResolutionHost,
+    });
+  }
+
+  /**
+   * Which project types `file` (carrick#1604): the key of its owning
+   * project's program, or `''` for the default one. A tsconfig that
+   * references other projects owns only the files it lists itself; any other
+   * file belongs to the first project it references (depth-first, in
+   * declared order) whose file list includes it, and is typed under that
+   * project's options. A file no project includes, and every request that
+   * names no file, uses the default project, built from the named tsconfig
+   * as before.
+   */
+  projectKeyFor(file?: string): string {
+    if (!this.namedTsconfigPath || file === undefined) return '';
+    this.configPathFor ??= serviceConfigPath(this.namedTsconfigPath, (d) => this.logError(d));
+    const config = this.configPathFor(path.resolve(this.repoRoot, file));
+    return config === this.namedTsconfigPath ? '' : config;
+  }
+
+  /**
+   * The project behind a key from `projectKeyFor`, built on first use and
+   * kept: a service whose files all belong to one project builds one.
+   */
+  getProjectFor(key: string): Project {
+    if (key === '') return this.getProject();
+    let project = this.ownerProjects.get(key);
+    if (!project) {
+      const startTime = performance.now();
+      project = this.projectFromConfig(key);
+      this.ownerProjects.set(key, project);
+      this.log(
+        `Project for ${key}, the project that owns the requested files, built in ` +
+          `${Math.round(performance.now() - startTime)}ms (${project.getSourceFiles().length} source files)`
+      );
+    }
+    return project;
   }
 
   /**
