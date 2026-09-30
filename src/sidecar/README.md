@@ -105,6 +105,8 @@ Re-initialising re-scopes the sidecar to another root, and drops the previous pr
 
 `tsconfig_path` is optional and relative to `repo_root`. `tsconfig_snapshot` and `pinned_dependencies` are optional and carry another repo's compiler options / exact versions when the sidecar has to stand in for a tree it cannot see.
 
+When the tsconfig `references` other projects, each file is typed under the project that owns it, found the way TypeScript's editor finds a file's project: the named config if it lists the file, else the first project its references reach (depth-first, in declared order) that does. `infer`, `bundle` and `retype_check` are answered by that project's program, built the first time a request needs it. `capture_v2` resolves each anchor in its owner's program and emits the surface once, under the project that owns the most anchors; an anchor from another project whose text names a module is demoted when the two projects' options differ. A file no project lists, and a request that names no file, uses the named tsconfig. A reference that cannot be read is skipped and reported (carrick#1604).
+
 #### Deno projects
 
 Unless a TypeScript config is explicitly selected, `init` and `capture_v2` discover
