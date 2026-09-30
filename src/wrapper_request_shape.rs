@@ -23,6 +23,10 @@
 //!   wrapper parameterizes it, so the SITE's argument is the real method) makes
 //!   the whole module's shape unknown. The site keeps whatever extraction gave
 //!   it.
+//! - So does a bag whose method a spread or a computed key may write
+//!   (`fetch(url, { ...init, headers })`): an entry overwrites the ones before
+//!   it, so only a `method` written after every such entry is read, and the
+//!   verb a call is spelled with still counts (carrick#1603).
 //! - Requests that disagree on the method make the module's shape unknown: a
 //!   delegating site could be reaching either.
 //!
@@ -130,6 +134,73 @@ pub(crate) fn prop_value<'a>(obj: &'a ObjectLit, name: &str) -> Option<Option<&'
     None
 }
 
+/// What a request-options bag says about its `method`, read the way the
+/// runtime builds the object: each entry overwrites the ones before it.
+#[derive(Debug, Clone, Copy)]
+enum BagMethod<'a> {
+    /// No entry in the bag can put a `method` in it.
+    Absent,
+    /// A `method` key is the last entry that can: its value, or `None` when the
+    /// key is not a plain `key: value` pair (`{ method }`, a getter).
+    Written(Option<&'a Expr>),
+    /// A spread, or a computed key, comes after every `method` key, so the bag
+    /// may carry a method the source does not state: `{ ...init, headers }`
+    /// sends whatever `init` holds (carrick#1603).
+    Open,
+}
+
+/// Read a bag's `method` as the last entry that can write one.
+fn bag_method(obj: &ObjectLit) -> BagMethod<'_> {
+    let mut stated = BagMethod::Absent;
+    for entry in &obj.props {
+        let PropOrSpread::Prop(prop) = entry else {
+            stated = BagMethod::Open;
+            continue;
+        };
+        if prop_key_name(entry).as_deref() == Some("method") {
+            stated = BagMethod::Written(match &**prop {
+                Prop::KeyValue(kv) => Some(&*kv.value),
+                _ => None,
+            });
+            continue;
+        }
+        let key = match &**prop {
+            Prop::KeyValue(kv) => Some(&kv.key),
+            Prop::Method(method) => Some(&method.key),
+            Prop::Getter(getter) => Some(&getter.key),
+            Prop::Setter(setter) => Some(&setter.key),
+            Prop::Shorthand(_) | Prop::Assign(_) => None,
+        };
+        if matches!(key, Some(PropName::Computed(_))) {
+            stated = BagMethod::Open;
+        }
+    }
+    stated
+}
+
+/// The method a request states, when a request-options bag was found.
+///
+/// `absent` answers for a bag with no entry that can write a method; the two
+/// readers below differ there and nowhere else. A bag whose method a spread or
+/// computed key may write states the verb the call is spelled with, and
+/// otherwise nothing: `request_summary` reads an open bag the same way.
+fn bag_verb(
+    obj: &ObjectLit,
+    verb: Option<String>,
+    absent: impl FnOnce(Option<String>) -> Option<String>,
+) -> Option<String> {
+    match bag_method(obj) {
+        // A `method` key whose value is not a string literal is the
+        // parameterized wrapper: only the delegating site knows the method.
+        BagMethod::Written(value) => {
+            let normalized = normalize_manifest_method(&literal_string(value?)?);
+            is_http_method(&normalized).then_some(normalized)
+        }
+        BagMethod::Open => verb,
+        BagMethod::Absent => absent(verb),
+    }
+}
+
 /// Whether an object literal looks like a request-options bag: it carries at
 /// least one of the four keys every HTTP client spells the same way.
 pub(crate) fn is_request_options(obj: &ObjectLit) -> bool {
@@ -192,40 +263,24 @@ pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> Req
     // call was spelled with, because a client that accepts both is configured
     // by the bag.
     let method = match options {
-        Some((_, obj)) => match prop_value(obj, "method") {
-            // A `method` key whose value is not a string literal is the
-            // parameterized wrapper: only the delegating site knows the method.
-            Some(value) => match value.and_then(literal_string) {
-                Some(literal) => {
-                    let normalized = normalize_manifest_method(&literal);
-                    if !is_http_method(&normalized) {
-                        return RequestShapeSignal::Unreadable;
-                    }
-                    normalized
-                }
-                None => return RequestShapeSignal::Unreadable,
-            },
-            // No `method` key at all. The verb the call was spelled with is the
-            // method; without one this module's shape stays unknown, even
-            // though a bag with no `method` is a GET everywhere it is written.
-            //
-            // The two readers of that fact want different things. Here the fold
-            // propagates a method AND a body-presence to delegating sites that
-            // state no URL of their own, so a wrong `GET` also strips their
-            // payload anchor, and the sites are only reachable through a module
-            // whose other requests may disagree. `imported_request_member`
-            // reads one member's own call, which has already stated a URL and a
-            // request-options object beside it, so there the same absence is
-            // read as the GET it is.
-            None => match verb {
-                Some(verb) => verb,
-                None => return RequestShapeSignal::Unreadable,
-            },
-        },
-        None => match verb {
-            Some(verb) => verb,
-            None => return RequestShapeSignal::Unreadable,
-        },
+        // No entry that can write a `method` at all. The verb the call was
+        // spelled with is the method; without one this module's shape stays
+        // unknown, even though a bag with no `method` is a GET everywhere it
+        // is written.
+        //
+        // The two readers of that fact want different things. Here the fold
+        // propagates a method AND a body-presence to delegating sites that
+        // state no URL of their own, so a wrong `GET` also strips their
+        // payload anchor, and the sites are only reachable through a module
+        // whose other requests may disagree. `imported_request_member` reads
+        // one member's own call, which has already stated a URL and a
+        // request-options object beside it, so there the same absence is read
+        // as the GET it is.
+        Some((_, obj)) => bag_verb(obj, verb, |verb| verb),
+        None => verb,
+    };
+    let Some(method) = method else {
+        return RequestShapeSignal::Unreadable;
     };
 
     RequestShapeSignal::Known(WrapperRequestShape {
@@ -242,11 +297,23 @@ pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> Req
 /// anchors, so a wrong `GET` would delete a real one. This reader corrects only
 /// the VERB, and only at a site that states none of its own, so the same
 /// absence is read the way [`crate::imported_request_member`] reads it — a
-/// request-options bag with no `method` is a GET.
+/// request-options bag with no `method` and no payload is a GET.
+///
+/// A bag carrying a payload (`body`, `data`) and no method states no GET. A
+/// body sent with no method is a verb something else supplies, and the same
+/// keys are handed to calls that are not requests at all (`decode({ data })`,
+/// `logger.info({ body })`), which the key alone cannot tell apart
+/// (carrick#1624). Such a call reads as `Unreadable`, so a module holding one
+/// states no verb: the pass fails closed rather than read the call as nothing
+/// and take a verb from the module's other calls or its imports.
+/// `imported_request_member` and `request_summary` read a payload with no
+/// method the same way.
 ///
 /// Everything else is identical, including which calls are requests at all: a
 /// non-literal `method` is still the parameterized wrapper, and a call with
-/// neither a verb nor an options bag is still not a request.
+/// neither a verb nor an options bag is still not a request. So is how a spread
+/// is read: a bag a spread may write a `method` into states no GET, because
+/// the absence it would be read from is not in the source (carrick#1603).
 pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> RequestShapeSignal {
     let verb = verb_from_callee_property(callee_property);
     let options = request_options_argument(call);
@@ -254,30 +321,26 @@ pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> Requ
         return RequestShapeSignal::NotARequest;
     }
     let method = match options {
-        Some((_, obj)) => match prop_value(obj, "method") {
-            Some(value) => match value.and_then(literal_string) {
-                Some(literal) => {
-                    let normalized = normalize_manifest_method(&literal);
-                    if !is_http_method(&normalized) {
-                        return RequestShapeSignal::Unreadable;
-                    }
-                    normalized
-                }
-                None => return RequestShapeSignal::Unreadable,
-            },
-            // The difference from `call_request_shape`, and the whole reason
-            // this exists: a bag that names no method sends a GET.
-            None => verb.unwrap_or_else(|| "GET".to_string()),
-        },
-        None => match verb {
-            Some(verb) => verb,
-            None => return RequestShapeSignal::Unreadable,
-        },
+        // The difference from `call_request_shape`, and the whole reason this
+        // exists: a bag that names no method and carries no payload sends a
+        // GET.
+        Some((_, obj)) => bag_verb(obj, verb, |verb| {
+            verb.or_else(|| (!carries_payload(obj)).then(|| "GET".to_string()))
+        }),
+        None => verb,
+    };
+    let Some(method) = method else {
+        return RequestShapeSignal::Unreadable;
     };
     RequestShapeSignal::Known(WrapperRequestShape {
         method,
         has_body: body_presence(call, options),
     })
+}
+
+/// Whether a request-options bag names a payload.
+fn carries_payload(obj: &ObjectLit) -> bool {
+    prop_value(obj, "body").is_some() || prop_value(obj, "data").is_some()
 }
 
 /// Whether the call carries a request body.
@@ -289,7 +352,7 @@ pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> Requ
 fn body_presence(call: &CallExpr, options: Option<(usize, &ObjectLit)>) -> Option<bool> {
     let positional = call.args.len();
     if let Some((index, obj)) = options {
-        if prop_value(obj, "body").is_some() || prop_value(obj, "data").is_some() {
+        if carries_payload(obj) {
             return Some(true);
         }
         // Another object literal beside the bag is a payload or a parameter
@@ -535,6 +598,53 @@ export async function list() {
                 method: "GET".to_string(),
                 has_body: Some(false),
             })
+        );
+    }
+
+    /// carrick#1603: a spread written after the wrapper's own `method` may
+    /// overwrite it, so the module states no method for its importers. One
+    /// written after every spread is the method sent.
+    #[test]
+    fn a_spread_after_the_method_leaves_the_module_unknown() {
+        assert_eq!(
+            module_shape(
+                r#"
+export async function send(path: string, init?: RequestInit) {
+  return fetch(`${BASE}${path}`, { method: "POST", ...init });
+}
+"#,
+            ),
+            None
+        );
+        assert_eq!(
+            module_shape(
+                r#"
+export async function send(path: string, init?: RequestInit) {
+  return fetch(`${BASE}${path}`, { ...init, method: "POST" });
+}
+"#,
+            )
+            .map(|shape| shape.method)
+            .as_deref(),
+            Some("POST")
+        );
+    }
+
+    /// A call spelled with its verb keeps it beside a spread in its options:
+    /// the verb is what the source states.
+    #[test]
+    fn a_verb_spelled_call_keeps_its_verb_beside_a_spread() {
+        assert_eq!(
+            module_shape(
+                r#"
+export async function create(config?: object) {
+  return client.post(`${BASE}/things`, { ...config, headers: {} });
+}
+"#,
+            )
+            .map(|shape| shape.method)
+            .as_deref(),
+            Some("POST")
         );
     }
 
