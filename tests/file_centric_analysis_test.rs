@@ -91,6 +91,7 @@ fn create_express_detection() -> DetectionResult {
         messaging_clients: vec![],
         socket_clients: vec![],
         notes: "Test detection result".to_string(),
+        client_semantics: None,
     }
 }
 
@@ -159,6 +160,8 @@ fn test_file_analysis_result_structures() {
         resolution_source: None,
         dispatch: None,
         reaches_request: None,
+        body_literals: Default::default(),
+        library_semantics: Vec::new(),
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -256,6 +259,8 @@ fn test_file_analysis_result_serialization() {
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }],
         dispatch_tables: Vec::new(),
     };
@@ -309,6 +314,8 @@ fn test_processing_stats_tracking() {
         files_analysis_failed: 0,
         files_skipped_unrouted_protocol: 0,
         deterministic_rows_emitted: Default::default(),
+        summary_rows_withdrawn: 0,
+        summary_dispatch_settled: 0,
         model_rows_joined: 0,
         model_rows_reconciled: 0,
         model_routes_kept_without_a_site: 0,
@@ -613,6 +620,8 @@ fn test_data_call_extraction() {
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
+                library_semantics: Vec::new(),
             },
             DataCallResult {
                 call_kind: None,
@@ -636,6 +645,8 @@ fn test_data_call_extraction() {
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
+                library_semantics: Vec::new(),
             },
             DataCallResult {
                 call_kind: None,
@@ -659,6 +670,8 @@ fn test_data_call_extraction() {
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
+                library_semantics: Vec::new(),
             },
         ],
         dispatch_tables: Vec::new(),

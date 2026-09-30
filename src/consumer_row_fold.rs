@@ -441,6 +441,8 @@ mod tests {
             dispatch: None,
             resolution_source: Some(ResolutionSource::Model),
             reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }
     }
 

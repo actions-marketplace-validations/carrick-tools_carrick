@@ -270,6 +270,9 @@ pub struct RetryPolicy {
     /// Whether this call's sleeps draw on the run-wide budget
     /// ([`crate::retry_budget`]) as well as its own.
     run_budgeted: bool,
+    /// Lease waits ([`ANALYSIS_IN_FLIGHT_CODE`]) sat out without spending an
+    /// attempt. Past it a lease wait is a retriable error like any other.
+    max_in_flight_waits: u32,
 }
 
 impl RetryPolicy {
@@ -280,6 +283,7 @@ impl RetryPolicy {
         // Never the binding limit: the attempts run out first (~126 s at most).
         wait_budget: Duration::from_secs(3600),
         run_budgeted: false,
+        max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
     };
 
     /// A call a whole service depends on: exponential with jitter, sleeps of
@@ -291,6 +295,20 @@ impl RetryPolicy {
         max_delay: PATIENT_RETRY_MAX_DELAY,
         wait_budget: Duration::from_secs(600),
         run_budgeted: true,
+        max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
+    };
+
+    /// A best-effort call whose failure costs nothing: one HTTP attempt, no
+    /// retry, and no re-send after a lease wait either. The re-ask for
+    /// library semantics is one (carrick#1564): a failure keeps what the
+    /// service already has, and the next scan asks again, so a retry only
+    /// spends.
+    pub const ONCE: Self = Self {
+        max_attempts: 1,
+        max_delay: Duration::ZERO,
+        wait_budget: Duration::ZERO,
+        run_budgeted: false,
+        max_in_flight_waits: 0,
     };
 
     /// Whether a failed attempt `attempt` may be followed by a sleep of `next`
@@ -671,8 +689,11 @@ impl AgentService {
         record_request(task_path);
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            if let Some(error) = take_mock_failure(task_path, body) {
-                return Err(error);
+            if let Some(outcome) = take_mock_override(task_path, body) {
+                return outcome.map(|text| LambdaOutcome {
+                    text,
+                    guidance_key: mock_guidance_key(task_path, body),
+                });
             }
             return Ok(LambdaOutcome {
                 text: generate_mock_for_task(task_path, body, mock_seed),
@@ -745,7 +766,7 @@ impl AgentService {
         // What this call has slept so far, against the policy's wait budget.
         let mut waited = Duration::ZERO;
         let route_limit = self.limits.for_route(path);
-        // Lease waits sat out so far, against [`MAX_IN_FLIGHT_WAITS`]. Counted
+        // Lease waits sat out so far, against the policy's cap. Counted
         // by hand, with `attempt`, so a wait can hand its attempt back.
         let mut in_flight_waits: u32 = 0;
         let mut attempt: u32 = 0;
@@ -1046,14 +1067,17 @@ impl AgentService {
                     // back. The model was not asked, so `X-Carrick-Attempt`
                     // does not advance either: a re-send that finds the lease
                     // gone and becomes the holder keeps the chain it had.
-                    if in_flight && call_err.retriable && in_flight_waits < MAX_IN_FLIGHT_WAITS {
+                    if in_flight
+                        && call_err.retriable
+                        && in_flight_waits < policy.max_in_flight_waits
+                    {
                         in_flight_waits += 1;
                         let wait_time =
                             in_flight_wait(jitter_seed(), retry_after, policy.max_delay);
                         debug!(
                             "An earlier request for this {} call is still being analysed; \
                              collecting its answer in {:?} (wait {}/{})",
-                            path, wait_time, in_flight_waits, MAX_IN_FLIGHT_WAITS
+                            path, wait_time, in_flight_waits, policy.max_in_flight_waits
                         );
                         drop(permit);
                         drop(route_slot);
@@ -1158,29 +1182,44 @@ fn mock_guidance_key<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option
     Some(format!("{:x}", hasher.finalize()))
 }
 
-/// A failure an offline run answers instead of the mock response, for the
-/// tests that prove a scan survives a call the cloud never answered.
-struct MockFailure {
+/// What an offline run answers instead of the mock response: a failure, for
+/// the tests that prove a scan survives a call the cloud never answered, or
+/// another answer, for the tests where one ask is answered differently from
+/// the next.
+struct MockOverride {
     task_path: String,
     body_contains: String,
     remaining: usize,
-    /// What the call returns: the error the retry loop hands back once it has
-    /// finished with the answer.
-    error: AgentCallError,
+    /// What the call returns: the answer's text, or the error the retry loop
+    /// hands back once it has finished with the answer.
+    outcome: Result<String, AgentCallError>,
 }
 
-fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
-    static FAILURES: OnceLock<Mutex<Vec<MockFailure>>> = OnceLock::new();
-    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+fn mock_overrides() -> &'static Mutex<Vec<MockOverride>> {
+    static OVERRIDES: OnceLock<Mutex<Vec<MockOverride>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn push_mock_failure(task_path: &str, body_contains: &str, times: usize, error: AgentCallError) {
-    mock_failures().lock().unwrap().push(MockFailure {
+fn push_mock_override(
+    task_path: &str,
+    body_contains: &str,
+    times: usize,
+    outcome: Result<String, AgentCallError>,
+) {
+    mock_overrides().lock().unwrap().push(MockOverride {
         task_path: task_path.to_string(),
         body_contains: body_contains.to_string(),
         remaining: times,
-        error,
+        outcome,
     });
+}
+
+/// Make the next `times` offline calls to `task_path` whose serialized body
+/// contains `body_contains` answer `text` instead of the mock response.
+/// Honoured only under `CARRICK_MOCK_ALL`, as [`inject_mock_failure`] is.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_answer(task_path: &str, body_contains: &str, times: usize, text: &str) {
+    push_mock_override(task_path, body_contains, times, Ok(text.to_string()));
 }
 
 /// Make the next `times` offline calls to `task_path` whose serialized body
@@ -1193,14 +1232,14 @@ fn push_mock_failure(task_path: &str, body_contains: &str, times: usize, error: 
 /// retry loop is not run: the error is what that loop returns once it is spent.
 #[allow(dead_code)] // Called by tests/ through the library, never by the binary.
 pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
-    push_mock_failure(
+    push_mock_override(
         task_path,
         body_contains,
         times,
-        AgentCallError::transient(
+        Err(AgentCallError::transient(
             "model_error",
             "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
-        ),
+        )),
     );
 }
 
@@ -1216,11 +1255,11 @@ pub fn inject_mock_envelope(task_path: &str, body_contains: &str, times: usize, 
         serde_json::from_str(envelope).expect("an injected envelope parses");
     assert!(!parsed.success, "an injected envelope is a failed one");
     let error = parsed.error.expect("an injected envelope carries an error");
-    push_mock_failure(
+    push_mock_override(
         task_path,
         body_contains,
         times,
-        call_error_from_envelope(error),
+        Err(call_error_from_envelope(error)),
     );
 }
 
@@ -1242,17 +1281,20 @@ pub fn inject_mock_budget_refusal(
     inject_mock_envelope(task_path, body_contains, times, &envelope.to_string());
 }
 
-fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option<AgentCallError> {
-    let mut failures = mock_failures().lock().unwrap();
-    if failures.is_empty() {
+fn take_mock_override<B: Serialize + ?Sized>(
+    task_path: &str,
+    body: &B,
+) -> Option<Result<String, AgentCallError>> {
+    let mut overrides = mock_overrides().lock().unwrap();
+    if overrides.is_empty() {
         return None;
     }
     let serialized = serde_json::to_string(body).unwrap_or_default();
-    let failure = failures.iter_mut().find(|f| {
-        f.remaining > 0 && f.task_path == task_path && serialized.contains(&f.body_contains)
+    let found = overrides.iter_mut().find(|o| {
+        o.remaining > 0 && o.task_path == task_path && serialized.contains(&o.body_contains)
     })?;
-    failure.remaining -= 1;
-    Some(failure.error.clone())
+    found.remaining -= 1;
+    Some(found.outcome.clone())
 }
 
 /// Request body for per-task lambda endpoints (e.g. /analyze-file).
@@ -2807,7 +2849,7 @@ pub(crate) mod tests {
             .is_err();
         // SAFETY: serial test; leave the process as it was found.
         unsafe { env::remove_var("CARRICK_MOCK_ALL") };
-        mock_failures().lock().unwrap().clear();
+        mock_overrides().lock().unwrap().clear();
 
         assert!(
             sent,
@@ -3003,6 +3045,372 @@ pub(crate) mod tests {
         // An absurd hint is capped before it is jittered.
         assert!(
             retry_wait(1, u32::MAX, Some(Duration::from_secs(86_400))) <= RETRY_AFTER_CAP * 3 / 2
+        );
+    }
+
+    /// A stub `/framework-detect` that counts every connection it accepts
+    /// until told to stop: each is answered with the next canned response,
+    /// and any beyond them with a failure nothing sends again.
+    struct CountingStub {
+        api_base: String,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl CountingStub {
+        fn start(responses: Vec<(u16, String)>) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let api_base = format!("http://{}", listener.local_addr().unwrap());
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (counted, stopped) = (attempts.clone(), stop.clone());
+            let server = std::thread::spawn(move || {
+                let beyond = (
+                    500,
+                    r#"{"success":false,"error":{"code":"bad_request","message":"no more answers","retriable":false}}"#
+                        .to_string(),
+                );
+                while !stopped.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw).to_string();
+                        let complete = text.find("\r\n\r\n").is_some_and(|end| {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            raw.len() >= end + 4 + length
+                        });
+                        if n == 0 || complete {
+                            break;
+                        }
+                    }
+                    let (status, body) = responses
+                        .get(counted.fetch_add(1, Ordering::SeqCst))
+                        .unwrap_or(&beyond);
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                api_base,
+                attempts,
+                stop,
+                server,
+            }
+        }
+
+        /// Every connection the server accepted. Called once the calls under
+        /// test have returned, so any attempt they made has already arrived.
+        fn attempts(self) -> usize {
+            self.stop.store(true, Ordering::SeqCst);
+            self.server.join().unwrap();
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A retriable failure, which the standard policy would send again.
+    fn retriable_failure() -> (u16, String) {
+        (
+            503,
+            r#"{"success":false,"error":{"code":"model_error","message":"overloaded","retriable":true}}"#
+                .to_string(),
+        )
+    }
+
+    /// carrick#1564 review, finding 5: a library-semantics re-ask is one HTTP
+    /// attempt. A retriable failure the standard policy would send again after
+    /// a backoff ends the call, and the call returns before the count is read.
+    #[tokio::test]
+    async fn the_library_semantics_reask_makes_one_http_attempt() {
+        let stub = CountingStub::start(vec![retriable_failure()]);
+        let result = crate::engine::reask_agent()
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &stub.api_base,
+                "/framework-detect",
+                &serde_json::json!({ "ask_client_semantics": true }),
+            )
+            .await;
+        assert!(result.is_err(), "the failure is the call's answer");
+        assert_eq!(stub.attempts(), 1);
+    }
+
+    /// carrick#1564 re-review, R5: a lease wait is no free re-send for the
+    /// re-ask either. The standard policy sits out eight of them without
+    /// spending an attempt; the re-ask's single attempt ends on the first.
+    #[tokio::test]
+    async fn the_library_semantics_reask_sits_out_no_lease_wait() {
+        let in_flight = (
+            409,
+            r#"{"success":false,"error":{"code":"analysis_in_flight","message":"still being analysed","retriable":true}}"#
+                .to_string(),
+        );
+        let stub = CountingStub::start(vec![in_flight; 9]);
+        let result = crate::engine::reask_agent()
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &stub.api_base,
+                "/framework-detect",
+                &serde_json::json!({ "ask_client_semantics": true }),
+            )
+            .await;
+        assert!(result.is_err(), "the wait is the call's answer");
+        assert_eq!(stub.attempts(), 1);
+    }
+
+    /// The contract's sample detection (carrick#1564), as `/framework-detect`
+    /// answers it, after `edit`. The sample leaves `fixture-slow-http`
+    /// pending and `@fixture/internal-sdk` skipped.
+    fn detection_answer(edit: impl FnOnce(&mut serde_json::Value)) -> (u16, String) {
+        let mut detection: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        edit(&mut detection);
+        (
+            200,
+            serde_json::json!({ "success": true, "text": detection.to_string() }).to_string(),
+        )
+    }
+
+    /// The sample as it is: `fixture-slow-http` pending.
+    fn slow_pending() -> (u16, String) {
+        detection_answer(|_| {})
+    }
+
+    /// The sample with `fixture-slow-http` answered, as `@fixture/http` is.
+    fn answer_slow(detection: &mut serde_json::Value) {
+        let entries = detection["client_semantics"].as_array_mut().unwrap();
+        let clients = entries[0]["clients"].clone();
+        let slow = entries
+            .iter_mut()
+            .find(|entry| entry["package"] == "fixture-slow-http")
+            .unwrap();
+        slow["status"] = "answered".into();
+        slow["clients"] = clients;
+    }
+
+    /// What one scan's detection and its in-scan schedule did against a stub.
+    struct Settled {
+        entries: Vec<crate::client_semantics::ClientSemanticsEntry>,
+        first: Vec<crate::client_semantics::ClientSemanticsEntry>,
+        waits: Vec<Duration>,
+        lines: Vec<String>,
+        attempts: usize,
+    }
+
+    impl Settled {
+        fn entry(&self, package: &str) -> &crate::client_semantics::ClientSemanticsEntry {
+            self.entries
+                .iter()
+                .find(|entry| entry.package == package)
+                .unwrap()
+        }
+    }
+
+    /// Ask `/framework-detect` once, as a re-ask does: one attempt.
+    async fn ask_detection(
+        api_base: &str,
+    ) -> Result<crate::framework_detector::DetectionResult, Box<dyn std::error::Error>> {
+        let outcome = crate::engine::reask_agent()
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                api_base,
+                "/framework-detect",
+                &serde_json::json!({ "ask_client_semantics": true }),
+            )
+            .await?;
+        crate::framework_detector::detection_from_response(&outcome.text)
+    }
+
+    /// A scan's detection, then the in-scan schedule over it with the real
+    /// waits recorded rather than slept, every ask going to one stub that
+    /// answers `responses` in turn.
+    async fn settle_against(
+        responses: Vec<(u16, String)>,
+        installed: impl Fn(&str) -> bool,
+    ) -> Settled {
+        let stub = CountingStub::start(responses);
+        let first = ask_detection(&stub.api_base)
+            .await
+            .expect("the scan's own detection answers");
+        let asked = first.client_semantics.clone().unwrap();
+        let mut waits = Vec::new();
+        let mut lines = Vec::new();
+        let entries = {
+            let (api_base, detection) = (stub.api_base.as_str(), &first);
+            crate::client_semantics::settle_pending(
+                asked.clone(),
+                installed,
+                &crate::client_semantics::PENDING_REASK_WAITS,
+                move || crate::engine::semantics_from_reask(ask_detection(api_base), detection),
+                |pause| {
+                    waits.push(pause);
+                    std::future::ready(())
+                },
+                |notice| lines.push(notice.line()),
+            )
+            .await
+        };
+        Settled {
+            entries,
+            first: asked,
+            waits,
+            lines,
+            attempts: stub.attempts(),
+        }
+    }
+
+    /// carrick#1564 schedule: a detection that answers every installed
+    /// package is not asked again.
+    #[tokio::test]
+    async fn a_detection_that_answers_every_package_is_asked_once() {
+        let settled = settle_against(vec![detection_answer(answer_slow)], |_| true).await;
+        assert_eq!(settled.attempts, 1);
+        assert!(settled.waits.is_empty() && settled.lines.is_empty());
+        assert_eq!(settled.entries, settled.first);
+    }
+
+    /// carrick#1564 schedule: a package the first ask leaves pending is
+    /// answered by the second, 5 s later, and the schedule stops there.
+    #[tokio::test]
+    async fn a_package_pending_on_the_first_ask_is_answered_by_the_second() {
+        let settled = settle_against(vec![slow_pending(), detection_answer(answer_slow)], |_| {
+            true
+        })
+        .await;
+        assert_eq!(settled.attempts, 2);
+        assert_eq!(settled.waits, vec![Duration::from_secs(5)]);
+        assert_eq!(
+            settled.lines,
+            vec!["1 of 3 client libraries still being described, waiting up to 35 s"]
+        );
+        let slow = settled.entry("fixture-slow-http");
+        assert_eq!(
+            slow.status,
+            crate::client_semantics::SemanticsStatus::Answered
+        );
+        assert!(!slow.clients.is_empty());
+    }
+
+    /// carrick#1564 schedule: a package pending on every ask is asked three
+    /// times in all, 5 s and then 15 s apart, and stays pending: it states no
+    /// claim, so its sites stay candidates, and the user reads that the next
+    /// scan asks again.
+    #[tokio::test]
+    async fn a_package_pending_on_every_ask_is_asked_three_times_and_states_nothing() {
+        let settled = settle_against(vec![slow_pending(); 3], |_| true).await;
+        assert_eq!(settled.attempts, 3);
+        assert_eq!(
+            settled.waits,
+            vec![Duration::from_secs(5), Duration::from_secs(15)]
+        );
+        assert_eq!(
+            settled.lines,
+            vec![
+                "1 of 3 client libraries still being described, waiting up to 35 s",
+                "1 of 3 client libraries still being described, waiting up to 45 s",
+                "1 client library not described yet",
+            ]
+        );
+        assert_eq!(settled.entries, settled.first);
+        assert!(
+            crate::client_semantics::derive_claims(&settled.entries)
+                .checks()
+                .iter()
+                .all(|check| check.package != "fixture-slow-http"),
+            "a pending package states no claim"
+        );
+    }
+
+    /// carrick#1564 schedule, and review finding 7: a pending package that is
+    /// not installed could not verify an answer, so it is not asked about.
+    #[tokio::test]
+    async fn a_pending_package_that_is_not_installed_is_not_asked_again() {
+        let settled = settle_against(vec![slow_pending()], |package| {
+            package != "fixture-slow-http"
+        })
+        .await;
+        assert_eq!(settled.attempts, 1);
+        assert!(settled.waits.is_empty() && settled.lines.is_empty());
+    }
+
+    /// carrick#1564 schedule: a re-ask that fails is one attempt and keeps
+    /// what the scan already has; the next ask still goes.
+    #[tokio::test]
+    async fn a_failed_reask_keeps_what_is_known_and_the_next_ask_answers() {
+        let settled = settle_against(
+            vec![
+                slow_pending(),
+                retriable_failure(),
+                detection_answer(answer_slow),
+            ],
+            |_| true,
+        )
+        .await;
+        assert_eq!(settled.attempts, 3);
+        assert_eq!(
+            settled.entry("fixture-slow-http").status,
+            crate::client_semantics::SemanticsStatus::Answered
+        );
+    }
+
+    /// carrick#1564 schedule: a re-ask that names other packages than the
+    /// detection the scan's guidance came from changes nothing.
+    #[tokio::test]
+    async fn a_reask_that_names_other_packages_changes_nothing() {
+        let other_packages = detection_answer(|detection| {
+            answer_slow(detection);
+            detection["data_fetchers"]
+                .as_array_mut()
+                .unwrap()
+                .push("fixture-other-http".into());
+        });
+        let settled = settle_against(
+            vec![slow_pending(), other_packages.clone(), other_packages],
+            |_| true,
+        )
+        .await;
+        assert_eq!(settled.attempts, 3);
+        assert_eq!(settled.entries, settled.first);
+    }
+
+    /// carrick#1564 schedule: the first answer for a package stands, so the
+    /// rows cannot depend on which ask answered it.
+    #[tokio::test]
+    async fn a_later_answer_never_replaces_an_earlier_one() {
+        let changed = detection_answer(|detection| {
+            answer_slow(detection);
+            detection["client_semantics"][0]["clients"][0]["verbs"] = serde_json::json!([]);
+        });
+        let settled = settle_against(vec![slow_pending(), changed], |_| true).await;
+        assert_eq!(settled.attempts, 2);
+        assert_eq!(settled.entry("@fixture/http"), &settled.first[0]);
+        assert_eq!(
+            settled.entry("fixture-slow-http").status,
+            crate::client_semantics::SemanticsStatus::Answered
         );
     }
 
@@ -3388,6 +3796,7 @@ pub(crate) mod tests {
             max_delay: Duration::from_millis(20),
             wait_budget: Duration::from_secs(60),
             run_budgeted: false,
+            max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
         }
     }
 
@@ -4275,6 +4684,7 @@ pub(crate) mod tests {
             max_delay: Duration::from_millis(200),
             wait_budget: Duration::from_secs(600),
             run_budgeted: false,
+            max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
         }
     }
 

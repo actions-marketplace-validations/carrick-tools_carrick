@@ -64,6 +64,7 @@ echo "scan-twice: output  $out_dir"
 fixture_targets=(
   astro
   class-controller-api
+  client-semantics
   demo-services-shape
   e2e-scaffolding
   env-var-whole-url
@@ -82,6 +83,7 @@ fixture_targets=(
   nextjs-app-monorepo
   pubsub-wrapper-monorepo
   remix-flat
+  request-summary
   scenario-1-dependency-conflicts
   scenario-3-cross-repo-success/repo-a
   scenario-3-cross-repo-success/repo-b
