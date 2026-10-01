@@ -58,7 +58,13 @@ const TEST_FILE_SUFFIXES: &[&str] = &[
 /// case is a mock-service-worker handler tree under `src/mocks/`. These are
 /// ecosystem-wide path conventions, deliberately NOT a mock-framework package
 /// list — provenance must hold for any registration idiom.
-const MOCK_DIR_NAMES: &[&str] = &["mocks", "mock"];
+///
+/// `cypress` is the directory convention of a browser end-to-end suite: its
+/// `support/` and `plugins/` files register listeners and stubs that never run
+/// in production (carrick#1626). Its `e2e/` and `fixtures/` already fall under
+/// [`TEST_DIR_NAMES`]; the rest is kept and tagged rather than skipped, so the
+/// file set a scan reads does not change.
+const MOCK_DIR_NAMES: &[&str] = &["mocks", "mock", "cypress"];
 
 /// Whether any directory segment of `path`, relative to the scanned
 /// `root_dir`, matches one of `dir_names` (case-insensitive). Only checked
@@ -86,6 +92,14 @@ fn has_dir_named(path: &Path, root_dir: &Path, dir_names: &[&str]) -> bool {
 
 fn has_test_dir(path: &Path, root_dir: &Path) -> bool {
     has_dir_named(path, root_dir, TEST_DIR_NAMES)
+}
+
+/// Whether `path` sits under a test directory ([`TEST_DIR_NAMES`]) below
+/// `root_dir`: the folders [`find_files`] does not read. For a walk over
+/// files that are not TypeScript (the GraphQL walk, carrick#1626), so both
+/// read the same tree.
+pub fn is_under_test_dir(path: &Path, root_dir: &Path) -> bool {
+    has_test_dir(path, root_dir)
 }
 
 fn has_test_suffix(path: &Path) -> bool {
@@ -707,6 +721,11 @@ mod tests {
         );
         assert_eq!(
             endpoint_provenance(Path::new("src/api/server.spec.ts"), root),
+            EndpointProvenance::Mock
+        );
+        // A browser end-to-end suite's support tree (carrick#1626).
+        assert_eq!(
+            endpoint_provenance(Path::new("cypress/support/commands.ts"), root),
             EndpointProvenance::Mock
         );
         // Real product routes stay routes.
