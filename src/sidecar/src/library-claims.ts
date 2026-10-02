@@ -430,12 +430,7 @@ export class LibraryClaimsVerifier {
       /** The probe's no-argument build of `receiver` on the check's export, resolved. */
       const atDefaults = (check: LibraryCheck, receiver: string): ts.Signature | undefined => {
         const index = builtIndex.get(builtKey(check, receiver));
-        if (index === undefined) return undefined;
-        const statement = file.statements[index];
-        if (!statement || !ts.isExpressionStatement(statement)) return undefined;
-        const expression = statement.expression;
-        if (!ts.isCallExpression(expression) && !ts.isNewExpression(expression)) return undefined;
-        return checker.getResolvedSignature(expression);
+        return index === undefined ? undefined : resolvedBuild(checker, file.statements[index]);
       };
 
       // A runtime module is read for the message roles only: HTTP answers as #1564 does.
@@ -635,6 +630,14 @@ export class LibraryClaimsVerifier {
    * receiver is listed before any member name, and every member name before
    * any signature, so the cap cuts signatures first and exports last.
    *
+   * A receiver a maker builds is listed as the verifier reads it: built with
+   * no argument and no type argument, so a generic maker's instance is read
+   * at its declared type-parameter defaults (carrick#1696). That takes two
+   * programs. The first reads which receivers each export can make; the
+   * second adds the verifier's own build statement for each
+   * (`receiverExpression` on the export's `importLine`, read through
+   * `DeclarationReader.returnOf`) and lists from it.
+   *
    * `surface_sha256` is the full-surface hash (see `fullSurfaceSha256`).
    */
   listSurface(
@@ -644,24 +647,101 @@ export class LibraryClaimsVerifier {
     only: Readonly<Record<string, string[]>> = {}
   ): ListedSurface {
     if (packages.length === 0) return { surfaces: [], surface_sha256: fullSurfaceSha256([]) };
-    const probeText = packages
-      .map((pkg, i) => `import * as __carrick_ns${i} from ${JSON.stringify(pkg)};`)
-      .join('\n');
+    // Each specifier twice: as a namespace, which holds its named exports, and
+    // as a default import, which is how a module that exports a value whole
+    // (`export =`) is imported as `default`.
+    const imports = packages.flatMap((pkg, i) => [
+      `import * as __carrick_ns${i} from ${JSON.stringify(pkg)};`,
+      importLine(pkg, 'default', `__carrick_d${i}`),
+    ]);
+    const probeOf = (file: ts.SourceFile, i: number): SurfaceProbe => ({
+      namespace: file.statements[2 * i] as ts.ImportDeclaration,
+      defaultImport: file.statements[2 * i + 1] as ts.ImportDeclaration,
+    });
+
+    const makers = this.readProbe(fromDir, imports, (_checker, reader, file) =>
+      packages.map((pkg, i) => reader.makersOf(pkg, probeOf(file, i), only[pkg]))
+    );
+
+    const importLines: string[] = [];
+    const buildLines: string[] = [];
+    const builtIndex = new Map<string, number>();
+    packages.forEach((pkg, i) => {
+      for (const { export: name, receivers } of makers[i]) {
+        const local = `__carrick_e${importLines.length}`;
+        importLines.push(importLine(pkg, name, local));
+        for (const receiver of receivers) {
+          const expression = receiverExpression(local, receiver);
+          if (expression === undefined) continue;
+          builtIndex.set(builtKey({ package: pkg, export: name }, receiver), buildLines.length);
+          buildLines.push(`${expression};`);
+        }
+      }
+    });
+    const firstBuild = imports.length + importLines.length;
+
+    const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) =>
+      packages.map((pkg, i) =>
+        reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], (name, receiver) => {
+          const index = builtIndex.get(builtKey({ package: pkg, export: name }, receiver));
+          return index === undefined ? undefined : resolvedBuild(checker, file.statements[firstBuild + index]);
+        })
+      )
+    );
+    return { surfaces, surface_sha256: fullSurfaceSha256(surfaces) };
+  }
+
+  /** `read` over a probe file holding `lines` in `fromDir`, removed again afterwards. */
+  private readProbe<T>(
+    fromDir: string,
+    lines: readonly string[],
+    read: (checker: ts.TypeChecker, reader: DeclarationReader, file: ts.SourceFile) => T
+  ): T {
     const probePath = path.join(fromDir, `__carrick_surface_probe_${process.pid}_${probeSequence++}.ts`);
-    const probe = this.project.createSourceFile(probePath, `${probeText}\n`, { overwrite: true });
+    const probe = this.project.createSourceFile(probePath, `${lines.join('\n')}\n`, { overwrite: true });
     try {
       const program = this.project.getProgram().compilerObject;
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
       const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
-      const surfaces = packages.map((pkg, i) =>
-        reader.listPackage(pkg, file.statements[i] as ts.ImportDeclaration, maxEntries, only[pkg])
-      );
-      return { surfaces, surface_sha256: fullSurfaceSha256(surfaces) };
+      return read(program.getTypeChecker(), reader, file);
     } finally {
       this.project.removeSourceFile(probe);
     }
   }
+}
+
+/** A specifier's two imports in the surface probe (see `listSurface`). */
+interface SurfaceProbe {
+  namespace: ts.ImportDeclaration;
+  defaultImport: ts.ImportDeclaration;
+}
+
+/** One value export a surface lists: its name, the declaration it names and its type. */
+interface ListedExport {
+  name: string;
+  target: ts.Symbol;
+  type: ts.Type;
+}
+
+/** A way an export makes a receiver, by receiver id, with the library signatures that make it. */
+interface Maker {
+  receiver: string;
+  /** Made by a member one level below the export, not by the export itself. */
+  member: boolean;
+  signatures: readonly ts.Signature[];
+}
+
+/**
+ * What a probe statement that builds a receiver (`receiverExpression`)
+ * resolves to: its maker or scope signature as a call with no argument and
+ * no type argument instantiates it (see `DeclarationReader.returnOf`).
+ */
+function resolvedBuild(checker: ts.TypeChecker, statement: ts.Statement | undefined): ts.Signature | undefined {
+  if (!statement || !ts.isExpressionStatement(statement)) return undefined;
+  const expression = statement.expression;
+  if (!ts.isCallExpression(expression) && !ts.isNewExpression(expression)) return undefined;
+  return checker.getResolvedSignature(expression);
 }
 
 /** The answer to `list_library_surface`. */
@@ -775,7 +855,7 @@ function builtReceiver(check: LibraryCheck): string | undefined {
   return `${check.receiver}>scope:${scopeStep(claim)}`;
 }
 
-function builtKey(check: LibraryCheck, receiver: string): string {
+function builtKey(check: { package: string; export: string }, receiver: string): string {
   return JSON.stringify([check.package, check.export, receiver]);
 }
 
@@ -877,6 +957,8 @@ class DeclarationReader {
   private augmentedNames: ReadonlyMap<string, ReadonlySet<string>> | undefined;
   /** The package of the check being judged; see `serviceAugmentedNames`. */
   private currentPackage = '';
+  /** `declaredProperties` per type, for `currentPackage` (its augmentations decide them). */
+  private readonly declared = new Map<ts.Type, ts.Symbol[]>();
   /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
   private readonly printedRoots: readonly string[];
 
@@ -1638,8 +1720,7 @@ class DeclarationReader {
     if (slot === VARIADIC || !this.isObjectType(slot)) {
       return { rank: 1, outcome: this.slotFailure(slot, 'param_missing') };
     }
-    const parts = this.parts(slot);
-    const views = parts.length > 1 ? parts.filter(part => this.isPlainObject(part)) : [slot];
+    const views = this.keyViews(slot);
     let best: RankedFailure | undefined;
     if (views.length === 0) best = { rank: 2, outcome: failed('key_missing') };
     for (const view of views) {
@@ -1674,13 +1755,25 @@ class DeclarationReader {
   }
 
   /**
+   * The objects a claim's keys at one argument are read from, one at a time:
+   * the whole type, or each union member that is an object type and not a
+   * function type.
+   */
+  private keyViews(slot: ts.Type): readonly ts.Type[] {
+    const parts = this.parts(slot);
+    return parts.length > 1 ? parts.filter(part => this.isPlainObject(part)) : [slot];
+  }
+
+  /**
    * Strict D2: `name_ambiguous` unless every string slot of the call besides
    * the name is accounted for, because which of two string slots is the name
    * is behaviour, not shape. A slot is accounted for when the claim assigns it
    * a part (payload, handler, base, prefix), or, for a key of an object at
    * the call, when `key_labels` labels it `not_name`. A positional string the
-   * claim leaves unassigned cannot be labelled, so it always competes. Keys
-   * are counted with the same `acceptsString` the surface listing labels by.
+   * claim leaves unassigned cannot be labelled, so it always competes. A
+   * slot or key counts as a string exactly when a name there would
+   * (`siblingTakesString`): a conditional counts when one of its branches
+   * takes a string (fail closed, carrick#1687).
    *
    * The labels must agree with the claim: at most one key is labelled `name`,
    * and only the claim's own name key; that key is never labelled `not_name`.
@@ -1690,7 +1783,10 @@ class DeclarationReader {
    * Rest parameters: a rest the claim puts a payload or handler in belongs
    * wholly to that part; one that holds the name holds other names too; from
    * the first variable element of a tuple rest (`[...channels: string[], cb]`)
-   * no position is fixed, so a name there is one of many.
+   * no position is fixed, so a name there is one of many. A rest the claim
+   * leaves unassigned competes when its element accepts a string, or when it
+   * cannot be read at all (`...args: Rest<B>`, a conditional on a type
+   * parameter), since it could hold a string slot.
    */
   private nameSiblings(
     signature: ts.Signature,
@@ -1715,9 +1811,12 @@ class DeclarationReader {
     const unaccountedKey = (keys: readonly string[], assigned: ReadonlyMap<string, PartName>) =>
       keys.some(key => !assigned.has(key) && labels[key] !== 'not_name');
     const none = new Map<string, PartName>();
-    const takesString = (slot: Slot | undefined) => slot !== undefined && slot !== VARIADIC && this.acceptsString(slot);
-    // An argument the claim gives no part: a string, or an object with a string key nobody accounts for.
-    const competes = (slot: Slot | undefined) => takesString(slot) || unaccountedKey(this.stringKeys(slot), none);
+    const takesString = (slot: Slot | undefined) => slot !== undefined && this.siblingTakesString(slot);
+    // An argument the claim gives no part: a string, an object with a string
+    // key nobody accounts for, or a rest the verifier cannot read, which could
+    // hold either and no label can account for (fail closed, carrick#1687).
+    const competes = (slot: Slot | undefined) =>
+      slot === VARIADIC || takesString(slot) || unaccountedKey(this.stringKeys(slot), none);
 
     // Every object the claim reads keys of: its other string keys.
     for (const [arg, keys] of layout.keyed) {
@@ -1770,6 +1869,15 @@ class DeclarationReader {
   }
 
   /**
+   * A slot beside the name takes a string, read as a name there is read: a
+   * conditional through its branches (`throughConditional`). One whose
+   * branch says nothing counts no more than `any` does.
+   */
+  private siblingTakesString(slot: Slot): boolean {
+    return this.acceptsString(this.throughConditional(slot));
+  }
+
+  /**
    * The string-accepting keys of an argument: every key some object part of
    * it declares, read through a type parameter's constraint.
    */
@@ -1778,8 +1886,8 @@ class DeclarationReader {
     const keys = new Set<string>();
     for (const part of this.parts(this.throughConstraint(slot) as ts.Type)) {
       if (!this.isObjectLike(part)) continue;
-      for (const property of this.declaredProperties(part)) {
-        if (this.acceptsString(this.checker.getTypeOfSymbol(property))) keys.add(property.getName());
+      for (const property of this.namedProperties(part)) {
+        if (this.siblingTakesString(this.checker.getTypeOfSymbol(property))) keys.add(property.getName());
       }
     }
     return [...keys];
@@ -1960,7 +2068,7 @@ class DeclarationReader {
         map = this.checker.getDefaultFromTypeParameter(map) ?? this.checker.getBaseConstraintOfType(map) ?? map;
       }
       for (const property of this.checker.getPropertiesOfType(this.checker.getApparentType(map))) {
-        if (!property.getName().startsWith('__@')) into.add(property.getName());
+        if (!isSymbolKeyed(property)) into.add(property.getName());
       }
     }
   }
@@ -2117,18 +2225,28 @@ class DeclarationReader {
   // Surface listing (carrick#1660)
   // --------------------------------------------------------------------------
 
-  /** One specifier's declared surface (see `LibraryClaimsVerifier.listSurface`). */
-  listPackage(pkg: string, declaration: ts.ImportDeclaration, maxEntries: number, only?: readonly string[]): LibrarySurface {
+  /**
+   * One specifier's declared surface (see `LibraryClaimsVerifier.listSurface`).
+   * `built` answers the probe's no-argument build of a receiver an export
+   * makes, resolved, when the probe holds one.
+   */
+  listPackage(
+    pkg: string,
+    probe: SurfaceProbe,
+    maxEntries: number,
+    only: readonly string[] | undefined,
+    built: (exportName: string, receiver: string) => ts.Signature | undefined
+  ): LibrarySurface {
     this.setPackage(pkg);
     // Runtime modules on: a `node:` specifier is listed from the runtime's
     // types package, as the message roles read it.
-    const moduleRead = this.readModule(pkg, declaration, true);
+    const moduleRead = this.readModule(pkg, probe.namespace, true);
     const surface: LibrarySurface = { package: pkg, truncated: 0, exports: [] };
     if (moduleRead.entry.resolved_file) surface.resolved_file = moduleRead.entry.resolved_file;
     if (moduleRead.entry.installed_version) surface.installed_version = moduleRead.entry.installed_version;
     if (moduleRead.reason) return { ...surface, reason: moduleRead.reason };
-    const moduleSymbol = this.checker.getSymbolAtLocation(declaration.moduleSpecifier);
-    if (!moduleSymbol) return { ...surface, reason: 'module_unresolved' };
+    const exported = this.listedExports(probe, only);
+    if (!exported) return { ...surface, reason: 'module_unresolved' };
 
     let budget = maxEntries;
     let dropped = 0;
@@ -2144,68 +2262,136 @@ class DeclarationReader {
     const names: Array<() => void> = [];
     const fills: Array<() => void> = [];
 
-    const exportsOf = this.checker
-      .getExportsOfModule(moduleSymbol)
-      .filter(symbol => {
-        const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
-        // A module that exports a class whole (\`export =\`) exports its
-        // statics, and its \`prototype\`, which no service imports.
-        return (
-          !this.checker.isUnknownSymbol(target) &&
-          (target.flags & ts.SymbolFlags.Value) !== 0 &&
-          (target.flags & ts.SymbolFlags.Prototype) === 0 &&
-          (only === undefined || only.includes(symbol.getName()))
-        );
-      })
-      .sort((a, b) => (a.getName() < b.getName() ? -1 : a.getName() > b.getName() ? 1 : 0));
-
-    for (const symbol of exportsOf) {
+    for (const { name, target, type } of exported) {
       if (!take()) continue;
-      const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
-      const type = this.checker.getTypeOfSymbolAtLocation(symbol, declaration);
-      const entry: SurfaceExport = { export: symbol.getName(), receivers: [] };
+      const entry: SurfaceExport = { export: name, receivers: [] };
       surface.exports.push(entry);
       if (this.isOpenTop(type)) continue;
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(receiverName, receiverType, home, take, names, fills));
+        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, fills));
       };
       receiverOf('export', type);
-      const called = this.madeBy(this.librarySignatures(type, 'call'));
-      if (called) receiverOf('instance:()', called);
-      const constructed = this.madeBy(this.librarySignatures(type, 'new'));
-      if (constructed) receiverOf('instance:new', constructed);
-      // Makers one level below the export: `export.member(...)` and
-      // `new export.Member(...)`, when the export's home declares the member
-      // (a static a class only inherits from another package is no maker the
-      // verifier reads, `member_inherited`) and what it builds declares a
-      // callable member.
-      const exportHome = this.homeOf(pkg, [target, ...typeSymbols(type)]);
-      const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
-      for (const property of this.declaredProperties(type)) {
-        if (!this.isOwnMember(property, apparent, exportHome)) continue;
-        const memberType = this.checker.getTypeOfSymbol(property);
-        for (const [form, prefix] of [['call', 'instance:'], ['new', 'instance:new:']] as const) {
-          const made = this.madeBy(this.librarySignatures(memberType, form));
-          if (made && this.declaredProperties(made).some(member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0)) {
-            receiverOf(`${prefix}${property.getName()}`, made);
-          }
+      for (const maker of this.makers(pkg, target, type)) {
+        const made = this.madeBy(maker.signatures, built(name, maker.receiver));
+        if (!made) continue;
+        // One level below the export, what the member builds must declare a callable member.
+        if (
+          maker.member &&
+          !this.namedProperties(made).some(
+            member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
+          )
+        ) {
+          continue;
         }
+        receiverOf(maker.receiver, made);
       }
     }
-    for (const name of names) name();
+    for (const run of names) run();
     for (const fill of fills) fill();
     surface.truncated = dropped;
     return surface;
   }
 
-  /** What a maker builds, when its overloads agree on one object type that says something. */
-  private madeBy(signatures: readonly ts.Signature[]): ts.Type | undefined {
-    const returns = [...new Set(signatures.map(sig => this.checker.getReturnTypeOfSignature(sig)))];
-    return returns.length === 1 && !this.returnSaysNothing(returns[0]) && this.isObjectType(returns[0])
-      ? returns[0]
-      : undefined;
+  /**
+   * The receivers each export of a specifier can make, by receiver id, for
+   * the probe statements that build them (see `LibraryClaimsVerifier.listSurface`).
+   */
+  makersOf(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): { export: string; receivers: string[] }[] {
+    this.setPackage(pkg);
+    if (this.readModule(pkg, probe.namespace, true).reason) return [];
+    return (this.listedExports(probe, only) ?? [])
+      .filter(({ type }) => !this.isOpenTop(type))
+      .map(({ name, target, type }) => ({
+        export: name,
+        receivers: this.makers(pkg, target, type).map(maker => maker.receiver),
+      }))
+      .filter(({ receivers }) => receivers.length > 0);
+  }
+
+  /**
+   * The value exports a specifier lists (every one, or only those `only`
+   * names), sorted by name: what its namespace holds, and `default` for a
+   * module that exports a value whole (`export =`), as a default import gets
+   * it, when that import reads a typed value (`readExport`, as the verifier
+   * reads `default`). Such a module's namespace holds its statics, and its
+   * `prototype`, which no service imports. Undefined when the specifier
+   * resolves to no module symbol.
+   */
+  private listedExports(probe: SurfaceProbe, only: readonly string[] | undefined): ListedExport[] | undefined {
+    const moduleSymbol = this.checker.getSymbolAtLocation(probe.namespace.moduleSpecifier);
+    if (!moduleSymbol) return undefined;
+    const wanted = (name: string) => only === undefined || only.includes(name);
+    const all = this.checker.getExportsOfModule(moduleSymbol);
+    const listed: ListedExport[] = [];
+    for (const symbol of all) {
+      const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
+      if (
+        this.checker.isUnknownSymbol(target) ||
+        (target.flags & ts.SymbolFlags.Value) === 0 ||
+        (target.flags & ts.SymbolFlags.Prototype) !== 0 ||
+        !wanted(symbol.getName())
+      ) {
+        continue;
+      }
+      listed.push({ name: symbol.getName(), target, type: this.checker.getTypeOfSymbolAtLocation(symbol, probe.namespace) });
+    }
+    if (
+      moduleSymbol.exports?.has(ts.InternalSymbolName.ExportEquals) &&
+      !all.some(symbol => symbol.getName() === 'default') &&
+      wanted('default')
+    ) {
+      const read = this.readExport(probe.defaultImport);
+      if (!('reason' in read)) listed.push({ name: 'default', target: read.value.target, type: read.value.type });
+    }
+    return listed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+
+  /**
+   * The ways an export makes a receiver, in listing order: calling it
+   * (`instance:()`), constructing it (`instance:new`), then calling or
+   * constructing each member (`instance:<member>`, `instance:new:<member>`),
+   * each through the signatures a maker claim reads there (`ownCallee`): its
+   * home's own, or a base's it binds with its own type. A maker the export
+   * only inherits from another package is none the verifier reads
+   * (`member_inherited`).
+   */
+  private makers(pkg: string, target: ts.Symbol, type: ts.Type): Maker[] {
+    const holder = this.surfaceHolder(pkg, type, this.homeOf(pkg, [target, ...typeSymbols(type)]));
+    const makers: Maker[] = [];
+    for (const [form, receiver] of [['call', 'instance:()'], ['new', 'instance:new']] as const) {
+      const callee = this.ownCallee(holder, [], null, form);
+      if ('signatures' in callee) makers.push({ receiver, member: false, signatures: callee.signatures });
+    }
+    for (const property of sortedByName(this.namedProperties(type))) {
+      for (const [form, prefix] of [['call', 'instance:'], ['new', 'instance:new:']] as const) {
+        const callee = this.ownCallee(holder, [], property.getName(), form);
+        if ('signatures' in callee) {
+          makers.push({ receiver: `${prefix}${property.getName()}`, member: true, signatures: callee.signatures });
+        }
+      }
+    }
+    return makers;
+  }
+
+  /** A receiver read for the listing as a message claim reads it (`ownCallee`). */
+  private surfaceHolder(pkg: string, type: ts.Type, home: ReadonlySet<string>): MessageReceiver {
+    return { type, pkg, home, makerBindsName: false, scoped: false };
+  }
+
+  /**
+   * What a maker builds: each overload's return, read at its declared
+   * type-parameter defaults where `built` (the probe's no-argument build of
+   * the receiver) instantiates it (`returnOf`), less the returns that say
+   * nothing, which no maker claim holds on. Listed when what is left is one
+   * object type.
+   */
+  private madeBy(signatures: readonly ts.Signature[], built: ts.Signature | undefined): ts.Type | undefined {
+    const returns = [
+      ...new Set(signatures.map(sig => this.returnOf(sig, built)).filter(type => !this.returnSaysNothing(type))),
+    ];
+    return returns.length === 1 && this.isObjectType(returns[0]) ? returns[0] : undefined;
   }
 
   /** The call (or construct) signatures of `type` an installed package or the default library declares. */
@@ -2224,6 +2410,7 @@ class DeclarationReader {
    * signatures last (`fills`), once every name is.
    */
   private outlineReceiver(
+    pkg: string,
     receiverName: string,
     type: ts.Type,
     home: ReadonlySet<string>,
@@ -2232,23 +2419,29 @@ class DeclarationReader {
     fills: Array<() => void>
   ): SurfaceReceiver {
     const receiver: SurfaceReceiver = { receiver: receiverName, members: [] };
-    const call = this.librarySignatures(type, 'call');
-    if (call.length > 0) fills.push(() => (receiver.call = this.listSignatures(call, take)));
-    const construct = this.librarySignatures(type, 'new');
-    if (construct.length > 0) fills.push(() => (receiver.construct = this.listSignatures(construct, take)));
+    const holder = this.surfaceHolder(pkg, type, home);
+    // The receiver's own call and construct signatures, as a claim with a
+    // null member reads them.
+    const call = this.ownCallee(holder, [], null, 'call');
+    if ('signatures' in call) fills.push(() => (receiver.call = this.listSignatures(call.signatures, take)));
+    const construct = this.ownCallee(holder, [], null, 'new');
+    if ('signatures' in construct) {
+      fills.push(() => (receiver.construct = this.listSignatures(construct.signatures, take)));
+    }
     if (this.isOpenTop(type)) return receiver;
     names.push(() => {
-      const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
-      for (const property of this.declaredProperties(type)) {
-        const signatures = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
-        if (signatures.length === 0 || !take()) continue;
-        const member: SurfaceMember = {
-          name: property.getName(),
-          own: this.isOwnMember(property, apparent, home),
-          signatures: [],
-        };
+      for (const property of sortedByName(this.namedProperties(type))) {
+        const library = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
+        if (library.length === 0 || !take()) continue;
+        // Own when an op claim reads the member at all (`ownCallee`): its
+        // home declares it, or it sits on a base the receiver binds with its
+        // own type, and its home writes a signature of it. An inherited
+        // member is listed with every library signature.
+        const callee = this.ownCallee(holder, [], property.getName(), 'call');
+        const own = 'signatures' in callee;
+        const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
-        fills.push(() => (member.signatures = this.listSignatures(signatures, take)));
+        fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, take)));
       }
     });
     return receiver;
@@ -2259,38 +2452,29 @@ class DeclarationReader {
     for (const signature of signatures) {
       if (!take()) continue;
       const params: SurfaceParam[] = [];
-      for (const parameter of signature.getParameters()) {
+      const parameters = signature.getParameters();
+      for (let index = 0; index < parameters.length; index++) {
         if (!take()) continue;
+        const parameter = parameters[index];
         const declaration = parameter.valueDeclaration;
         const isParameter = declaration !== undefined && ts.isParameter(declaration);
-        const type = this.checker.getTypeOfSymbol(parameter);
-        const slot = this.throughConstraint(type);
+        // What a claim part at this argument is checked against: a rest's
+        // element, a type parameter's constraint (`keyParameterAt`).
+        const slot = this.keyParameterAt(signature, index);
         const param: SurfaceParam = {
           name: parameter.getName(),
           optional: isParameter && (declaration.questionToken !== undefined || declaration.initializer !== undefined),
           rest: isParameter && declaration.dotDotDotToken !== undefined,
-          type: this.printed(type),
-          accepts_string: this.acceptsString(type),
-          function: this.handlerFailure(type) === undefined,
+          type: this.printed(this.checker.getTypeOfSymbol(parameter)),
+          // The checks a positional name and a positional handler pass there.
+          accepts_string: slot !== undefined && this.acceptsString(this.throughConditional(slot)),
+          function: this.handlerFailure(slot) === undefined,
         };
-        if (slot !== VARIADIC && this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
-          const keys: SurfaceKey[] = [];
-          for (const property of this.declaredProperties(slot)) {
-            if (!take()) continue;
-            const keyType = this.checker.getTypeOfSymbol(property);
-            keys.push({
-              name: property.getName(),
-              optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
-              accepts_string: this.acceptsString(keyType),
-              function: this.handlerFailure(keyType) === undefined,
-            });
-          }
+        if (slot !== undefined && slot !== VARIADIC && this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
+          const keys = this.listKeys(slot, take);
           if (keys.length > 0) param.keys = keys;
         }
-        const literals = new Set<string>();
-        this.spell(type, literals, 0);
-        const node = isParameter ? declaration.type : undefined;
-        if (node) this.spell(this.checker.getTypeFromTypeNode(node), literals, 0);
+        const literals = this.literalsAt(signature, { arg: index });
         if (literals.size > 0) param.literals = [...literals].sort();
         params.push(param);
       }
@@ -2300,15 +2484,83 @@ class DeclarationReader {
   }
 
   /**
+   * The keys a claim can name at an object argument, by name: every key of
+   * each view the verifier reads one at a time (`keyViews`). A
+   * key accepts a string, or is a handler, when it does so in some view, as
+   * a keyed name or handler is checked (`viewFor`). It is optional when a
+   * call can leave it out: some view marks it optional or does not declare it.
+   */
+  private listKeys(slot: ts.Type, take: () => boolean): SurfaceKey[] {
+    const views = this.keyViews(slot);
+    const keys = new Map<string, SurfaceKey & { views: number }>();
+    for (const view of views) {
+      for (const property of this.namedProperties(view)) {
+        const type = this.checker.getTypeOfSymbol(property);
+        const read = {
+          name: property.getName(),
+          optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
+          accepts_string: this.acceptsString(this.throughConditional(type)),
+          function: this.handlerFailure(type) === undefined,
+          views: 1,
+        };
+        const seen = keys.get(read.name);
+        if (!seen) {
+          keys.set(read.name, read);
+          continue;
+        }
+        seen.optional = seen.optional || read.optional;
+        seen.accepts_string = seen.accepts_string || read.accepts_string;
+        seen.function = seen.function || read.function;
+        seen.views += 1;
+      }
+    }
+    return [...keys.values()]
+      .sort((a, b) => byName(a.name, b.name))
+      .filter(() => take())
+      .map(({ views: declaredIn, ...key }) => ({ ...key, optional: key.optional || declaredIn < views.length }));
+  }
+
+  /**
    * A type as the declarations print it, with the service root written as
    * `<root>` (the checker spells a type no entry exports through the file that
    * declares it), cut to a length a listing can carry. The root goes first,
    * so where the cut falls does not depend on where the package is installed.
    */
   private printed(type: ts.Type): string {
-    let text = this.checker.typeToString(type);
+    const node = this.checker.typeToTypeNode(type, undefined, PRINT_FLAGS);
+    const text = node === undefined ? this.checker.typeToString(type) : printTypeNode(this.orderUnions(node));
+    return truncate(this.scrubbed(text));
+  }
+
+  /** `text` with the service root written as `<root>`. */
+  private scrubbed(text: string): string {
     for (const root of this.printedRoots) text = text.split(root).join('<root>');
-    return truncate(text);
+    return text;
+  }
+
+  /**
+   * `node` with the members of every union in it, at every depth (inside a
+   * function or a conditional type too), sorted by their own print with the
+   * root scrubbed, compared by UTF-16 code unit. The compiler prints a union
+   * in the order it made the members, which moves with whatever the program
+   * read first.
+   */
+  private orderUnions(node: ts.TypeNode): ts.TypeNode {
+    const result = ts.transform(node, [
+      context => root => {
+        const visit = (child: ts.Node): ts.Node => {
+          const next = ts.visitEachChild(child, visit, context);
+          if (!ts.isUnionTypeNode(next)) return next;
+          const keyed = next.types.map(member => ({ member, key: this.scrubbed(printTypeNode(member)) }));
+          keyed.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+          return ts.factory.updateUnionTypeNode(next, ts.factory.createNodeArray(keyed.map(({ member }) => member)));
+        };
+        return ts.visitNode(root, visit) as ts.TypeNode;
+      },
+    ]);
+    const [ordered] = result.transformed;
+    result.dispose();
+    return ordered;
   }
 
   // --------------------------------------------------------------------------
@@ -2353,7 +2605,7 @@ class DeclarationReader {
    * not the package's.
    */
   private declaredProperty(slot: Slot, name: string): ts.Symbol | undefined {
-    return this.declaredProperties(slot).find(property => property.getName() === name);
+    return this.namedProperties(slot).find(property => property.getName() === name);
   }
 
   /**
@@ -2411,10 +2663,24 @@ class DeclarationReader {
     return this.checker.getBaseConstraintOfType(parts[0]) ?? slot;
   }
 
+  /**
+   * The declared properties a claim can name: every one keyed by a string. A
+   * member or key keyed by a unique symbol (`[Symbol.iterator]`, the runtime
+   * emitter's `[captureRejectionSymbol]`) has no name a claim can carry, and
+   * the checker names it with a symbol id that moves whenever anything
+   * earlier in the process does (`__@iterator@84`): it is never listed, and
+   * it neither satisfies nor blocks a slot or a name (D2).
+   */
+  private namedProperties(slot: Slot): ts.Symbol[] {
+    return this.declaredProperties(slot).filter(property => !isSymbolKeyed(property));
+  }
+
   private declaredProperties(slot: Slot): ts.Symbol[] {
     if (slot === VARIADIC) return [];
+    const cached = this.declared.get(slot);
+    if (cached) return cached;
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(slot));
-    return this.checker
+    const declared = this.checker
       .getPropertiesOfType(apparent)
       .filter(
         property =>
@@ -2422,6 +2688,8 @@ class DeclarationReader {
           this.isLibraryDeclared(property, apparent) &&
           !this.isAbsent(property)
       );
+    this.declared.set(slot, declared);
+    return declared;
   }
 
   /**
@@ -2443,7 +2711,9 @@ class DeclarationReader {
 
   /** Judge the next check as a claim about `pkg`. */
   setPackage(pkg: string): void {
-    this.currentPackage = packageNameOf(pkg);
+    const named = packageNameOf(pkg);
+    if (named !== this.currentPackage) this.declared.clear();
+    this.currentPackage = named;
   }
 
   /**
@@ -2739,6 +3009,43 @@ class DeclarationReader {
   }
 }
 
+/**
+ * What `typeToString` asks the node builder for, less its length cut: a
+ * union the builder cuts short keeps the members it made first, so the
+ * listing orders every union before its own cut (`truncate`).
+ */
+const PRINT_FLAGS =
+  ts.NodeBuilderFlags.AllowUniqueESSymbolType |
+  ts.NodeBuilderFlags.UseAliasDefinedOutsideCurrentScope |
+  ts.NodeBuilderFlags.IgnoreErrors |
+  ts.NodeBuilderFlags.NoTruncation;
+
+const TYPE_PRINTER = ts.createPrinter({ removeComments: true });
+
+/**
+ * A type node as `typeToString` prints it with no enclosing declaration: with
+ * no source file, so a node the builder reused from a declaration prints its
+ * own text.
+ */
+function printTypeNode(node: ts.Node): string {
+  return TYPE_PRINTER.printNode(ts.EmitHint.Unspecified, node, undefined as unknown as ts.SourceFile);
+}
+
+/** Code-unit order on names. */
+function byName(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Properties by name. A type's own property order is declaration order, but
+ * a mapped type's (`Record<keyof M, F>`, `Partial<A & B>`) follows its key
+ * union, in the order the compiler made the keys: listed as it comes, the
+ * order would move with whatever the program read first.
+ */
+function sortedByName(properties: readonly ts.Symbol[]): ts.Symbol[] {
+  return [...properties].sort((a, b) => byName(a.getName(), b.getName()));
+}
+
 /** A printed type, cut to a length a listing can carry. */
 function truncate(text: string): string {
   return text.length > 200 ? `${text.slice(0, 197)}...` : text;
@@ -2793,6 +3100,15 @@ function readInstalledPackage(
 
 function isNullish(type: ts.Type): boolean {
   return (type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)) !== 0;
+}
+
+/**
+ * Keyed by a unique symbol. The checker escapes such a name as
+ * `__@<description>@<symbol id>`; a string key that starts with `__` is
+ * escaped with one more underscore, so it never matches.
+ */
+function isSymbolKeyed(property: ts.Symbol): boolean {
+  return (property.escapedName as string).startsWith('__@');
 }
 
 /** `string`, a string literal or template, or an intersection with one (`string & {}`). */

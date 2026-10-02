@@ -209,12 +209,16 @@ an HTTP row.
   Classes are told apart by their binding, not their name. A static member
   reads no instance field. HTTP keeps its rule above: a field written
   anywhere but the constructor's own statements holds no client.
-- **The contest set.** A hand-off, a write, a member read that is not
-  called, a spread, a member called by a key the source does not state, a
-  namespace import of the module that holds an instance, and loading that
-  module any other way still take the receiver away. A test for truth
-  (`if (!this.client)`) reads the receiver and keeps nothing of it, so it
-  contests nothing here; it still takes an HTTP client away. A module the
+- **The contest set.** A hand-off, a write, a member read used as a value
+  (assigned, passed, a property's value, returned), a spread, a member
+  called by a key the source does not state, a namespace import of the
+  module that holds an instance, and loading that module any other way still
+  take the receiver away. A test for truth reads the receiver and keeps
+  nothing of it, so it contests nothing here: the receiver, or a member read
+  off it, as the test of an `if`, a loop or a conditional, under `!`, or as
+  an operand of a `&&` or `||` that is itself tested (`if (!this.client)`,
+  `if (socket.recovered || retrying)`, carrick#1690). It still takes an HTTP
+  client away. A comparison or `typeof` operand contests neither. A module the
   scan cannot follow still turns imported reading off. Every member called
   or constructed through the receiver is kept, along with the export's own
   uses where an instance was made. The reader classifies each against the
@@ -232,14 +236,27 @@ an HTTP row.
   it), a class field, or a call made on the returned instance itself
   (`createQueue("emails").add(…)`). A call made directly on what a package's
   maker returns (`z.string().min(1)`) is no site. An `async` factory's
-  instance is reached only through `await`. None of these is a factory: two
-  makers, or one maker handed other arguments, on two paths; a binding
-  assigned on each path; a module's instance or a field, which every call
-  shares; a path that returns anything else; a generator. The factory's own
-  calls through its binding count among the uses. Its binding handed on, or
-  returned by anything but the factory itself, takes the instance away; its
-  own calls through the binding it returns are contested, as a returned
-  receiver's are anywhere.
+  instance is reached only through `await`. None of these is a factory: a
+  module's instance or a field, which every call shares; a path that returns
+  anything else; a generator. The factory's own calls through its binding
+  count among the uses. Its binding handed on, or returned by anything but
+  the factory itself, takes the instance away; its own calls through the
+  binding it returns are contested, as a returned receiver's are anywhere.
+- **A set of makers** (carrick#1689, contract amendment 3 on carrick#1564).
+  A factory whose paths return instances of up to four makers of one export
+  (`new Lib.Cluster(…)` on one branch, `new Lib(…)` on the other, or one
+  maker handed other arguments) holds the set of those makers. Its paths are
+  `return`s, or a `let` the function sets on every path before each
+  `return` of it: a plain `x = <instance>` among the function's own
+  statements, its blocks and its `if` branches. A `let` written anywhere
+  else (a loop, a `try`, a `switch`, a closure, `||=`, a destructuring),
+  left unset on a path, or returned before it is set is no path; a `let` is
+  read only where it is returned, never as a receiver. The checks go to each
+  receiver id in the set, and the site states a fact only when every maker
+  verifies, an op verifies on each, and every one reads the same op, name,
+  role and name scope (`LibrarySite::fold`); otherwise it is a candidate.
+  Five makers, or makers of two exports, are no factory. One maker's
+  instance held by two bindings is one maker, used as both are.
 - **Names a caller fills** (carrick#1562). A library call whose argument
   holds a parameter of the function it is written in (`bus.publish(topic,
   data)` inside `publish(topic, data)`, or a template built from one) states
