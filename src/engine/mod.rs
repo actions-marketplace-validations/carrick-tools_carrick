@@ -3012,7 +3012,13 @@ async fn analyze_current_repo_incremental(
             // asked (carrick#1564).
             let declared_dependencies = packages.declared_dependency_names();
             let semantics_root = service_scan_root(repo_path, config);
-            let (analysis, settled) = tokio::join!(
+            let library_ask = LibraryAsk::start(
+                &request_inputs,
+                sidecar,
+                &semantics_root,
+                Path::new(repo_path),
+            );
+            let (analysis, settled, library_answer) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3034,6 +3040,7 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
+                first_library_answer(library_ask.as_ref()),
             );
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
@@ -3084,8 +3091,13 @@ async fn analyze_current_repo_incremental(
                 service,
                 graphql_schemas,
             );
-            protocol_extractions.library =
-                library_rows(&request_inputs, NO_LIBRARY_CLAIMS, sidecar, &semantics_root);
+            protocol_extractions.library = library_rows(
+                library_ask.as_ref(),
+                library_answer,
+                sidecar,
+                &semantics_root,
+            )
+            .await;
             let withdrawn = withdraw_model_routes_at_definitions(
                 &mut mount_graph,
                 &merged_results,
@@ -3195,16 +3207,21 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &service_modules,
             );
-            append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+            let library_sites = LibrarySiteIndex::of(
+                &stated_library_rows(&protocol_extractions.library, repo_path, service),
+                repo_path,
+            );
+            append_protocol_manifest_entries(
+                &mut manifest_entries,
+                &protocol_extractions,
+                &library_sites,
+            );
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
                 &merged_results,
                 &protocol_extractions.sockets,
                 &in_process_pubsub,
-                &LibrarySiteIndex::of(
-                    &stated_library_rows(&protocol_extractions.library, repo_path, service),
-                    repo_path,
-                ),
+                &library_sites,
                 repo_path,
             );
             if !manifest_entries.is_empty() {
@@ -3215,7 +3232,7 @@ async fn analyze_current_repo_incremental(
             // both resolve through the same sidecar bundle path as HTTP explicit
             // symbols (#245/#248). Concatenate both into the extra-explicit slice.
             let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
-                &protocol_extractions.sockets,
+                &library_sites.typed_sockets(&protocol_extractions.sockets),
                 repo_path,
                 &service_modules,
             );
@@ -3723,18 +3740,92 @@ fn scan_protocol_extractions(
     )
 }
 
-/// The library claims a service's imported packages answer, by export
-/// (carrick#1662). None yet: the scan asks the library store for them in
-/// carrick#1664, and passes them to [`library_rows`] in place of this.
-const NO_LIBRARY_CLAIMS: &[crate::library_claims::ExportClaims] = &[];
+/// A service's library sites and what the library store is asked about
+/// them (carrick#1664). Read before the analysis, so the first ask runs
+/// beside it.
+struct LibraryAsk {
+    sites: crate::request_summary::LibrarySites,
+    asked: crate::library_store::Asked,
+}
 
-/// The service's library sites read through `claims`, each verified by the
-/// sidecar against the package's own declarations, from `from_dir` (the
-/// service root, as for the client semantics). Verification runs on every
-/// scan and is never cached. No claims, or no sidecar, read nothing, and the
-/// sites are not even collected.
-fn library_rows(
-    inputs: &crate::request_summary::RequestSummaryInputs,
+impl LibraryAsk {
+    /// What the service asks, or `None` when it asks nothing: a run with no
+    /// model asks the cloud nothing, a scan with no sidecar could verify no
+    /// answer, and a service whose library calls go through no public
+    /// registry package has nothing to ask about.
+    fn start(
+        inputs: &crate::request_summary::RequestSummaryInputs,
+        sidecar: Option<&TypeSidecar>,
+        service_root: &Path,
+        repo_root: &Path,
+    ) -> Option<Self> {
+        if crate::local_mode::no_model() || sidecar.is_none() {
+            return None;
+        }
+        let sites = crate::request_summary::library_sites(inputs);
+        let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
+        let home = dirs::home_dir();
+        let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
+        let asked = crate::library_store::request(
+            &specifiers,
+            &crate::library_store::Install {
+                service_root,
+                repo_root,
+                home: home.as_deref(),
+                yarn_registry_env: yarn_registry_env.as_deref(),
+            },
+        )?;
+        Some(Self { sites, asked })
+    }
+}
+
+/// Send one request to the library store: one attempt, because a failure
+/// costs nothing the next scan does not fix, and a refusal or a throttle
+/// means no claims this scan.
+async fn send_to_library_store(
+    request: crate::library_store::LibraryClaimsRequest,
+) -> Result<String, crate::agent_service::AgentCallError> {
+    reask_agent()
+        .post_to_lambda(
+            crate::library_store::ROUTE,
+            &request,
+            crate::library_store::MOCK_SEED,
+        )
+        .await
+}
+
+/// The store's first answer for `ask`, asked beside the analysis.
+async fn first_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::LibraryAnswer {
+    match ask {
+        Some(ask) => {
+            crate::library_store::ask(ask.asked.request.clone(), send_to_library_store).await
+        }
+        None => crate::library_store::LibraryAnswer::default(),
+    }
+}
+
+/// The service's library rows: its library sites read through the claims
+/// the store answered (packages it had pending asked once more), each
+/// verified by the sidecar from `from_dir`. Nothing asked reads nothing.
+async fn library_rows(
+    ask: Option<&LibraryAsk>,
+    first: crate::library_store::LibraryAnswer,
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> crate::library_claims::LibraryRows {
+    let Some(ask) = ask else {
+        return crate::library_claims::LibraryRows::default();
+    };
+    let claims = crate::library_store::settle(&ask.asked, first, send_to_library_store).await;
+    read_library_rows(&ask.sites, &claims, sidecar, from_dir)
+}
+
+/// `sites` read through `claims`, each verified by the sidecar against the
+/// package's own declarations, from `from_dir` (the service root, as for the
+/// client semantics). Verification runs on every scan and is never cached.
+/// No claims, or no sidecar, read nothing.
+fn read_library_rows(
+    sites: &crate::request_summary::LibrarySites,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
@@ -3742,8 +3833,7 @@ fn library_rows(
     let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
         return crate::library_claims::LibraryRows::default();
     };
-    let sites = crate::request_summary::library_sites(inputs);
-    crate::library_claims::read(&sites, claims, |checks| {
+    crate::library_claims::read(sites, claims, |checks| {
         sidecar
             .verify_library_claims(from_dir, checks)
             .map(|answer| answer.verdicts)
@@ -4082,27 +4172,6 @@ fn append_deterministic_protocol_operations(
             }));
     }
 
-    let sockets = &extractions.sockets;
-    if !sockets.is_empty() {
-        debug!(
-            listeners = sockets.listeners.len(),
-            emitters = sockets.emitters.len(),
-            "Indexing Socket.IO operations"
-        );
-        cloud_data.endpoints.extend(
-            sockets
-                .listeners
-                .iter()
-                .map(|op| to_producer(op.key.clone(), &op.file_path, op.line)),
-        );
-        cloud_data.calls.extend(
-            sockets
-                .emitters
-                .iter()
-                .map(|op| to_call(op.key.clone(), &op.file_path, op.line)),
-        );
-    }
-
     let library = append_library_operations(
         cloud_data,
         &extractions.library,
@@ -4111,6 +4180,40 @@ fn append_deterministic_protocol_operations(
         &to_producer,
         &to_call,
     );
+
+    // A socket pass row a library row states at the same file, line, name,
+    // direction and side is the same call read twice: the library row is the
+    // fact, so the pass's row folds into it. With no library row there, the
+    // pass's row stands (ruled on carrick#1664). Its payload anchor stays in
+    // the manifest: it types the same operation at the same site.
+    let sockets = &extractions.sockets;
+    if !sockets.is_empty() {
+        let unstated = |ops: &[crate::socket_io::SocketOp], listener: bool| -> Vec<_> {
+            ops.iter()
+                .filter(|op| !library.states_socket(&op.file_path, op.line, &op.key, listener))
+                .cloned()
+                .collect()
+        };
+        let listeners = unstated(&sockets.listeners, true);
+        let emitters = unstated(&sockets.emitters, false);
+        debug!(
+            listeners = listeners.len(),
+            emitters = emitters.len(),
+            folded =
+                sockets.listeners.len() + sockets.emitters.len() - listeners.len() - emitters.len(),
+            "Indexing Socket.IO operations"
+        );
+        cloud_data.endpoints.extend(
+            listeners
+                .iter()
+                .map(|op| to_producer(op.key.clone(), &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            emitters
+                .iter()
+                .map(|op| to_call(op.key.clone(), &op.file_path, op.line)),
+        );
+    }
     append_event_bus_operations(
         cloud_data,
         &extractions.event_bus,
@@ -4131,16 +4234,26 @@ fn append_deterministic_protocol_operations(
 }
 
 /// Where library rows were stated (carrick#1662), by normalized file and
-/// line: each name, and each pub/sub name with its role. A model pub/sub row
-/// at the same file, line, topic and role is the same call read again and
-/// folds into the library row; so does an event-bus row at the same file,
-/// line and name.
+/// line: each name, each pub/sub name with its role, and each socket name
+/// with its direction and side. A model pub/sub row at the same file, line,
+/// topic and role is the same call read again and folds into the library
+/// row; so does an event-bus row at the same file, line and name, and a
+/// socket pass row at the same file, line, name, direction and side
+/// (carrick#1664).
 #[derive(Debug, Default)]
 struct LibrarySiteIndex {
     /// Files are keyed relative to this root, whichever form a caller holds.
     repo_root: PathBuf,
     named: HashSet<(PathBuf, u32, String)>,
     pubsub: HashSet<(PathBuf, u32, String, crate::operation::PubsubRole)>,
+    /// Each socket name with its direction, and whether the row listens.
+    socket: HashSet<(
+        PathBuf,
+        u32,
+        String,
+        crate::operation::SocketDirection,
+        bool,
+    )>,
 }
 
 impl LibrarySiteIndex {
@@ -4155,10 +4268,20 @@ impl LibrarySiteIndex {
             index
                 .named
                 .insert((file.clone(), row.line, row.name.clone()));
-            if let LibraryRowKind::Pubsub(role) = row.kind {
-                index
-                    .pubsub
-                    .insert((file, row.line, row.name.clone(), role));
+            match row.kind {
+                LibraryRowKind::Pubsub(role) => {
+                    index
+                        .pubsub
+                        .insert((file, row.line, row.name.clone(), role));
+                }
+                LibraryRowKind::Socket {
+                    direction,
+                    listener,
+                } => {
+                    index
+                        .socket
+                        .insert((file, row.line, row.name.clone(), direction, listener));
+                }
             }
         }
         index
@@ -4180,6 +4303,65 @@ impl LibrarySiteIndex {
     ) -> bool {
         self.pubsub
             .contains(&(self.relative(file), line, name.to_string(), role))
+    }
+
+    /// Whether a library socket row on the same side (listening or not) was
+    /// stated here for `key`'s event: in `key`'s direction, or, when the pass
+    /// could not read one (`Unknown`), in either (ruled on carrick#1664: the
+    /// library row's direction wins).
+    fn states_socket(&self, file: &Path, line: u32, key: &OperationKey, listener: bool) -> bool {
+        use crate::operation::SocketDirection;
+        let OperationKey::Socket { event, direction } = key else {
+            return false;
+        };
+        let directions: &[SocketDirection] = match direction {
+            SocketDirection::Unknown => &[
+                SocketDirection::ClientToServer,
+                SocketDirection::ServerToClient,
+            ],
+            known => std::slice::from_ref(known),
+        };
+        let file = self.relative(file);
+        directions.iter().any(|direction| {
+            self.socket
+                .contains(&(file.clone(), line, event.clone(), *direction, listener))
+        })
+    }
+
+    /// Whether `op` is a socket pass op of unknown direction folded into a
+    /// library row here: the operation it named is gone, so an anchor for it
+    /// would orphan (the library row's direction replaced its key).
+    fn folds_unknown(&self, op: &crate::socket_io::SocketOp, listener: bool) -> bool {
+        matches!(
+            op.key,
+            OperationKey::Socket {
+                direction: crate::operation::SocketDirection::Unknown,
+                ..
+            }
+        ) && self.states_socket(&op.file_path, op.line, &op.key, listener)
+    }
+
+    /// `sockets` without the ops [`Self::folds_unknown`] names: the ops
+    /// whose payload anchors still type an operation. An op folded in its own
+    /// direction keeps its anchor, which types the library row on its key.
+    fn typed_sockets(
+        &self,
+        sockets: &crate::socket_io::SocketExtraction,
+    ) -> crate::socket_io::SocketExtraction {
+        crate::socket_io::SocketExtraction {
+            listeners: sockets
+                .listeners
+                .iter()
+                .filter(|op| !self.folds_unknown(op, true))
+                .cloned()
+                .collect(),
+            emitters: sockets
+                .emitters
+                .iter()
+                .filter(|op| !self.folds_unknown(op, false))
+                .cloned()
+                .collect(),
+        }
     }
 
     fn states_name(&self, file: &Path, line: u32, name: &str) -> bool {
@@ -5013,7 +5195,9 @@ fn merge_graphql_consumer_locations(
 fn append_protocol_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     extractions: &ProtocolExtractions,
+    library: &LibrarySiteIndex,
 ) {
+    let sockets = library.typed_sockets(&extractions.sockets);
     for op in &extractions.graphql.producers {
         add_protocol_manifest_entry(
             entries,
@@ -5057,7 +5241,7 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
-    for op in &extractions.sockets.listeners {
+    for op in &sockets.listeners {
         add_protocol_manifest_entry(
             entries,
             &op.key,
@@ -5068,7 +5252,7 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
-    for op in &extractions.sockets.emitters {
+    for op in &sockets.emitters {
         add_protocol_manifest_entry(
             entries,
             &op.key,
@@ -7466,7 +7650,13 @@ async fn analyze_current_repo(
     // settled; the analysis reads them only once the model has been asked
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
-    let (analysis_result, settled) = tokio::join!(
+    let library_ask = LibraryAsk::start(
+        &request_inputs,
+        sidecar,
+        &service_root,
+        Path::new(repo_path),
+    );
+    let (analysis_result, settled, library_answer) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -7487,6 +7677,7 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
+        first_library_answer(library_ask.as_ref()),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
@@ -7529,7 +7720,7 @@ async fn analyze_current_repo(
         graphql_schemas,
     );
     protocol_extractions.library =
-        library_rows(&request_inputs, NO_LIBRARY_CLAIMS, sidecar, &service_root);
+        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root).await;
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -7602,16 +7793,17 @@ async fn analyze_current_repo(
         repo_path,
         &service_modules,
     );
-    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+    let library_sites = LibrarySiteIndex::of(
+        &stated_library_rows(&protocol_extractions.library, repo_path, service),
+        repo_path,
+    );
+    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions, &library_sites);
     append_pubsub_manifest_entries(
         &mut manifest_entries,
         &analysis_result.file_results,
         &protocol_extractions.sockets,
         &in_process_pubsub,
-        &LibrarySiteIndex::of(
-            &stated_library_rows(&protocol_extractions.library, repo_path, service),
-            repo_path,
-        ),
+        &library_sites,
         repo_path,
     );
     if !manifest_entries.is_empty() {
@@ -7628,7 +7820,7 @@ async fn analyze_current_repo(
     // resolve through the same sidecar bundle path as HTTP explicit symbols
     // (#245/#248). Concatenate both into the extra-explicit slice.
     let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
-        &protocol_extractions.sockets,
+        &library_sites.typed_sockets(&protocol_extractions.sockets),
         repo_path,
         &service_modules,
     );
@@ -15889,8 +16081,188 @@ mod tests {
         );
     }
 
-    /// carrick#1662: with no claims (every scan until carrick#1664 asks the
-    /// library store), or no sidecar to verify them, nothing is read.
+    /// A socket pass op at `file:line`, keyed `name` in `direction`.
+    fn socket_op_at(
+        file: &str,
+        line: u32,
+        name: &str,
+        direction: crate::operation::SocketDirection,
+    ) -> crate::socket_io::SocketOp {
+        crate::socket_io::SocketOp {
+            key: OperationKey::socket(name, direction),
+            file_path: PathBuf::from(file),
+            line,
+            payload_type_symbol: None,
+            payload_type_source: None,
+        }
+    }
+
+    /// Ruled on carrick#1664: a socket pass row folds into the verified
+    /// library socket row at the same file, line, name, direction and side,
+    /// as an event-bus row does; a row whose direction the pass could not
+    /// read folds into one at the same file, line, name and side, whose
+    /// direction wins. Any other socket row stands, the opposite side at the
+    /// same site included, and with no library row the pass's row stands.
+    /// The repo path is absolute and the pass's files are too, as a full scan
+    /// walks them; the library rows are relative.
+    #[test]
+    fn a_socket_pass_row_folds_into_the_library_row_at_its_site_and_no_other() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::library_claims::{LibraryRowKind, LibraryRows};
+        use crate::operation::SocketDirection::{ClientToServer, ServerToClient, Unknown};
+
+        let live = "/repo/svc/src/live.ts";
+        let extractions = ProtocolExtractions {
+            library: LibraryRows {
+                rows: vec![
+                    library_row(
+                        "svc/src/live.ts",
+                        4,
+                        "chat",
+                        LibraryRowKind::Socket {
+                            direction: ClientToServer,
+                            listener: true,
+                        },
+                    ),
+                    library_row(
+                        "svc/src/live.ts",
+                        5,
+                        "typing",
+                        LibraryRowKind::Socket {
+                            direction: ServerToClient,
+                            listener: false,
+                        },
+                    ),
+                ],
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![
+                    socket_op_at(live, 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat", Unknown),
+                    socket_op_at(live, 4, "chat", ServerToClient),
+                    socket_op_at(live, 9, "chat", ClientToServer),
+                    socket_op_at("/repo/svc/src/other.ts", 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat-room", ClientToServer),
+                    socket_op_at(live, 5, "typing", ServerToClient),
+                    socket_op_at(live, 5, "typing", Unknown),
+                ],
+                emitters: vec![
+                    socket_op_at(live, 5, "typing", ServerToClient),
+                    socket_op_at(live, 5, "typing", Unknown),
+                    socket_op_at(live, 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat", Unknown),
+                ],
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &HashMap::new(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            "/repo",
+            &Config::default(),
+        );
+        let rows =
+            |rows: &[ApiEndpointDetails]| -> Vec<(String, String, Option<ResolutionSource>)> {
+                let mut rows: Vec<_> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.key.canonical(),
+                            row.file_path.display().to_string(),
+                            row.resolution_source,
+                        )
+                    })
+                    .collect();
+                rows.sort();
+                rows
+            };
+        let fact = Some(ResolutionSource::LibraryClaim);
+        let row = |key: &str, at: &str, source: Option<ResolutionSource>| {
+            (key.to_string(), at.to_string(), source)
+        };
+        let (live4, live5) = ("/repo/svc/src/live.ts:4", "/repo/svc/src/live.ts:5");
+        assert_eq!(
+            rows(&cloud_data.endpoints),
+            vec![
+                row(
+                    "socket|CLIENT->SERVER|chat",
+                    "/repo/svc/src/live.ts:9",
+                    None
+                ),
+                row(
+                    "socket|CLIENT->SERVER|chat",
+                    "/repo/svc/src/other.ts:4",
+                    None
+                ),
+                row("socket|CLIENT->SERVER|chat", "svc/src/live.ts:4", fact),
+                row("socket|CLIENT->SERVER|chat-room", live4, None),
+                row("socket|SERVER->CLIENT|chat", live4, None),
+                row("socket|SERVER->CLIENT|typing", live5, None),
+                row("socket|UNKNOWN|typing", live5, None),
+            ],
+            "the listeners at the library listener's site in its direction or none fold; \
+             every other listener stands, those at the library emitter's site included"
+        );
+        assert_eq!(
+            rows(&cloud_data.calls),
+            vec![
+                row("socket|CLIENT->SERVER|chat", live4, None),
+                row("socket|SERVER->CLIENT|typing", "svc/src/live.ts:5", fact),
+                row("socket|UNKNOWN|chat", live4, None),
+            ],
+            "the emitters at the library emitter's site fold; those at a listener's site stand"
+        );
+
+        // An op folded in its own direction keeps its payload anchor, which
+        // types the library row on the same key; one of unknown direction
+        // loses it, as no operation has its key any more.
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::of(
+                &stated_library_rows(&extractions.library, "/repo", &Config::default()),
+                "/repo",
+            ),
+        );
+        let anchored: Vec<(String, bool, u32)> = {
+            let mut anchored: Vec<(String, bool, u32)> = entries
+                .iter()
+                .filter(|entry| entry.file_path == live && entry.line_number <= 5)
+                .map(|entry| {
+                    (
+                        entry.key.canonical(),
+                        entry.role == ManifestRole::Producer,
+                        entry.line_number,
+                    )
+                })
+                .collect();
+            anchored.sort();
+            anchored
+        };
+        let anchor = |key: &str, listener: bool, line: u32| (key.to_string(), listener, line);
+        assert_eq!(
+            anchored,
+            vec![
+                anchor("socket|CLIENT->SERVER|chat", false, 4),
+                anchor("socket|CLIENT->SERVER|chat", true, 4),
+                anchor("socket|CLIENT->SERVER|chat-room", true, 4),
+                anchor("socket|SERVER->CLIENT|chat", true, 4),
+                anchor("socket|SERVER->CLIENT|typing", false, 5),
+                anchor("socket|SERVER->CLIENT|typing", true, 5),
+                anchor("socket|UNKNOWN|chat", false, 4),
+                anchor("socket|UNKNOWN|typing", true, 5),
+            ],
+            "the folded listener of unknown direction at line 4 and emitter at line 5 \
+             keep no anchor; every other op at those lines does"
+        );
+    }
+
+    /// carrick#1662: with no claims, or no sidecar to verify them, nothing
+    /// is read.
     #[test]
     fn no_claims_or_no_sidecar_read_no_library_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -15899,9 +16271,9 @@ mod tests {
             "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
         )
         .expect("write");
-        let inputs = discover_request_inputs(dir.path());
+        let sites = crate::request_summary::library_sites(&discover_request_inputs(dir.path()));
         assert!(
-            library_rows(&inputs, NO_LIBRARY_CLAIMS, None, dir.path())
+            read_library_rows(&sites, &[], None, dir.path())
                 .rows
                 .is_empty()
         );
@@ -15915,7 +16287,7 @@ mod tests {
             .expect("claims"),
         ];
         assert!(
-            library_rows(&inputs, &claims, None, dir.path())
+            read_library_rows(&sites, &claims, None, dir.path())
                 .rows
                 .is_empty()
         );
@@ -16838,7 +17210,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
 
         let socket_entry = entries
             .iter()
@@ -16912,7 +17284,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
 
         let requests: Vec<&TypeManifestEntry> = entries
             .iter()
@@ -16978,7 +17350,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_alias = entries
             .iter()
             .find(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
@@ -17821,7 +18193,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_entry = entries
             .iter()
             .find(|e| {
@@ -17960,7 +18332,7 @@ mod tests {
 
         // The producer manifest entry's alias (Producer, Response).
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_entry = entries
             .iter()
             .find(|e| {
