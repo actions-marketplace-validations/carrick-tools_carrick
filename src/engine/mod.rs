@@ -6083,6 +6083,11 @@ fn resolve_types_if_available(
                             &type_resolution.anchor_changes,
                             repo_path,
                         );
+                        anchor_stated_body_roots(
+                            manifest,
+                            &type_resolution.inferred_types,
+                            repo_path,
+                        );
                         enrich_manifest_with_type_resolution(
                             manifest,
                             &type_resolution,
@@ -7363,21 +7368,6 @@ fn drop_call_through_entries(
     });
 }
 
-/// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
-///
-/// The manifest's `type_alias` is a synthetic hashed name (`Endpoint_<hash>_…`);
-/// the real source symbol (`StatusResponse`) lives on the file-analyzer result.
-/// Join by `(file_path, line_number)`: the mount-graph `file_location` the
-/// manifest is built from is `"{file_path}:{line}"`, where `file_path` is the
-/// same key `file_results` is keyed by and `line` is the same LLM-emitted
-/// `line_number`. Stamp the symbol onto every manifest entry for that op
-/// (request + response) so the eval projection surfaces the real anchor instead
-/// of the hash. The first non-None symbol per `(file, line)` wins.
-///
-/// The symbol-side line is normalized exactly as the manifest side
-/// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
-/// a line-0 anchor at `0` would never join a manifest entry (always `>= 1`), so
-/// the anchor would silently fall back to the hashed `type_alias`.
 /// The anchor a file-analyzer result stated for one source site: the symbol,
 /// and the import specifier the file brought it in through.
 struct AnchorAtSite {
@@ -7385,6 +7375,25 @@ struct AnchorAtSite {
     import_source: Option<String>,
 }
 
+/// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
+///
+/// The manifest's `type_alias` is a synthetic hashed name (`Endpoint_<hash>_…`);
+/// the real source symbol (`StatusResponse`) lives on the file-analyzer result.
+/// Join by `(file_path, line_number)`: the mount-graph `file_location` the
+/// manifest is built from is `"{file_path}:{line}"`, where `file_path` is the
+/// same key `file_results` is keyed by and `line` is the same LLM-emitted
+/// `line_number`. The first non-None symbol per `(file, line)` wins.
+///
+/// Only the op's RESPONSE entry takes the symbol (carrick#1818). An endpoint's
+/// symbol is the type of the response it sends and a data call's is the type
+/// the call expects back, and the explicit type request built from it targets
+/// the response alias alone. On the request entry it named the response type
+/// over the request body; enrichment anchors that entry from its own inference.
+///
+/// The symbol-side line is normalized exactly as the manifest side
+/// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
+/// a line-0 anchor at `0` would never join a manifest entry (always `>= 1`), so
+/// the anchor would silently fall back to the hashed `type_alias`.
 fn stamp_manifest_anchor_symbols(
     manifest: &mut [TypeManifestEntry],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
@@ -7427,7 +7436,10 @@ fn stamp_manifest_anchor_symbols(
         HashMap::new();
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
-    for entry in manifest.iter_mut() {
+    for entry in manifest
+        .iter_mut()
+        .filter(|entry| entry.type_kind == ManifestTypeKind::Response)
+    {
         let Some(anchor) = symbols.get(&(entry.file_path.clone(), entry.line_number)) else {
             continue;
         };
@@ -7500,15 +7512,14 @@ fn absolute_source_path(file_path: &str, repo_path: &str) -> PathBuf {
 
 /// Take back a model anchor the type arbitration rejected (carrick#1779).
 ///
-/// `stamp_manifest_anchor_symbols` writes the model's symbol onto every entry
-/// of an op's site before any type resolves. When
+/// `stamp_manifest_anchor_symbols` writes the model's symbol onto the response
+/// entries at an op's site before any type resolves. When
 /// `demote_witnessed_borrowed_anchors` then drops or re-aims the explicit
 /// request that symbol made, the row serves a type the symbol does not name:
 /// the wrapper the source casts its body read to, say, with the anchor still
 /// naming the element inside it. Each change reaches every entry of the same
-/// op at the same site that still carries the rejected symbol, the request
-/// entry included, since the stamp wrote it there too. A re-aimed root
-/// becomes the anchor, with the declaration the sidecar found for it. A
+/// op at the same site that still carries the rejected symbol. A re-aimed
+/// root becomes the anchor, with the declaration the sidecar found for it. A
 /// dropped one leaves no anchor and no home, so enrichment fills the anchor
 /// from each entry's own inference.
 fn restamp_arbitrated_anchors(
@@ -7583,6 +7594,73 @@ fn reported_declaration_home(
         line_number: line,
         symbol: root.symbol.clone(),
     })
+}
+
+/// Anchor a consumer response at the type its source states the body to be
+/// (carrick#1817).
+///
+/// A call's inference reports `stated_body` when the source casts or
+/// annotates the body it reads (`(await res.json()) as MemberPage`), and the
+/// row serves that statement. Its root is the named type the data-call schema
+/// asks the model for. The inference's own anchor cannot stand in for it: it
+/// is the call's type, `Response` for `fetch`, which enrichment's fill never
+/// writes. So a response entry left without an anchor, because the model
+/// named none or because `restamp_arbitrated_anchors` took back one the
+/// arbitration dropped, is anchored at the stated root, with its declaration.
+/// It runs after the restamp and before enrichment, whose fill then reaches
+/// only the entries this leaves without an anchor.
+///
+/// The entry keeps no anchor when the root is:
+/// - written with type arguments (`Page<Order>`): what such a row should
+///   name is not decided;
+/// - not declared in the repo under that name, so no home can be stated
+///   (the compiler's own globals, such as `Blob`, fall here);
+/// - transport machinery, which never anchors a row.
+fn anchor_stated_body_roots(
+    manifest: &mut [TypeManifestEntry],
+    inferred: &[crate::services::type_sidecar::InferredType],
+    repo_path: &str,
+) {
+    // The first inference per alias is the one whose text the entry serves,
+    // as in enrichment.
+    let mut first_by_alias: HashMap<&str, &crate::services::type_sidecar::InferredType> =
+        HashMap::new();
+    for inf in inferred {
+        first_by_alias.entry(inf.alias.as_str()).or_insert(inf);
+    }
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+    for entry in manifest
+        .iter_mut()
+        .filter(|entry| entry.primary_type_symbol.is_none())
+    {
+        let Some(inf) = first_by_alias.get(entry.type_alias.as_str()) else {
+            continue;
+        };
+        let Some(stated) = inf
+            .stated_body
+            .as_ref()
+            .filter(|stated| stated.root_type_arguments.is_none())
+        else {
+            continue;
+        };
+        let (Some(root), Some(source_file)) = (stated.root.as_ref(), stated.root_source.as_ref())
+        else {
+            continue;
+        };
+        if TypeSidecar::is_untyped_response_type(root) {
+            continue;
+        }
+        let root = crate::services::type_sidecar::AnchorRoot {
+            symbol: root.clone(),
+            source_file: source_file.clone(),
+        };
+        let Some(home) = reported_declaration_home(&root, repo_path, &cm, &handler) else {
+            continue;
+        };
+        entry.primary_type_symbol = Some(root.symbol);
+        entry.defined_in = Some(home);
+    }
 }
 
 fn add_manifest_pair(
@@ -7754,7 +7832,8 @@ fn enrich_manifest_with_type_resolution(
         // Fill the deterministic anchor ONLY when the LLM left it unset, so the
         // ops where the model already emitted a correct symbol (POST /payments,
         // socket) are never regressed. Stamping runs before enrichment, so any
-        // entry still `None` here had no LLM anchor.
+        // entry still `None` here had no LLM anchor of its own: a request
+        // entry never does, since the model's symbol names the response.
         if entry.primary_type_symbol.is_none()
             && let Some(symbol) = inferred_symbols.get(&entry.type_alias)
         {
@@ -15844,8 +15923,109 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // carrick#1818: the model's symbol names the response, not the request
+    // -----------------------------------------------------------------
+
+    /// An endpoint's symbol is the type of the response it sends and a data
+    /// call's is the type the call expects back, so both anchor the site's
+    /// response entry. The request entry keeps no anchor and no home from the
+    /// model; enrichment anchors it from its own inference.
+    #[test]
+    fn stamp_anchors_the_response_entry_only() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(
+            repo.path().join("src/orders.ts"),
+            "export interface Order {\n  id: string;\n}\n",
+        )
+        .expect("write");
+        let file = "src/orders.ts";
+        let mut result = make_file_result(vec!["/orders"], vec!["/orders"]);
+        result.endpoints[0].method = "POST".to_string();
+        result.endpoints[0].primary_type_symbol = Some("Order".to_string());
+        result.data_calls[0].method = Some("POST".to_string());
+        result.data_calls[0].primary_type_symbol = Some("Order".to_string());
+        let (endpoint_line, call_line) = (
+            result.endpoints[0].line_number as u32,
+            result.data_calls[0].line_number as u32,
+        );
+        let file_results = HashMap::from([(file.to_string(), result)]);
+        let key = OperationKey::http("POST", "/orders");
+        let mut manifest = Vec::new();
+        add_manifest_pair(
+            &mut manifest,
+            key.clone(),
+            ManifestRole::Producer,
+            file,
+            endpoint_line,
+            None,
+        );
+        add_manifest_pair(
+            &mut manifest,
+            key,
+            ManifestRole::Consumer,
+            file,
+            call_line,
+            None,
+        );
+        let modules =
+            crate::workspace_resolver::WorkspaceIndex::build_with_aliases(repo.path(), None);
+
+        stamp_manifest_anchor_symbols(
+            &mut manifest,
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &modules,
+        );
+
+        assert_eq!(manifest.len(), 4, "a request and a response entry per side");
+        let home = crate::cloud_storage::TypeHome {
+            file_path: file.to_string(),
+            line_number: 1,
+            symbol: "Order".to_string(),
+        };
+        for entry in &manifest {
+            match entry.type_kind {
+                ManifestTypeKind::Response => {
+                    assert_eq!(
+                        entry.primary_type_symbol.as_deref(),
+                        Some("Order"),
+                        "{:?} response",
+                        entry.role
+                    );
+                    assert_eq!(entry.defined_in.as_ref(), Some(&home));
+                }
+                ManifestTypeKind::Request => {
+                    assert_eq!(
+                        entry.primary_type_symbol, None,
+                        "{:?} request: the model's symbol names the response",
+                        entry.role
+                    );
+                    assert_eq!(entry.defined_in, None);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // carrick#1779: a rejected model anchor leaves the manifest row
     // -----------------------------------------------------------------
+
+    /// One entry of a consumer call at `file:line`, with no anchor: a request
+    /// entry as the stamp leaves it.
+    fn site_entry(
+        alias: &str,
+        type_kind: ManifestTypeKind,
+        path: &str,
+        line_number: u32,
+    ) -> TypeManifestEntry {
+        let mut entry = consumer_entry(alias);
+        entry.key = OperationKey::http("GET", path);
+        entry.type_kind = type_kind;
+        entry.file_path = "src/api.ts".to_string();
+        entry.line_number = line_number;
+        entry
+    }
 
     /// One entry of a consumer call at `file:line`, stamped with the model's
     /// `symbol` and the home the stamp found for it.
@@ -15856,11 +16036,7 @@ mod tests {
         line_number: u32,
         symbol: &str,
     ) -> TypeManifestEntry {
-        let mut entry = consumer_entry(alias);
-        entry.key = OperationKey::http("GET", path);
-        entry.type_kind = type_kind;
-        entry.file_path = "src/api.ts".to_string();
-        entry.line_number = line_number;
+        let mut entry = site_entry(alias, type_kind, path, line_number);
         entry.primary_type_symbol = Some(symbol.to_string());
         entry.defined_in = Some(crate::cloud_storage::TypeHome {
             file_path: "src/types.ts".to_string(),
@@ -15879,10 +16055,10 @@ mod tests {
     }
 
     /// The source casts the body it reads to a wrapper and the model named the
-    /// element: the arbitration dropped the model's symbol, so neither entry
-    /// of that call may keep it or its home, and enrichment then anchors the
-    /// response from its own inference. Another op on the same line, and the
-    /// same op at another site, are not that call.
+    /// element: the arbitration dropped the model's symbol, so the call's
+    /// response may not keep it or its home, and enrichment then anchors each
+    /// entry of the call from its own inference. Another op on the same line,
+    /// and the same op at another site, are not that call.
     #[test]
     fn restamp_lets_go_of_a_dropped_model_anchor() {
         let mut manifest = vec![
@@ -15893,12 +16069,11 @@ mod tests {
                 5,
                 "Member",
             ),
-            stamped_entry(
+            site_entry(
                 "Members_Request_Call1",
                 ManifestTypeKind::Request,
                 "/members",
                 5,
-                "Member",
             ),
             stamped_entry(
                 "Teams_Response_Call1",
@@ -15934,9 +16109,14 @@ mod tests {
         manifest.extend([elsewhere, producer]);
         let mut resolution = empty_resolution();
         resolution.anchor_changes = vec![dropped("Members_Response_Call1", "Member")];
-        let mut inferred = inferred_with_symbol("MembersPage");
-        inferred.alias = "Members_Response_Call1".to_string();
-        resolution.inferred_types.push(inferred);
+        for (alias, symbol) in [
+            ("Members_Response_Call1", "MembersPage"),
+            ("Members_Request_Call1", "MemberQuery"),
+        ] {
+            let mut inferred = inferred_with_symbol(symbol);
+            inferred.alias = alias.to_string();
+            resolution.inferred_types.push(inferred);
+        }
 
         restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, "/repo");
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -15951,8 +16131,9 @@ mod tests {
             "no home for a symbol it never had"
         );
         assert_eq!(
-            manifest[1].primary_type_symbol, None,
-            "the request entry lets go too"
+            manifest[1].primary_type_symbol.as_deref(),
+            Some("MemberQuery"),
+            "the request entry is anchored by its own inference"
         );
         assert_eq!(manifest[1].defined_in, None);
         for untouched in &manifest[2..] {
@@ -15989,10 +16170,12 @@ mod tests {
         assert!(manifest[0].defined_in.is_some());
     }
 
-    /// A re-aimed request names the root the source states, so both entries of
-    /// the call name it too, with the declaration the sidecar found. The
-    /// sidecar spells the path in its resolved form (`/private/var/...` for a
-    /// macOS temp dir), which the repo root as the scan holds it may not.
+    /// A re-aimed request names the root the source states, so the call's
+    /// response names it too, with the declaration the sidecar found; the
+    /// request entry, which the model's symbol never anchored, is not part of
+    /// it. The sidecar spells the path in its resolved form
+    /// (`/private/var/...` for a macOS temp dir), which the repo root as the
+    /// scan holds it may not.
     #[test]
     fn restamp_names_a_reaimed_root_at_its_declaration() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -16015,12 +16198,11 @@ mod tests {
                 5,
                 "Member",
             ),
-            stamped_entry(
+            site_entry(
                 "Page_Request_Call1",
                 ManifestTypeKind::Request,
                 "/members",
                 5,
-                "Member",
             ),
         ];
         let changes = vec![crate::services::type_sidecar::AnchorChange {
@@ -16039,10 +16221,13 @@ mod tests {
             line_number: 3,
             symbol: "MemberPage".to_string(),
         };
-        for entry in &manifest {
-            assert_eq!(entry.primary_type_symbol.as_deref(), Some("MemberPage"));
-            assert_eq!(entry.defined_in.as_ref(), Some(&home));
-        }
+        assert_eq!(
+            manifest[0].primary_type_symbol.as_deref(),
+            Some("MemberPage")
+        );
+        assert_eq!(manifest[0].defined_in.as_ref(), Some(&home));
+        assert_eq!(manifest[1].primary_type_symbol, None);
+        assert_eq!(manifest[1].defined_in, None);
     }
 
     /// A root the sidecar found outside the repo is still the anchor, but the
@@ -16086,6 +16271,186 @@ mod tests {
         manifest[0].primary_type_symbol = Some("Member".to_string());
         restamp_arbitrated_anchors(&mut manifest, &changes, "");
         assert_eq!(manifest[0].defined_in, None);
+    }
+
+    // -----------------------------------------------------------------
+    // carrick#1817: a row is anchored at the body its source states
+    // -----------------------------------------------------------------
+
+    /// The calling file of the #1817 fixtures: the page type is declared
+    /// there, unexported, the way a client often keeps the shape of one read.
+    const STATED_SOURCE: &str = "type MemberPage = {\n  members: { id: string }[];\n};\n\nexport async function members() {\n  const response = await fetch('/members');\n  return (await response.json()) as MemberPage;\n}\n";
+
+    /// A repo holding `src/api.ts` (`STATED_SOURCE`), and that file's path as
+    /// the sidecar spells it (resolved, `/private/var/...` on macOS).
+    fn stated_repo() -> (tempfile::TempDir, String) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(repo.path().join("src/api.ts"), STATED_SOURCE).expect("write");
+        let declaring = repo
+            .path()
+            .join("src/api.ts")
+            .canonicalize()
+            .expect("canonical");
+        (repo, declaring.to_string_lossy().into_owned())
+    }
+
+    /// The call's inference as the sidecar reports a stated body read: its
+    /// text is the statement, its own anchor is the call's type (`Response`).
+    fn stated_call(alias: &str, stated: crate::services::type_sidecar::StatedBody) -> InferredType {
+        let mut inferred = inferred_with_symbol("Response");
+        inferred.alias = alias.to_string();
+        inferred.infer_kind = InferKind::CallResult;
+        inferred.type_string = "{ members: { id: string; }[]; }".to_string();
+        inferred.is_explicit = true;
+        inferred.stated_body = Some(stated);
+        inferred
+    }
+
+    fn stated_root(root: &str, source: &str) -> crate::services::type_sidecar::StatedBody {
+        crate::services::type_sidecar::StatedBody {
+            root: Some(root.to_string()),
+            root_source: Some(source.to_string()),
+            array_depth: None,
+            root_type_arguments: None,
+        }
+    }
+
+    /// The model named the element inside the page and the arbitration
+    /// dropped it (the ticket's case), or the model named nothing: either
+    /// way the response entry is anchored at the type the source states the
+    /// body to be, with its declaration. The request entry is another alias
+    /// with no statement, and the fill's `Response` never reaches either.
+    #[test]
+    fn stated_root_anchors_a_response_left_without_one() {
+        let (repo, declaring) = stated_repo();
+        let mut dropped_call = consumer_entry("Members_Response_Call1");
+        dropped_call.primary_type_symbol = Some("Member".to_string());
+        let mut manifest = vec![
+            dropped_call,
+            consumer_entry("Members_Response_Call2"),
+            consumer_entry("Members_Request_Call2"),
+        ];
+        manifest[2].type_kind = ManifestTypeKind::Request;
+        let mut resolution = empty_resolution();
+        resolution.anchor_changes = vec![dropped("Members_Response_Call1", "Member")];
+        resolution.inferred_types = vec![
+            stated_call(
+                "Members_Response_Call1",
+                stated_root("MemberPage", &declaring),
+            ),
+            stated_call(
+                "Members_Response_Call2",
+                stated_root("MemberPage", &declaring),
+            ),
+        ];
+
+        let repo_path = repo.path().to_string_lossy();
+        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
+        anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        let home = crate::cloud_storage::TypeHome {
+            file_path: "src/api.ts".to_string(),
+            line_number: 1,
+            symbol: "MemberPage".to_string(),
+        };
+        for entry in &manifest[..2] {
+            assert_eq!(
+                entry.primary_type_symbol.as_deref(),
+                Some("MemberPage"),
+                "{}",
+                entry.type_alias
+            );
+            assert_eq!(
+                entry.defined_in.as_ref(),
+                Some(&home),
+                "{}",
+                entry.type_alias
+            );
+        }
+        assert_eq!(manifest[2].primary_type_symbol, None);
+        assert_eq!(manifest[2].defined_in, None);
+    }
+
+    /// An anchor the row already has is not the stated root's to replace:
+    /// the model's, kept because it is the root or because several requests
+    /// fan in to the alias, and a re-aimed root.
+    #[test]
+    fn stated_root_leaves_an_anchor_in_place() {
+        let (repo, declaring) = stated_repo();
+        let mut manifest = vec![consumer_entry("Members_Response_Call1")];
+        manifest[0].primary_type_symbol = Some("Member".to_string());
+        let inferred = vec![stated_call(
+            "Members_Response_Call1",
+            stated_root("MemberPage", &declaring),
+        )];
+
+        anchor_stated_body_roots(&mut manifest, &inferred, &repo.path().to_string_lossy());
+
+        assert_eq!(manifest[0].primary_type_symbol.as_deref(), Some("Member"));
+        assert_eq!(manifest[0].defined_in, None);
+    }
+
+    /// Each statement here names a root the row cannot be anchored at, so
+    /// the row keeps no anchor, and the fill's `Response` stays out too.
+    #[test]
+    fn stated_root_anchors_nothing_it_cannot_name_at_home() {
+        let (repo, declaring) = stated_repo();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let outside = elsewhere.path().join("pages.ts");
+        std::fs::write(&outside, "export type MemberPage = { id: string };\n").expect("write");
+        // A repo can declare a type under a machinery name; it is still not
+        // a body to anchor.
+        std::fs::write(
+            repo.path().join("src/transport.ts"),
+            "export interface Response {\n  ok: boolean;\n}\n",
+        )
+        .expect("write");
+        let transport = repo
+            .path()
+            .join("src/transport.ts")
+            .canonicalize()
+            .expect("canonical");
+        let mut generic = stated_root("MemberPage", &declaring);
+        generic.root_type_arguments = Some(1);
+        let mut no_source = stated_root("MemberPage", &declaring);
+        no_source.root_source = None;
+        let cases = [
+            ("written with type arguments", generic),
+            ("declared nowhere the sidecar found", no_source),
+            (
+                "declared outside the repo",
+                stated_root("MemberPage", &outside.to_string_lossy()),
+            ),
+            (
+                "not declared under that name",
+                stated_root("MembersPage", &declaring),
+            ),
+            (
+                "transport machinery",
+                stated_root("Response", &transport.to_string_lossy()),
+            ),
+            (
+                "rooted at no name",
+                crate::services::type_sidecar::StatedBody::default(),
+            ),
+        ];
+        for (why, stated) in cases {
+            let mut manifest = vec![consumer_entry("Members_Response_Call1")];
+            let mut resolution = empty_resolution();
+            resolution.inferred_types = vec![stated_call("Members_Response_Call1", stated)];
+
+            anchor_stated_body_roots(
+                &mut manifest,
+                &resolution.inferred_types,
+                &repo.path().to_string_lossy(),
+            );
+            enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+            assert_eq!(manifest[0].primary_type_symbol, None, "{why}");
+            assert_eq!(manifest[0].defined_in, None, "{why}");
+        }
     }
 
     /// carrick#780, case (a): the statement the v1 side writes when it was
