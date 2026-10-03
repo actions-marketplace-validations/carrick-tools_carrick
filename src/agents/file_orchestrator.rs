@@ -2091,11 +2091,19 @@ impl FileOrchestrator {
                 // `None` is a package import: a real binding, no same-repo
                 // module behind it.
                 let mut import_owners: HashMap<String, Option<PathBuf>> = HashMap::new();
+                // Each NAMED import of a same-repo module, with the name that
+                // module exports it by: the receivers an object constant's
+                // members are reached through (carrick#1733).
+                let mut object_receivers: HashMap<String, (PathBuf, String)> = HashMap::new();
                 for (local_name, symbol) in &pf.symbol_table.imported_symbols {
-                    import_owners.insert(
-                        local_name.clone(),
-                        Self::resolve_relative_import(&importer, &symbol.source),
-                    );
+                    let owner = Self::resolve_relative_import(&importer, &symbol.source);
+                    if let (Some(module), SymbolKind::Named) = (&owner, &symbol.kind) {
+                        object_receivers.insert(
+                            local_name.clone(),
+                            (module.clone(), symbol.imported_name.clone()),
+                        );
+                    }
+                    import_owners.insert(local_name.clone(), owner);
                 }
                 for symbol in pf.symbol_table.imported_symbols.values() {
                     let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
@@ -2204,6 +2212,17 @@ impl FileOrchestrator {
                             &import_owners,
                             &receiver_imports,
                         );
+                    // A call through an imported object constant's member
+                    // (carrick#1733) names its module and its object, so it
+                    // answers ahead of the name join at the same site.
+                    for (span, member) in Self::resolve_object_members(
+                        &pf.candidate_map,
+                        &object_receivers,
+                        &member_cache,
+                    ) {
+                        pf.unresolved_member_sites.retain(|(site, _)| *site != span);
+                        pf.resolved_members.insert(span, member);
+                    }
 
                     // Which wrapper each site delegates to, for the dispatch
                     // carry (carrick#872). Same rings, same receiver rule, a
@@ -3136,11 +3155,14 @@ impl FileOrchestrator {
         // function per sibling route it can name the sibling. Before the verb
         // pass, so the verb its AST states still has the last word, and before
         // the two passes after it, which decide which rows state one
-        // operation.
+        // operation. The same site's value is the function's return value, so
+        // a row there is marked `at_caller` unless the function hands back its
+        // parsed body (carrick#1801), before the type requests read the mark.
         let wrapper_route_corrections = crate::wrapper_call_route::correct_wrapper_call_routes(
             &mut file_results,
             normalizer,
             Some(service_modules),
+            &|file, function| summaries.passes_body(file, function),
         );
         stats.wrapper_route_corrections = wrapper_route_corrections;
         if wrapper_route_corrections
@@ -3148,9 +3170,11 @@ impl FileOrchestrator {
         {
             debug!(
                 "  - Routes read off the body of the function the call reaches: {} (body states \
-                 no single route it writes: {})",
+                 no single route it writes: {}); rows whose value is that function's return \
+                 value: {}",
                 wrapper_route_corrections.corrected,
-                wrapper_route_corrections.declaration_unreadable
+                wrapper_route_corrections.declaration_unreadable,
+                wrapper_route_corrections.restated_at_caller
             );
         }
 
@@ -3889,7 +3913,14 @@ impl FileOrchestrator {
                     }
                 }
 
-                if should_infer_request_body(&method) {
+                // A call through a declaration in another module (carrick#1733)
+                // hands the member its parameters, and the member builds the
+                // body: what the model anchored at this site is an argument,
+                // not the request body. The member's own request line states
+                // the body; this site states none.
+                if should_infer_request_body(&method)
+                    && data_call.resolution_source != Some(ResolutionSource::ImportedMember)
+                {
                     push_infer(
                         &file_path_absolute,
                         line_number,
@@ -4382,16 +4413,20 @@ impl FileOrchestrator {
 
         let mut requests: Vec<SymbolRequest> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        // An alias the executed document's declaration types goes through the
-        // infer path instead (carrick#1761); a located symbol for it must not
-        // compete with that anchor in the capture.
-        let declared = Self::declared_result_anchors(graphql);
+        // An alias a field-level type is written for goes through the infer
+        // path instead (carrick#1761, carrick#1760); a located symbol for it
+        // must not compete with that anchor in the capture. A located symbol
+        // that is the result of the row's whole operation is never bundled:
+        // it would serve the wrapper as the field's type (carrick#1760).
+        let field_level = Self::consumer_field_type_anchors(graphql);
         for op in &graphql.consumers {
-            if declared.contains_key(&build_manifest_type_alias(
-                &op.key,
-                ManifestRole::Consumer,
-                ManifestTypeKind::Response,
-            )) {
+            if op.located_field_type.is_some()
+                || field_level.contains_key(&build_manifest_type_alias(
+                    &op.key,
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                ))
+            {
                 continue;
             }
             // #268: the deterministic call-site anchor (`payload_type_symbol`,
@@ -4485,21 +4520,23 @@ impl FileOrchestrator {
         requests
     }
 
-    /// The consumer Response aliases the executed document's declaration
-    /// types (carrick#1761), each with the row whose declared field type
-    /// answers it.
+    /// The consumer Response aliases a field-level result type is written
+    /// for, each with the span of the type that answers it: the executed
+    /// document's declaration (carrick#1761), else a located operation result
+    /// type read at the field (carrick#1760).
     ///
     /// A consumer alias is keyed by the operation alone (#291), so every row
     /// of one field in a service shares it and one anchor answers for all of
     /// them. An explicit call-site generic on any row (`payload_type_symbol`)
     /// keeps the alias on the symbol path, as it always has. Otherwise a row
     /// whose document declares the field's type answers it, ahead of any model
-    /// locate: the declaration is read from the AST, the locate is a hint. Of
-    /// several such rows, the first by file and line, so the choice is the
-    /// same on every scan.
-    fn declared_result_anchors(
+    /// locate: the declaration is read from the AST, the locate is a hint.
+    /// Only then does a row whose located type was read at its field answer
+    /// it. Of several rows of one kind, the first by file and line, so the
+    /// choice is the same on every scan.
+    fn consumer_field_type_anchors(
         graphql: &crate::graphql::GraphqlExtraction,
-    ) -> BTreeMap<String, &crate::graphql::GraphqlOp> {
+    ) -> BTreeMap<String, &crate::graphql_document_sites::DeclaredFieldType> {
         let alias = |op: &crate::graphql::GraphqlOp| {
             build_manifest_type_alias(&op.key, ManifestRole::Consumer, ManifestTypeKind::Response)
         };
@@ -4509,46 +4546,47 @@ impl FileOrchestrator {
             .filter(|op| op.payload_type_symbol.is_some())
             .map(alias)
             .collect();
-        let mut declared: Vec<&crate::graphql::GraphqlOp> = graphql
-            .consumers
-            .iter()
-            .filter(|op| op.declared_result_type.is_some())
-            .collect();
-        declared.sort_by(|a, b| (&a.file_path, a.line).cmp(&(&b.file_path, b.line)));
+        let mut rows: Vec<&crate::graphql::GraphqlOp> = graphql.consumers.iter().collect();
+        rows.sort_by(|a, b| (&a.file_path, a.line).cmp(&(&b.file_path, b.line)));
         let mut anchors = BTreeMap::new();
-        for op in declared {
+        let declared = rows
+            .iter()
+            .filter_map(|op| Some((*op, op.declared_result_type.as_ref()?)));
+        let located = rows
+            .iter()
+            .filter_map(|op| Some((*op, op.located_field_type.as_ref()?)));
+        for (op, field_type) in declared.chain(located) {
             let alias = alias(op);
             if !generic.contains(&alias) {
-                anchors.entry(alias).or_insert(op);
+                anchors.entry(alias).or_insert(field_type);
             }
         }
         anchors
     }
 
     /// Build `Expression` infer requests for GraphQL consumer rows whose
-    /// executed document declares the field's result type (carrick#1761).
+    /// result type is written at the field's level: the executed document's
+    /// declaration states it (carrick#1761), or the result type the model
+    /// located is the operation's and its property for the field is read
+    /// (carrick#1760).
     ///
-    /// The declaration is asserted to a document type whose result argument
-    /// declares one property per root field; the request points the sidecar
-    /// at that property's TYPE in the declaring module, so what it reads is
-    /// the field's payload exactly as the declaration states it (the level a
-    /// consumer row is keyed at, carrick#1760), resolved by the checker
-    /// against the module's own imports. The span goes out in the sidecar's
-    /// numbering, converted at this boundary (carrick#805).
+    /// Either way the type is an object with one property per root field; the
+    /// request points the sidecar at that property's TYPE in the declaring
+    /// module, so what it reads is the field's payload exactly as written (the
+    /// level a consumer row is keyed at), resolved by the checker against the
+    /// module's own imports. The span goes out in the sidecar's numbering,
+    /// converted at this boundary (carrick#805).
     ///
     /// The alias is `build_manifest_type_alias(&op.key, Consumer, Response)`,
     /// byte-identical to the manifest entry's, or the inferred type never
-    /// joins back. One request per alias ([`Self::declared_result_anchors`]).
+    /// joins back. One request per alias ([`Self::consumer_field_type_anchors`]).
     pub fn collect_graphql_consumer_infer_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
     ) -> Vec<InferRequestItem> {
         let mut file_source: HashMap<String, Option<String>> = HashMap::new();
         let mut requests = Vec::new();
-        for (alias, op) in Self::declared_result_anchors(graphql) {
-            let Some(declared) = op.declared_result_type.as_ref() else {
-                continue;
-            };
+        for (alias, declared) in Self::consumer_field_type_anchors(graphql) {
             let file = declared.file.to_string_lossy().into_owned();
             let Some(content) = Self::cached_source(&mut file_source, &file) else {
                 continue;
@@ -4566,7 +4604,7 @@ impl FileOrchestrator {
             });
         }
         debug!(
-            "[FileOrchestrator] Collected {} graphql consumer infer requests from declared document result types",
+            "[FileOrchestrator] Collected {} graphql consumer infer requests from field-level result types",
             requests.len()
         );
         requests
@@ -8321,6 +8359,48 @@ impl FileOrchestrator {
         // this is persisted.
         declined.sort();
         (resolved, declined)
+    }
+
+    /// Join each call made through an imported object constant onto the member
+    /// its module declares (carrick#1733): `ordersApi.addNote(…)`, where the
+    /// file imports `ordersApi` by name from the module whose `const ordersApi
+    /// = { addNote: … }` states the request.
+    ///
+    /// The call's IMMEDIATE receiver must be that named import, and the member
+    /// is looked up in the imported module alone, under the name the module
+    /// exports the object by (`object_receivers`: local name to module and
+    /// exported name). So no other module's member of the same name can
+    /// answer, and a receiver that is a parameter, a local, a default or
+    /// namespace import, or a barrel that re-exports the object from another
+    /// module joins nothing and keeps whatever extraction gave it.
+    fn resolve_object_members(
+        candidate_map: &HashMap<String, CandidateTarget>,
+        object_receivers: &HashMap<String, (PathBuf, String)>,
+        member_cache: &HashMap<PathBuf, RequestMemberIndex>,
+    ) -> HashMap<u32, ResolvedMember> {
+        let mut resolved = HashMap::new();
+        for candidate in candidate_map.values() {
+            let (Some(receiver), Some(property)) =
+                (&candidate.receiver_ident, &candidate.callee_property)
+            else {
+                continue;
+            };
+            let Some((module, exported)) = object_receivers.get(receiver) else {
+                continue;
+            };
+            let name = format!("{exported}.{property}");
+            let Some(member) = member_cache.get(module).and_then(|index| index.get(&name)) else {
+                continue;
+            };
+            resolved.insert(
+                candidate.span_start,
+                ResolvedMember {
+                    name,
+                    member: member.clone(),
+                },
+            );
+        }
+        resolved
     }
 
     /// Join each candidate's callee name onto the wrapper whose body issues
@@ -13265,6 +13345,94 @@ export * from "./aFetch.js";"#,
         );
     }
 
+    /// carrick#1733: a row the imported-member join states at a call through
+    /// a member carries the member's call, and its arguments are the member's
+    /// parameters: the member builds the body its own request line states. So
+    /// the payload a model row folded onto it anchors (`note.trim()`) is not
+    /// the request body, and no request type is asked for. Its response is
+    /// still asked for, and a model row's own request side beside it still is.
+    #[test]
+    fn a_call_through_an_imported_member_asks_for_no_request_body() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let repo = repo_with_source("src/page.ts", 700);
+        let call = |line: i32, span: u32, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{span}-{}", span + 50),
+            line_number: line,
+            target: "/v1/orders/${orderId}/notes".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: "addNote".to_string(),
+            call_expression_span_start: Some(span),
+            call_expression_span_end: Some(span + 50),
+            call_expression_text: Some("ordersApi.addNote(orderId, note.trim())".to_string()),
+            call_expression_line: Some(line),
+            payload_expression_text: Some("note.trim()".to_string()),
+            payload_expression_line: Some(line),
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/page.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    call(10, 470, ResolutionSource::ImportedMember),
+                    call(20, 530, ResolutionSource::Model),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &Config::default(),
+            &repo_modules(repo.path()),
+        );
+
+        let lines = |kind: InferKind| -> Vec<u32> {
+            let mut lines: Vec<u32> = infer
+                .iter()
+                .filter(|item| item.infer_kind == kind)
+                .map(|item| item.line_number)
+                .collect();
+            lines.sort();
+            lines.dedup();
+            lines
+        };
+        assert_eq!(
+            lines(InferKind::RequestBody),
+            vec![20],
+            "only the model row asks for a request body: {infer:?}"
+        );
+        assert_eq!(
+            lines(InferKind::CallResult),
+            vec![10, 20],
+            "both rows still ask for the call's result: {infer:?}"
+        );
+    }
+
     /// carrick#1601: the mark a summary row carries reaches the call row the
     /// type layer reads, on a caller row and on a request line's own row.
     #[test]
@@ -17426,6 +17594,85 @@ export { routes };
         candidate.callee_object = callee_object.to_string();
         candidate.callee_property = Some(callee_property.to_string());
         HashMap::from([("c1".to_string(), candidate)])
+    }
+
+    /// carrick#1733: a call through an imported object constant joins the
+    /// member the IMPORTED module declares, under the name that module exports
+    /// the object by, and nothing else answers for it.
+    #[test]
+    fn resolve_object_members_reads_the_member_off_the_module_the_receiver_is_imported_from() {
+        let module = |path: &str, target: &str| {
+            let (path, index) = ring(&[(path, "ordersApi.addNote", "POST", target)]).remove(0);
+            (path, index)
+        };
+        let member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::from([
+            module("orders.api.ts", "/v1/orders/${orderId}/notes"),
+            module("admin.api.ts", "/admin/orders/${orderId}/notes"),
+        ]);
+        let through = |receiver: Option<&str>, property: &str, imports: &[(&str, &str, &str)]| {
+            let mut sites = site(receiver.unwrap_or("ordersApi"), property);
+            sites.get_mut("c1").expect("one site").receiver_ident = receiver.map(str::to_string);
+            let receivers: HashMap<String, (PathBuf, String)> = imports
+                .iter()
+                .map(|(local, path, exported)| {
+                    (
+                        local.to_string(),
+                        (PathBuf::from(path), exported.to_string()),
+                    )
+                })
+                .collect();
+            FileOrchestrator::resolve_object_members(&sites, &receivers, &member_cache)
+        };
+        let orders = [("ordersApi", "orders.api.ts", "ordersApi")];
+        assert_eq!(
+            through(Some("ordersApi"), "addNote", &orders).get(&100),
+            Some(&ring_outcome(
+                "ordersApi.addNote",
+                "POST",
+                "/v1/orders/${orderId}/notes"
+            ))
+        );
+        assert_eq!(
+            through(
+                Some("ordersApi"),
+                "addNote",
+                &[("ordersApi", "admin.api.ts", "ordersApi")]
+            )
+            .get(&100),
+            Some(&ring_outcome(
+                "ordersApi.addNote",
+                "POST",
+                "/admin/orders/${orderId}/notes"
+            )),
+            "the same object and member in another module answer only for that module"
+        );
+        assert_eq!(
+            through(
+                Some("orders"),
+                "addNote",
+                &[("orders", "orders.api.ts", "ordersApi")]
+            )
+            .get(&100),
+            Some(&ring_outcome(
+                "ordersApi.addNote",
+                "POST",
+                "/v1/orders/${orderId}/notes"
+            )),
+            "an import under another local name joins by the exported name"
+        );
+        assert!(
+            through(Some("api"), "addNote", &orders).is_empty(),
+            "a receiver that is no named import (a parameter, a local) joins nothing"
+        );
+        assert!(
+            through(None, "addNote", &orders).is_empty(),
+            "a call whose immediate receiver is no bare name (`ordersApi.addNote(x).then(f)`'s \
+             `then`) joins nothing"
+        );
+        assert!(
+            through(Some("ordersApi"), "remove", &orders).is_empty(),
+            "a member the module does not declare joins nothing"
+        );
     }
 
     /// carrick#655: a member the consumer's own imports do not declare is
