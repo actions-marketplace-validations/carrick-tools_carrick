@@ -117,7 +117,7 @@ pub struct ExtractionConfig {
 }
 
 /// Request for a specific symbol to be bundled
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SymbolRequest {
     /// The name of the symbol (type, interface, class, etc.)
     pub symbol_name: String,
@@ -1233,6 +1233,9 @@ pub struct TypeResolutionResult {
     pub symbol_failures: Vec<SymbolFailure>,
     /// General errors
     pub errors: Vec<String>,
+    /// The explicit requests the anchor arbitration re-aimed or dropped
+    /// before the bundle ran (carrick#1779).
+    pub anchor_changes: Vec<AnchorChange>,
 }
 
 // ============================================================================
@@ -2104,6 +2107,7 @@ impl TypeSidecar {
             inferred_types: vec![],
             symbol_failures: vec![],
             errors: vec![],
+            anchor_changes: vec![],
         };
 
         // Infer implicit types FIRST: a successful inference is the compiler's
@@ -2131,7 +2135,9 @@ impl TypeSidecar {
         // the bundled dts, so a post-hoc flag flip in
         // `enrich_manifest_with_type_resolution` could never undo a wrong
         // explicit definition.
-        let explicit = demote_witnessed_borrowed_anchors(explicit, &result.inferred_types);
+        let arbitrated = demote_witnessed_borrowed_anchors(explicit, &result.inferred_types);
+        let explicit = arbitrated.requests;
+        result.anchor_changes = arbitrated.changed;
 
         // Bundle explicit types. An LLM-extracted anchor is a bare identifier
         // by schema contract (`User[]` → `User`), so bundling it as-is erases
@@ -2268,7 +2274,7 @@ impl TypeSidecar {
         format!("req-{}", counter)
     }
 
-    fn is_untyped_response_type(type_string: &str) -> bool {
+    pub(crate) fn is_untyped_response_type(type_string: &str) -> bool {
         let trimmed = type_string.trim().trim_end_matches(';');
         if trimmed.is_empty() {
             return false;
@@ -2490,10 +2496,15 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// at the stated root when the inference is its bare named form and its
 /// declaration file is known, and dropped otherwise, so the alias is defined
 /// by the inference itself. The fan-in keep above applies to both witnesses.
+///
+/// Every request the arbitration did not keep as it came in is reported in
+/// `changed` (carrick#1779): the manifest stamped the rejected symbol onto the
+/// alias's row before any of this ran, and only this function knows the row
+/// now serves something else.
 pub(crate) fn demote_witnessed_borrowed_anchors(
     explicit: &[SymbolRequest],
     inferred: &[InferredType],
-) -> Vec<SymbolRequest> {
+) -> ArbitratedAnchors {
     // First inference per alias wins, mirroring `apply_inferred_array_depth`
     // and the `or_insert` join in `enrich_manifest_with_type_resolution`.
     let mut inferred_by_alias: HashMap<&str, &InferredType> = HashMap::new();
@@ -2508,9 +2519,9 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
         }
     }
 
-    explicit
+    let decisions: Vec<Option<SymbolRequest>> = explicit
         .iter()
-        .filter_map(|req| {
+        .map(|req| {
             let Some(alias) = req.alias.as_deref() else {
                 return Some(req.clone());
             };
@@ -2569,7 +2580,62 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 payload_borrow_witness: false,
             })
         })
-        .collect()
+        .collect();
+
+    let mut arbitrated = ArbitratedAnchors::default();
+    for (req, decided) in explicit.iter().zip(decisions) {
+        let change = match (&decided, req.alias.as_deref()) {
+            (None, Some(alias)) => Some((alias, None)),
+            // Both arms keep a request whose symbol is the root, so a
+            // re-aimed one always names another symbol.
+            (Some(kept), Some(alias)) if kept.symbol_name != req.symbol_name => Some((
+                alias,
+                Some(AnchorRoot {
+                    symbol: kept.symbol_name.clone(),
+                    source_file: kept.source_file.clone(),
+                }),
+            )),
+            _ => None,
+        };
+        if let Some((alias, reaimed)) = change {
+            arbitrated.changed.push(AnchorChange {
+                alias: alias.to_string(),
+                rejected: req.symbol_name.clone(),
+                reaimed,
+            });
+        }
+        arbitrated.requests.extend(decided);
+    }
+    arbitrated
+}
+
+/// What `demote_witnessed_borrowed_anchors` decided: the explicit requests
+/// the bundle and the capture run from, and every request it did not keep as
+/// it came in.
+#[derive(Debug, Default)]
+pub struct ArbitratedAnchors {
+    pub requests: Vec<SymbolRequest>,
+    pub changed: Vec<AnchorChange>,
+}
+
+/// One explicit request the arbitration re-aimed or dropped (carrick#1779).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorChange {
+    /// The manifest alias the request was for.
+    pub alias: String,
+    /// The symbol the request named: the model's, or a borrowed one.
+    pub rejected: String,
+    /// The root the request names now, or `None` when it was dropped and the
+    /// inference defines the alias on its own.
+    pub reaimed: Option<AnchorRoot>,
+}
+
+/// A named type and the file that declares it, as the sidecar reported it
+/// (an absolute path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorRoot {
+    pub symbol: String,
+    pub source_file: String,
 }
 
 /// The carrick#1749 arm of `demote_witnessed_borrowed_anchors`: the source
@@ -3773,7 +3839,7 @@ mod tests {
             Some("/repo/src/orders.ts"),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "OrderPlaced", "re-aimed at the root");
@@ -3801,7 +3867,7 @@ mod tests {
         inf.array_depth = Some(1);
         let inferred = vec![inf];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept[0].symbol_name, "OrderPlaced");
         assert_eq!(kept[0].array_depth, Some(1));
@@ -3819,7 +3885,7 @@ mod tests {
             Some("/repo/src/orders.ts"),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "AuditRecord");
@@ -3841,7 +3907,7 @@ mod tests {
             Some("/repo/src/orders.ts"),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "OrderPlaced");
@@ -3865,7 +3931,7 @@ mod tests {
             None,
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "OrderPlaced");
@@ -3909,7 +3975,7 @@ mod tests {
                 None,
             ))];
             let type_string = inf.type_string.clone();
-            let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+            let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]).requests;
 
             assert_eq!(kept.len(), 1);
             assert_eq!(
@@ -3934,7 +4000,7 @@ mod tests {
             Some("/repo/src/orders.ts"),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].symbol_name, "AuditRecord");
@@ -3956,7 +4022,7 @@ mod tests {
             Some("/repo/src/orders.ts"),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "AuditRecord");
@@ -3987,7 +4053,7 @@ mod tests {
             StatedBody::default(),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert!(
             kept.is_empty(),
@@ -4012,7 +4078,7 @@ mod tests {
             },
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert!(kept.is_empty(), "{kept:?}");
     }
@@ -4033,7 +4099,7 @@ mod tests {
             },
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "Member");
@@ -4056,7 +4122,7 @@ mod tests {
             },
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "MemberPage");
@@ -4081,7 +4147,7 @@ mod tests {
             },
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert!(kept.is_empty(), "{kept:?}");
     }
@@ -4098,7 +4164,7 @@ mod tests {
         );
         inf.stated_body = None;
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]).requests;
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "Member");
@@ -4116,7 +4182,7 @@ mod tests {
         );
         inf.infer_kind = InferKind::ResponseBody;
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]).requests;
 
         assert_eq!(kept.len(), 1);
     }
@@ -4135,9 +4201,122 @@ mod tests {
             StatedBody::default(),
         )];
 
-        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred).requests;
 
         assert_eq!(kept.len(), 2);
+    }
+
+    /// carrick#1779: a dropped request is reported with the symbol it named,
+    /// so the manifest row stamped with that symbol can let it go.
+    #[test]
+    fn arbitration_reports_the_symbol_it_dropped() {
+        let explicit = vec![symbol_request("Member", "Members_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Members_Response_Call1",
+            "{ members: { id: string; }[]; }",
+            StatedBody::default(),
+        )];
+
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(
+            arbitrated.changed,
+            vec![AnchorChange {
+                alias: "Members_Response_Call1".to_string(),
+                rejected: "Member".to_string(),
+                reaimed: None,
+            }]
+        );
+    }
+
+    /// carrick#1779: a re-aimed request is reported with the root it names
+    /// now and that root's declaration file, from both witnesses.
+    #[test]
+    fn arbitration_reports_the_root_it_reaimed_at() {
+        let stated = stated_call_result(
+            "Page_Response_Call1",
+            "MemberPage[]",
+            StatedBody {
+                root: Some("MemberPage".to_string()),
+                root_source: Some("/repo/src/pages.ts".to_string()),
+                array_depth: Some(1),
+            },
+        );
+        let borrowed = inferred_with_anchor(
+            "Alias_Response",
+            Some("OrderPlaced"),
+            "OrderPlaced",
+            Some("/repo/src/orders.ts"),
+        );
+        let explicit = vec![
+            symbol_request("Member", "Page_Response_Call1", None),
+            witnessed(symbol_request("AuditRecord", "Alias_Response", None)),
+        ];
+
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &[stated, borrowed]);
+
+        assert_eq!(
+            arbitrated.changed,
+            vec![
+                AnchorChange {
+                    alias: "Page_Response_Call1".to_string(),
+                    rejected: "Member".to_string(),
+                    reaimed: Some(AnchorRoot {
+                        symbol: "MemberPage".to_string(),
+                        source_file: "/repo/src/pages.ts".to_string(),
+                    }),
+                },
+                AnchorChange {
+                    alias: "Alias_Response".to_string(),
+                    rejected: "AuditRecord".to_string(),
+                    reaimed: Some(AnchorRoot {
+                        symbol: "OrderPlaced".to_string(),
+                        source_file: "/repo/src/orders.ts".to_string(),
+                    }),
+                },
+            ]
+        );
+    }
+
+    /// A request the arbitration kept, for whatever reason, is not a change:
+    /// the model's symbol it agrees with, a fan-in alias, an alias with no
+    /// inference, a disagreement with no witness.
+    #[test]
+    fn arbitration_reports_nothing_it_kept() {
+        let explicit = vec![
+            symbol_request("Member", "Member_Response_Call1", None),
+            symbol_request("Member", "Fan_Response_Call1", None),
+            symbol_request("Team", "Fan_Response_Call1", None),
+            symbol_request("Orphan", "Orphan_Response_Call1", None),
+            symbol_request("AuditRecord", "Alias_Response", None),
+        ];
+        let inferred = vec![
+            stated_call_result(
+                "Member_Response_Call1",
+                "{ id: string; }",
+                StatedBody {
+                    root: Some("Member".to_string()),
+                    root_source: Some("/repo/src/members.ts".to_string()),
+                    array_depth: None,
+                },
+            ),
+            stated_call_result(
+                "Fan_Response_Call1",
+                "{ members: { id: string; }[]; }",
+                StatedBody::default(),
+            ),
+            inferred_with_anchor(
+                "Alias_Response",
+                Some("OrderPlaced"),
+                "OrderPlaced",
+                Some("/repo/src/orders.ts"),
+            ),
+        ];
+
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(arbitrated.requests, explicit);
+        assert!(arbitrated.changed.is_empty(), "{:?}", arbitrated.changed);
     }
 
     #[test]
