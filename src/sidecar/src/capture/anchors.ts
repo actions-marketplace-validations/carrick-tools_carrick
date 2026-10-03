@@ -18,6 +18,8 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import { installedPackageSpecifier } from './installed-package.js';
+import { realPath } from './service-config.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,
@@ -118,6 +120,13 @@ export function resolveAnchor(
      * these resolves through that module instead of dangling in the entry.
      */
     siblingSymbolSpecs?: Map<string, string>;
+    /**
+     * The file a module specifier resolves to from the surface entry, under
+     * the analysis program's own resolution (carrick#1789). A literal's name
+     * is imported through a package specifier only when the entry reaches the
+     * same module by it.
+     */
+    resolveFromEntry?: (specifier: string) => string | undefined;
   }
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
@@ -144,7 +153,9 @@ export function resolveAnchor(
     // sibling symbol anchor imports is resolved by that import.
     // carrick#1774: the text names types as they read where it was printed,
     // so a name its source file means by a repo module's export is imported
-    // from that module (a string-union alias printed bare read `any`).
+    // from that module (a string-union alias printed bare read `any`), and
+    // (carrick#1789) a name it imports from a package is imported from that
+    // package.
     const scoped = siblingSpec
       ? undefined
       : qualifyNamesFromSource(text, program, request.source_file, args);
@@ -565,10 +576,13 @@ function substituteUndeclaredNamesInText(
  * member that reads `any`) or a global of the same name (`Notification`).
  * Each reference whose name the source resolves to a type that a module
  * inside the repo exports becomes `import('<module>').<export>`, with its
- * qualifier and type arguments kept. Anything else is left as written: a
- * global, a name only a function body declares, an unexported local, and a
- * type declared outside the repo or under `node_modules`, which the stub does
- * not ship.
+ * qualifier and type arguments kept. A name the source imports from an
+ * installed package becomes `import('<package specifier>').<export>`
+ * (carrick#1789): the stub ships no `node_modules`, but it pins the packages
+ * its surface imports, and the check phase installs them. Anything else is
+ * left as written: a global, a name only a function body declares, an
+ * unexported local, and a type declared outside the repo that no package
+ * import reaches.
  *
  * Returns the rewritten text, or undefined when nothing was rewritten, so a
  * text with no such name stays byte-identical.
@@ -577,7 +591,11 @@ function qualifyNamesFromSource(
   text: string,
   program: ts.Program,
   sourceFileRel: string | undefined,
-  args: { repoRoot: string; entryDir: string }
+  args: {
+    repoRoot: string;
+    entryDir: string;
+    resolveFromEntry?: (specifier: string) => string | undefined;
+  }
 ): string | undefined {
   if (!sourceFileRel) return undefined;
   const source = program.getSourceFile(path.join(args.repoRoot, sourceFileRel));
@@ -594,10 +612,10 @@ function qualifyNamesFromSource(
   };
   collect(parsed);
 
-  const imports = new Map<string, { spec: string; exportName: string } | undefined>();
-  const importFor = (name: string): { spec: string; exportName: string } | undefined => {
+  const imports = new Map<string, ImportedName | undefined>();
+  const importFor = (name: string): ImportedName | undefined => {
     if (imports.has(name)) return imports.get(name);
-    let found: { spec: string; exportName: string } | undefined;
+    let found: ImportedName | undefined;
     const atSource = checker.resolveName(name, source, meaning, false);
     const target = atSource && resolveSymbolAliases(checker, atSource);
     const declaringFile = target?.declarations?.[0]?.getSourceFile();
@@ -623,6 +641,7 @@ function qualifyNamesFromSource(
         };
       }
     }
+    if (!found && atSource) found = packageImportOf(program, atSource, args.resolveFromEntry);
     imports.set(name, found);
     return found;
   };
@@ -633,18 +652,32 @@ function qualifyNamesFromSource(
     ts.isIdentifier(name)
       ? ts.factory.createIdentifier(to)
       : ts.factory.createQualifiedName(renameLeftmost(name.left, to), name.right);
+  const dropLeftmost = (name: ts.QualifiedName): ts.EntityName =>
+    ts.isIdentifier(name.left)
+      ? name.right
+      : ts.factory.createQualifiedName(dropLeftmost(name.left), name.right);
+  // What follows `import('<spec>')`: the export, then the reference's own
+  // qualifier. Through a namespace import the namespace's name goes, and the
+  // next name must be something the package exports.
+  const qualifierFor = (typeName: ts.EntityName, target: ImportedName): ts.EntityName | undefined => {
+    if ('exportName' in target) return renameLeftmost(typeName, target.exportName);
+    if (ts.isIdentifier(typeName)) return undefined;
+    const qualifier = dropLeftmost(typeName);
+    return target.namespaceExports.has(leftmost(qualifier).text) ? qualifier : undefined;
+  };
 
   let rewrites = 0;
   const rewrite = (node: ts.Node): ts.Node => {
     if (ts.isTypeReferenceNode(node)) {
       const name = leftmost(node.typeName).text;
       const target = typeParameters.has(name) ? undefined : importFor(name);
-      if (target) {
+      const qualifier = target && qualifierFor(node.typeName, target);
+      if (target && qualifier) {
         rewrites += 1;
         return ts.factory.createImportTypeNode(
           ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(target.spec)),
           undefined,
-          renameLeftmost(node.typeName, target.exportName),
+          qualifier,
           node.typeArguments?.map((argument) => rewrite(argument) as ts.TypeNode),
           false
         );
@@ -657,6 +690,72 @@ function qualifyNamesFromSource(
   return ts
     .createPrinter({ removeComments: true })
     .printNode(ts.EmitHint.Unspecified, rewritten, parsed.getSourceFile());
+}
+
+/**
+ * How the surface entry imports a name a literal's text prints: from a module
+ * by one of its exports, or, for a name the source binds with a namespace
+ * import, by the qualifier after it (one of the package's exports).
+ */
+type ImportedName =
+  | { spec: string; exportName: string }
+  | { spec: string; namespaceExports: ReadonlySet<string> };
+
+/**
+ * carrick#1789: how the surface entry imports `local`, a name the source file
+ * binds with an import from an installed package, or undefined.
+ *
+ * The entry names the module the source's import resolves to by its file
+ * path, as the node builder names a library type it cannot reach by a bare
+ * specifier; the post-emit rewrite turns that path into the package's bare
+ * specifier and pins the installed version (`installedPackageSpecifier`). A
+ * bare specifier in the entry itself would be resolved from the entry: on a
+ * Deno service that goes through the graph's virtual `node_modules`, and the
+ * emitter then reads the package there, cannot name its types from the
+ * service's own modules (TS2742), and skips their declarations.
+ *
+ * Kept only when the module lies inside an installed package and the bare
+ * specifier that package gives resolves from the entry to the same file. So
+ * a tsconfig path alias to the repo's own module, a workspace package linked
+ * from the repo (no installed copy to pin), and an import of another
+ * installed copy than the entry reaches all stay as written.
+ */
+function packageImportOf(
+  program: ts.Program,
+  local: ts.Symbol,
+  resolveFromEntry: ((specifier: string) => string | undefined) | undefined
+): ImportedName | undefined {
+  if (!resolveFromEntry || !(local.flags & ts.SymbolFlags.Alias)) return undefined;
+  const declaration = local.declarations?.[0];
+  let statement: ts.ImportDeclaration | ts.JSDocImportTag;
+  let exportName: string | undefined;
+  if (declaration && ts.isImportSpecifier(declaration)) {
+    // `import { "a-b" as name }` has no qualifier an import type can write.
+    const exported = declaration.propertyName ?? declaration.name;
+    if (!ts.isIdentifier(exported)) return undefined;
+    statement = declaration.parent.parent.parent;
+    exportName = exported.text;
+  } else if (declaration && ts.isImportClause(declaration)) {
+    statement = declaration.parent;
+    exportName = 'default';
+  } else if (declaration && ts.isNamespaceImport(declaration)) {
+    statement = declaration.parent.parent;
+  } else {
+    return undefined;
+  }
+  if (!ts.isImportDeclaration(statement)) return undefined;
+  const checker = program.getTypeChecker();
+  const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
+  const moduleFile = moduleSymbol?.declarations?.find(ts.isSourceFile);
+  if (!moduleSymbol || !moduleFile) return undefined;
+  const installed = installedPackageSpecifier(moduleFile.fileName, exportName);
+  const fromEntry = installed && resolveFromEntry(installed.specifier);
+  if (!fromEntry || realPath(fromEntry) !== realPath(moduleFile.fileName)) return undefined;
+
+  const spec = moduleFile.fileName;
+  const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
+  if (exportName === undefined) return { spec, namespaceExports: exported };
+  return exported.has(exportName) ? { spec, exportName } : undefined;
 }
 
 /** The type node of `type __LiteralAnchor = <text>;`, or undefined. */
