@@ -3288,6 +3288,7 @@ mod tests {
             any_provenance: Vec::new(),
             dangling_specifiers: Vec::new(),
             undeclared_names: Vec::new(),
+            unresolved_in_tree: Vec::new(),
         }
     }
 
