@@ -231,6 +231,30 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
+  // 4c. A body of bytes (carrick#1793): a blob, a buffer or a stream has no JSON
+  //     shape, so a MISMATCH between the containers two sides hold the bytes
+  //     in (a `Uint8Array` sent, read with `.blob()`) is not a drift. It
+  //     overrides a mismatch only: bytes that assign to bytes (a stream sent
+  //     where a stream is read) agree, and that verdict stands. When both
+  //     sides are bytes the sent side is named, whatever order the
+  //     diagnostics came in.
+  const firedGates = new Set(gateDiags.map((d) => plan.gateLines.get(d.line)!));
+  const bytesGate: GateName | undefined = firedGates.has('sent:bytes')
+    ? 'sent:bytes'
+    : firedGates.has('expected:bytes')
+      ? 'expected:bytes'
+      : undefined;
+  const bytesVerdict = (): CheckVerdict => {
+    const { side } = sideForGate(bytesGate!, plan);
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${side}:bytes`,
+      diagnostic: `the ${side} body is bytes (a blob, a buffer or a stream), which has no JSON shape to compare with the other side.`,
+      ...notAFact(`the ${side} body is bytes`, side),
+    };
+  };
+
   // 5. Assignment-class error on the DECISIVE assignment line -> incompatible.
   //
   // On an `http` pair that line is the JSON wire assignment, not the declared
@@ -245,6 +269,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     (d) => d.line === decisiveLine && ASSIGNMENT_CODES.has(d.code)
   );
   if (assignDiag) {
+    if (bytesGate) return bytesVerdict();
     const text = scrubDiagnostic(
       assignDiag.message,
       scrubCtx,
@@ -295,6 +320,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       (d) => d.line === plan.assignmentLine && ASSIGNMENT_CODES.has(d.code)
     );
     if (declaredMismatch) {
+      if (bytesGate) return bytesVerdict();
       return {
         ...base,
         bucket: 'incompatible',
