@@ -82,6 +82,7 @@ mod visitor;
 mod workspace_resolver;
 mod wrapper_call_join;
 mod wrapper_call_method;
+mod wrapper_call_route;
 mod wrapper_dispatch;
 mod wrapper_request_shape;
 
@@ -797,6 +798,7 @@ fn spawn_sidecar(
 
     // Spawn the sidecar process
     let sidecar = TypeSidecar::spawn(sidecar_path)?;
+    sidecar.set_scan_root(&absolute_repo_path);
 
     sidecar.start_init(
         &absolute_repo_path.join(service.directory.as_deref().unwrap_or(".")),
