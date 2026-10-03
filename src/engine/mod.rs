@@ -3147,6 +3147,8 @@ async fn analyze_current_repo_incremental(
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
                 document_sites,
+                &merged_results,
+                repo_path,
                 &mut mount_graph,
                 service,
                 graphql_schemas,
@@ -3261,6 +3263,7 @@ async fn analyze_current_repo_incremental(
             //
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
+            drop_caller_response_entries(&mut manifest_entries, &merged_results);
             stamp_manifest_anchor_symbols(
                 &mut manifest_entries,
                 &merged_results,
@@ -3751,14 +3754,15 @@ fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
 }
 
 /// Run the deterministic protocol scans (GraphQL SDL/documents, Socket.IO)
-/// and join in the file-analyzer's located types. Split from
+/// and join in the file-analyzer's located producer types. Split from
 /// `append_deterministic_protocol_operations` so the extractions exist BEFORE
 /// the mount graph is projected into cloud data — the GraphQL consumer file
 /// set drives `fold_graphql_transport_calls` on the graph first (#307).
 ///
 /// The calls that execute a GraphQL document are read here too, and placed
 /// in the extraction by [`settle_graphql_documents`] once the transport fold
-/// has run (carrick#1157).
+/// has run (carrick#1157). The located consumer types join there, after the
+/// placement, because they are keyed by the file that executes the document.
 fn scan_protocol_extractions(
     repo_path: &str,
     service: &Config,
@@ -3777,7 +3781,6 @@ fn scan_protocol_extractions(
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
-    merge_graphql_consumer_locations(&mut graphql, file_results, repo_path);
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
     // through a relative specifier.
@@ -3985,15 +3988,24 @@ fn withdraw_model_routes_at_definitions(
 /// passes a generated document to a hook is not a document file, and folding
 /// its HTTP calls would drop the REST requests it also makes. Those rows are
 /// attributed like any other document.
+///
+/// The consumer types the file-analyzer located (`file_results`) join once
+/// those rows are placed (carrick#1728). The model answers for the file it
+/// reads, and the row a located type describes sits in that file only after
+/// the placement: before it, the operation is still at its document file or
+/// the module that declares the document, and no locate finds it.
 fn settle_graphql_documents(
     graphql: &mut crate::graphql::GraphqlExtraction,
     document_sites: crate::graphql_document_sites::DocumentSiteConsumers,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
     mount_graph: &mut crate::mount_graph::MountGraph,
     service: &Config,
     catalogue: &crate::graphql::SchemaCatalogue,
 ) {
     fold_graphql_transport_calls(mount_graph, graphql);
     document_sites.apply(graphql);
+    merge_graphql_consumer_locations(graphql, file_results, repo_path);
     let label = service.service_name.as_deref().unwrap_or("(root)");
     // A schema the service's walk found is one it serves only with evidence
     // that it serves a schema at all (carrick#1189): it declares one, it serves
@@ -5183,7 +5195,9 @@ fn merge_graphql_resolver_locations(
 /// type. Joining on the canonical key alone would collide every file's locate
 /// entry onto whichever consumer op happened to occupy that key first. So this
 /// joins on the triple `(file_path, kind, field)`: each file's located type is
-/// scoped strictly to its own consumer op.
+/// scoped strictly to its own consumer op. The file is the one the model read,
+/// so this runs once the rows at the calls that execute a document are placed
+/// ([`settle_graphql_documents`], carrick#1728).
 ///
 /// ISOLATION GUARD: an op that already carries `payload_type_symbol` (the
 /// deterministic `TaggedTplVisitor::capture_request_call` explicit-generic
@@ -5876,6 +5890,8 @@ fn build_cloud_data_from_mount_graph(
         // "same commit, same scanner" (skip) from "same commit, newer
         // scanner" (re-index).
         scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        // And the build, which names the code even between releases (#1739).
+        scanner_build: crate::cloud_storage::ScannerBuild::current(),
         boundary: None,
         dispatch_tables: None,
     }
@@ -7231,6 +7247,57 @@ fn build_type_manifest_entries(
     entries
 }
 
+/// Drop the consumer response entry of every row restated at a call to a
+/// function the service declares (carrick#1601).
+///
+/// The call at such a site is the function's call, and its value is what the
+/// function returns, not the response body: the site states no response
+/// contract. An entry left at `unknown` would still make the site a party to
+/// the type check, read `unverifiable` there and carry that up to its pair, so
+/// the entry goes, as it does for a call with no internal producer. The
+/// request entry stays: what the caller hands the function is not this rule's.
+///
+/// Joined to the call rows the way [`stamp_manifest_anchor_symbols`] joins
+/// them, by `(file_path, line)`, and by the verb, so another row on the same
+/// line keeps its entry.
+fn drop_caller_response_entries(
+    manifest: &mut Vec<TypeManifestEntry>,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
+    let callers: HashSet<(&str, u32, String)> = file_results
+        .iter()
+        .flat_map(|(file_path, result)| {
+            result
+                .data_calls
+                .iter()
+                .filter(|call| call.at_caller)
+                .map(move |call| {
+                    (
+                        file_path.as_str(),
+                        normalize_line(call.line_number),
+                        normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+                    )
+                })
+        })
+        .collect();
+    if callers.is_empty() {
+        return;
+    }
+    manifest.retain(|entry| {
+        let restated = entry.role == ManifestRole::Consumer
+            && entry.type_kind == ManifestTypeKind::Response
+            && entry.key.as_http().is_some_and(|(method, _)| {
+                callers.contains(&(
+                    entry.file_path.as_str(),
+                    entry.line_number,
+                    method.to_string(),
+                ))
+            });
+        !restated
+    });
+}
+
 /// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
 ///
 /// The manifest's `type_alias` is a synthetic hashed name (`Endpoint_<hash>_…`);
@@ -7812,6 +7879,8 @@ async fn analyze_current_repo(
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
         document_sites,
+        &analysis_result.file_results,
+        repo_path,
         &mut analysis_result.mount_graph,
         service,
         graphql_schemas,
@@ -7884,6 +7953,7 @@ async fn analyze_current_repo(
     // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
+    drop_caller_response_entries(&mut manifest_entries, &analysis_result.file_results);
     stamp_manifest_anchor_symbols(
         &mut manifest_entries,
         &analysis_result.file_results,
@@ -9076,6 +9146,10 @@ mod tests {
             data.scanner_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+        assert_eq!(
+            data.scanner_build,
+            crate::cloud_storage::ScannerBuild::current()
+        );
     }
 
     /// "Uploaded" would be a lie when the cloud short-circuited every payload,
@@ -9179,6 +9253,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }
@@ -10036,6 +10111,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -10250,6 +10326,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -10301,6 +10378,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }];
@@ -10396,6 +10474,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }];
@@ -10474,6 +10553,7 @@ mod tests {
                     reaches_request: None,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -10564,6 +10644,120 @@ mod tests {
             consumer_paths.contains(&"/api/notifications/status"),
             "expected normalized notification path, got {:?}",
             consumer_paths
+        );
+    }
+
+    /// carrick#1601: a row restated at a helper's caller states no response
+    /// contract, so its consumer response entry goes and the site is no party
+    /// to a response verdict. Its request entry stays, and so does every entry
+    /// of a request line's own row, including another verb on the caller's
+    /// line.
+    #[test]
+    fn a_row_restated_at_a_helper_s_caller_has_no_response_entry() {
+        let config = Config::default();
+        let call = |method: &str, path: &str, line: u32| crate::mount_graph::DataFetchingCall {
+            method: method.to_string(),
+            canonical_path: path.to_string(),
+            target_url: path.to_string(),
+            client: "fetch".to_string(),
+            file_location: format!("src/page.ts:{line}"),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+        };
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            call("GET", "/things/:id/availability", 4),
+            call("POST", "/pdf", 9),
+            call("GET", "/orders", 9),
+            call("GET", "/orders", 12),
+        ];
+        let row = |method: &str, line: i32, at_caller: bool| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{line}"),
+            line_number: line,
+            target: "/x".to_string(),
+            method: Some(method.to_string()),
+            pattern_matched: "helper".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(
+                crate::agents::file_analyzer_agent::ResolutionSource::RequestSummary,
+            ),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/page.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    row("GET", 4, true),
+                    row("POST", 9, true),
+                    row("GET", 9, false),
+                    row("GET", 12, false),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+
+        let mut entries = build_type_manifest_entries(&mount_graph, &config, ".");
+        drop_caller_response_entries(&mut entries, &file_results);
+
+        let mut kept: Vec<(u32, String, ManifestTypeKind)> = entries
+            .iter()
+            .filter(|entry| entry.role == ManifestRole::Consumer)
+            .map(|entry| {
+                (
+                    entry.line_number,
+                    entry
+                        .key
+                        .as_http()
+                        .map(|(method, _)| method.to_string())
+                        .unwrap_or_default(),
+                    entry.type_kind,
+                )
+            })
+            .collect();
+        kept.sort_by_key(|(line, method, kind)| {
+            (*line, method.clone(), *kind == ManifestTypeKind::Response)
+        });
+        assert_eq!(
+            kept,
+            vec![
+                (4, "GET".to_string(), ManifestTypeKind::Request),
+                (9, "GET".to_string(), ManifestTypeKind::Request),
+                (9, "GET".to_string(), ManifestTypeKind::Response),
+                (9, "POST".to_string(), ManifestTypeKind::Request),
+                (12, "GET".to_string(), ManifestTypeKind::Request),
+                (12, "GET".to_string(), ManifestTypeKind::Response),
+            ]
         );
     }
 
@@ -10924,6 +11118,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -10980,6 +11175,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11049,6 +11245,7 @@ mod tests {
                 sdk_edges: None,
                 sdk_unresolved: None,
                 scanner_version: None,
+                scanner_build: None,
                 boundary: None,
                 dispatch_tables: None,
             }
@@ -11127,6 +11324,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11347,6 +11545,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11494,6 +11693,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11616,6 +11816,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11734,6 +11935,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -12259,6 +12461,249 @@ mod tests {
             .into_iter()
             .map(|row| (row.line, row.method, row.target))
             .collect()
+    }
+
+    /// carrick#1562: a parameter or a field that holds the platform's
+    /// `fetch` unless a caller hands another is `fetch`: a positional or a
+    /// destructured default, a constructor parameter's default kept in a
+    /// field, and a `??` falling back to it. One the function assigns again,
+    /// one written in a method, and a parameter with no default (the
+    /// caller's own function, composed where the caller writes it) are not.
+    /// No call here carries an options bag, which reads as a request
+    /// whatever its callee.
+    #[test]
+    fn an_injected_fetch_is_the_platform_s_fetch() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/client.ts",
+            "declare function wrap(f: typeof fetch): typeof fetch;\n\
+             const BASE = process.env.API_BASE;\n\
+             export async function post(owner: string, { fetchImpl = fetch }: { fetchImpl?: typeof fetch }) {\n\
+             \x20 const url = `${BASE}/repos/${owner}/comments`;\n\
+             \x20 return fetchImpl(url);\n\
+             }\n\
+             export async function get(id: string, fetchFn: typeof fetch = fetch) {\n\
+             \x20 const url = `${BASE}/items/${id}`;\n\
+             \x20 return fetchFn(url);\n\
+             }\n\
+             export async function swapped(id: string, fetchFn: typeof fetch = fetch) {\n\
+             \x20 fetchFn = wrap(fetchFn);\n\
+             \x20 const url = `${BASE}/swapped/${id}`;\n\
+             \x20 return fetchFn(url);\n\
+             }\n\
+             export async function handed(id: string, fetchFn: typeof fetch) {\n\
+             \x20 const url = `${BASE}/handed/${id}`;\n\
+             \x20 return fetchFn(url);\n\
+             }\n\
+             export class Client {\n\
+             \x20 #fetch: typeof fetch;\n\
+             \x20 private fetchFn: typeof fetch;\n\
+             \x20 constructor(fetcher: typeof fetch = fetch, options: { fetch?: typeof fetch } = {}) {\n\
+             \x20   this.#fetch = fetcher;\n\
+             \x20   this.fetchFn = options.fetch ?? fetch;\n\
+             \x20 }\n\
+             \x20 ping() { const url = `${BASE}/ping`; return this.#fetch(url); }\n\
+             \x20 pong() { const url = `${BASE}/pong`; return this.fetchFn(url); }\n\
+             }\n\
+             export class Swapped {\n\
+             \x20 #fetch: typeof fetch = fetch;\n\
+             \x20 swap(other: typeof fetch) { this.#fetch = other; }\n\
+             \x20 ping() { const url = `${BASE}/moved`; return this.#fetch(url); }\n\
+             }\n",
+        )]);
+        let get = |target: &str| (String::from("GET"), target.to_string());
+        let rows: Vec<(u32, (String, String))> = rows_by_line(&dir, &discovery, "src/client.ts")
+            .into_iter()
+            .map(|(line, method, target)| (line, (method, target)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (5, get("${process.env.API_BASE}/repos/${owner}/comments")),
+                (9, get("${process.env.API_BASE}/items/${id}")),
+                (27, get("${process.env.API_BASE}/ping")),
+                (28, get("${process.env.API_BASE}/pong")),
+            ]
+        );
+    }
+
+    /// carrick#1601: a row the summaries state at a call to a function the
+    /// service declares is restated at that caller, and says so, wherever the
+    /// function is: in the same module (the issue's token exchange, where the
+    /// caller fills the URL's holes) or in another (a helper handed the
+    /// platform's `fetch` by default, called with its base). The function's
+    /// own request line is no caller.
+    #[test]
+    fn a_row_stated_at_a_helper_s_caller_is_marked_as_restated_there() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/tools.ts",
+                "async function exchangeToken(origin: string, token: string, account: string): Promise<string | null> {\n\
+                 \x20 const res = await fetch(`${origin}/api/v1/accounts/${account}/token`, {\n\
+                 \x20   method: \"POST\",\n\
+                 \x20   headers: { Authorization: `Bearer ${token}` },\n\
+                 \x20   body: JSON.stringify({ scopes: [\"read\"] }),\n\
+                 \x20 });\n\
+                 \x20 if (!res.ok) return null;\n\
+                 \x20 const data = (await res.json()) as { token?: string };\n\
+                 \x20 return data.token ?? null;\n\
+                 }\n\
+                 export function buildTools(ctx: { token: string; account: string }) {\n\
+                 \x20 const origin = process.env.API_ORIGIN;\n\
+                 \x20 let pending: Promise<string | null> | undefined;\n\
+                 \x20 function getToken(): Promise<string | null> {\n\
+                 \x20   pending ??= exchangeToken(origin, ctx.token, ctx.account);\n\
+                 \x20   return pending;\n\
+                 \x20 }\n\
+                 \x20 return { getToken };\n\
+                 }\n",
+            ),
+            (
+                "src/availability.ts",
+                "type Params = { id: string; apiUrl: string; fetchFn?: typeof fetch };\n\
+                 export const checkAvailability = async ({ id, apiUrl, fetchFn = fetch }: Params) => {\n\
+                 \x20 const response = await fetchFn(`${apiUrl}/things/${encodeURIComponent(id)}/availability`);\n\
+                 \x20 if (!response.ok) throw new Error(`HTTP ${response.status}`);\n\
+                 \x20 const data = (await response.json()) as { available: boolean };\n\
+                 \x20 return data.available === true;\n\
+                 };\n",
+            ),
+            (
+                "src/page.ts",
+                "import { checkAvailability } from \"./availability\";\n\
+                 const API_URL = process.env.API_URL;\n\
+                 export function onBlur(id: string) {\n\
+                 \x20 return checkAvailability({ id, apiUrl: API_URL });\n\
+                 }\n",
+            ),
+        ]);
+        let marks = |file: &str| -> Vec<(u32, String, bool, bool)> {
+            summary_rows_of(&dir, &discovery, file)
+                .into_iter()
+                .map(|row| (row.line, row.method, row.at_caller, row.own_site))
+                .collect()
+        };
+        assert_eq!(
+            marks("src/tools.ts"),
+            vec![(15, "POST".to_string(), true, false)],
+            "the token exchange is stated at the caller that fills its holes, and is marked so"
+        );
+        assert_eq!(
+            marks("src/page.ts"),
+            vec![(4, "GET".to_string(), true, false)],
+            "the availability check is stated at its caller in another module, and is marked so"
+        );
+        assert!(
+            marks("src/availability.ts")
+                .iter()
+                .all(|(_, _, at_caller, _)| !at_caller),
+            "the helper's own request line is no caller: {:?}",
+            marks("src/availability.ts")
+        );
+    }
+
+    /// carrick#1601: a call of a function that makes one request and hands
+    /// back its parsed body unchanged is worth that body, so a row stated
+    /// there is not marked: a generic transport helper (`send<T>`), the body
+    /// held in a local first, the response parsed where it is awaited, an
+    /// arrow, and a function that returns such a helper's call (`viaSend`). A
+    /// helper that hands back the raw response, returns early with something
+    /// else, makes two requests, returns a call of a helper that hands back
+    /// the raw response (`viaRaw`), or parses a response its request did not
+    /// answer with (`stored`) is marked.
+    #[test]
+    fn a_helper_that_hands_back_its_parsed_body_leaves_its_caller_unmarked() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/send.ts",
+                "export async function send<T>(url: string, options: { method: string }): Promise<T> {\n\
+                 \x20 const response = await fetch(url, options);\n\
+                 \x20 return (await response.json()) as T;\n\
+                 }\n\
+                 export async function held(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 const data = (await res.json()) as { id: string };\n\
+                 \x20 return data;\n\
+                 }\n\
+                 export async function inline(url: string) {\n\
+                 \x20 return (await fetch(url, { method: \"GET\" })).json();\n\
+                 }\n\
+                 export const arrow = async (url: string) => (await fetch(url, { method: \"GET\" })).json();\n\
+                 export async function raw(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 return res;\n\
+                 }\n\
+                 export async function early(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 if (!res.ok) return null;\n\
+                 \x20 return res.json();\n\
+                 }\n\
+                 export async function twice(url: string) {\n\
+                 \x20 await fetch(`${url}/audit`, { method: \"POST\" });\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 return res.json();\n\
+                 }\n\
+                 export async function viaSend(url: string) {\n\
+                 \x20 return send<{ id: string }>(url, { method: \"GET\" });\n\
+                 }\n\
+                 export async function viaRaw(url: string) {\n\
+                 \x20 return raw(url);\n\
+                 }\n\
+                 declare const cache: { read(key: string): Promise<Response> };\n\
+                 export async function stored(url: string) {\n\
+                 \x20 await fetch(url, { method: \"GET\" });\n\
+                 \x20 return (await cache.read(url)).json();\n\
+                 }\n",
+            ),
+            (
+                "src/client.ts",
+                "import { send, held, inline, arrow, raw, early, twice, viaSend, viaRaw, stored } from \"./send\";\n\
+                 const BASE = process.env.API_BASE;\n\
+                 export function readWidget(id: string) {\n\
+                 \x20 return send<{ id: string }>(`${BASE}/widgets/${id}`, { method: \"GET\" });\n\
+                 }\n\
+                 export function readAll() {\n\
+                 \x20 held(`${BASE}/held`);\n\
+                 \x20 inline(`${BASE}/inline`);\n\
+                 \x20 arrow(`${BASE}/arrow`);\n\
+                 \x20 raw(`${BASE}/raw`);\n\
+                 \x20 early(`${BASE}/early`);\n\
+                 \x20 twice(`${BASE}/twice`);\n\
+                 \x20 viaSend(`${BASE}/via-send`);\n\
+                 \x20 viaRaw(`${BASE}/via-raw`);\n\
+                 \x20 stored(`${BASE}/stored`);\n\
+                 }\n",
+            ),
+        ]);
+        let mut marks: Vec<(u32, String, bool)> =
+            summary_rows_of(&dir, &discovery, "src/client.ts")
+                .into_iter()
+                .map(|row| {
+                    let last = row
+                        .target
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    (row.line, last, row.at_caller)
+                })
+                .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec![
+                (4, "${id}".to_string(), false),
+                (7, "held".to_string(), false),
+                (8, "inline".to_string(), false),
+                (9, "arrow".to_string(), false),
+                (10, "raw".to_string(), true),
+                (11, "early".to_string(), true),
+                (12, "audit".to_string(), true),
+                (12, "twice".to_string(), true),
+                (13, "via-send".to_string(), false),
+                (14, "via-raw".to_string(), true),
+                (15, "stored".to_string(), true),
+            ]
+        );
     }
 
     /// carrick#1562: a call to a module-scope builder is what the builder
@@ -16064,6 +16509,8 @@ mod tests {
         settle_graphql_documents(
             &mut graphql,
             Default::default(),
+            &HashMap::new(),
+            "",
             &mut mount_graph,
             &Config::default(),
             &catalogue,
@@ -18957,6 +19404,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }

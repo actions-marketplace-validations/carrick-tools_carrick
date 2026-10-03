@@ -49,6 +49,12 @@
 //!   carrying exactly one request-options bag (`method`/`headers`/`body`/
 //!   `data`). A call the call graph resolves to a function in this service is
 //!   never read as a request: it is composed instead.
+//! - **A `fetch` handed in is `fetch`** (carrick#1562). A parameter whose
+//!   default is the platform's `fetch` (`fetchImpl = fetch`, `{ fetchImpl =
+//!   fetch } = {}`) and that the body never assigns again, and a field the
+//!   field table reads as set once to the global, to such a constructor
+//!   parameter, or to `options.fetch ?? fetch`, are the platform's `fetch`,
+//!   whatever a caller hands in instead.
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
@@ -568,6 +574,92 @@ struct FnIr {
     /// anew, of one of its makers, each handed its own arguments
     /// (carrick#1689).
     returned: Option<Returned>,
+    /// What each `return` hands back, an arrow's expression body included,
+    /// as far as it is a request's parsed body or another call's value
+    /// ([`BodyReturn`], carrick#1601). Empty when the body returns nothing.
+    body_returns: Vec<BodyReturn>,
+}
+
+/// What one `return` hands back, read for whether a call of the function is
+/// worth its request's parsed body (carrick#1601). Calls are named by their
+/// span start in the discovery source map ([`Site`]'s `lo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyReturn {
+    /// The body the response of the call at this span parses into, unchanged
+    /// (`(await res.json()) as T` with `res` that call's value, or
+    /// `(await fetch(url)).json()`).
+    Parsed(u32),
+    /// The value of the call at this span, unchanged.
+    Value(u32),
+    /// Anything else: a value the function computes from the body, a
+    /// literal, a binding this pass cannot follow.
+    Other,
+}
+
+/// What a local binding holds, for [`BodyReturn`]: a call's value or the
+/// body that call's response parses into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodySource {
+    Response(u32),
+    Parsed(u32),
+}
+
+/// What `expr` hands back as a [`BodyReturn`], reading bindings through
+/// `bodies`. Types, parentheses and `await` change nothing it holds.
+fn body_return(expr: &Expr, bodies: &HashMap<BindingKey, BodySource>) -> BodyReturn {
+    let parsed = |response: &Expr| match unwrap_value(response) {
+        Expr::Call(call) => Some(call.span.lo.0),
+        Expr::Ident(ident) => match bodies.get(&ident_key(ident)) {
+            Some(BodySource::Response(at)) => Some(*at),
+            _ => None,
+        },
+        _ => None,
+    };
+    match unwrap_value(expr) {
+        Expr::Call(call) => match parse_call_object(call) {
+            Some(response) => parsed(response).map_or(BodyReturn::Other, BodyReturn::Parsed),
+            None => BodyReturn::Value(call.span.lo.0),
+        },
+        Expr::Ident(ident) => match bodies.get(&ident_key(ident)) {
+            Some(BodySource::Parsed(at)) => BodyReturn::Parsed(*at),
+            Some(BodySource::Response(at)) => BodyReturn::Value(*at),
+            None => BodyReturn::Other,
+        },
+        _ => BodyReturn::Other,
+    }
+}
+
+/// What a binding initialised with `init` holds, for [`body_return`].
+fn body_source(init: &Expr, bodies: &HashMap<BindingKey, BodySource>) -> Option<BodySource> {
+    match body_return(init, bodies) {
+        BodyReturn::Parsed(at) => Some(BodySource::Parsed(at)),
+        BodyReturn::Value(at) => Some(BodySource::Response(at)),
+        BodyReturn::Other => None,
+    }
+}
+
+/// The response a `<response>.json()` call parses: the Fetch body read the
+/// platform's `fetch` answers with. No arguments, no optional chain.
+fn parse_call_object(call: &CallExpr) -> Option<&Expr> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    match &**callee {
+        Expr::Member(member)
+            if call.args.is_empty() && member_prop(member).as_deref() == Some("json") =>
+        {
+            Some(&member.obj)
+        }
+        _ => None,
+    }
+}
+
+/// `expr` with its types, parentheses and `await` taken off.
+fn unwrap_value(expr: &Expr) -> &Expr {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Await(awaited) => unwrap_value(&awaited.arg),
+        other => other,
+    }
 }
 
 /// The instance an own factory returns (carrick#1562).
@@ -2076,6 +2168,11 @@ struct ClassFields {
     class: u32,
     values: HashMap<String, Value>,
     receivers: HashMap<String, ClientRef>,
+    /// Fields that hold the platform's `fetch` unless the class is handed
+    /// another (carrick#1562): set once, where the field table reads a
+    /// write, to the global or to a constructor parameter whose default it
+    /// is ([`platform_fetch`]).
+    fetches: HashSet<String>,
 }
 
 /// What a function written inside another can read of it, by binding.
@@ -2086,6 +2183,8 @@ struct Captured {
     /// which the function written inside it is not called with.
     texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
     receivers: HashMap<BindingKey, ClientRef>,
+    /// [`Scope::fetches`].
+    fetches: HashSet<BindingKey>,
 }
 
 /// One module-scope binding an import introduces.
@@ -2515,6 +2614,14 @@ struct Scope<'a> {
     /// [`Reader::let_makers`]). Read only where they are returned: no call
     /// is read through one, for any role.
     let_makers: HashMap<BindingKey, Vec<ClientRef>>,
+    /// Locals set once to a call's value or to the body its response parses
+    /// into ([`body_source`], carrick#1601).
+    bodies: HashMap<BindingKey, BodySource>,
+    /// Parameters, the enclosing function's included, that hold the
+    /// platform's `fetch` unless a caller hands another (`fetchImpl =
+    /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
+    /// assigns again: a call through one is a `fetch` (carrick#1562).
+    fetches: HashSet<BindingKey>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -2527,6 +2634,8 @@ impl<'a> Scope<'a> {
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
             let_makers: HashMap::new(),
+            bodies: HashMap::new(),
+            fetches: HashSet::new(),
             fields: None,
             module,
         }
@@ -2713,6 +2822,9 @@ impl Reader<'_> {
         let mut receivers: HashMap<String, ClientRef> = HashMap::new();
         let mut contested: HashSet<String> = HashSet::new();
         let mut nested_writes: HashSet<String> = HashSet::new();
+        // Fields set to the platform's `fetch`, or to a constructor parameter
+        // whose default it is (carrick#1562).
+        let mut fetches: HashSet<String> = HashSet::new();
         let mut assign = |name: String,
                           value: Value,
                           client: Option<ClientRef>,
@@ -2731,6 +2843,9 @@ impl Reader<'_> {
                     if let (Some(name), Some(init)) = (prop_name(&prop.key), &prop.value)
                         && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
                     {
+                        if platform_fetch(init, module) {
+                            fetches.insert(name.clone());
+                        }
                         let scope = Scope::module(module);
                         let value = self.eval(init, &scope);
                         let client = self.factory_call(init, &scope);
@@ -2740,6 +2855,9 @@ impl Reader<'_> {
                 ClassMember::PrivateProp(prop) if !prop.is_static => {
                     if let Some(init) = &prop.value {
                         let name = format!("#{}", prop.key.name);
+                        if platform_fetch(init, module) {
+                            fetches.insert(name.clone());
+                        }
                         let scope = Scope::module(module);
                         let value = self.eval(init, &scope);
                         let client = self.factory_call(init, &scope);
@@ -2748,15 +2866,26 @@ impl Reader<'_> {
                 }
                 ClassMember::Constructor(ctor) => {
                     let mut scope = Scope::module(module);
+                    let mut fetch_params: HashSet<BindingKey> = HashSet::new();
                     for param in &ctor.params {
                         match param {
-                            ParamOrTsParamProp::TsParamProp(prop) => {
-                                if let TsParamPropParam::Ident(ident) = &prop.param {
+                            ParamOrTsParamProp::TsParamProp(prop) => match &prop.param {
+                                TsParamPropParam::Ident(ident) => {
                                     let name = ident.id.sym.to_string();
                                     assign(name.clone(), Value::opaque(name), None, &mut fields);
                                 }
+                                // `private fetchImpl = fetch`.
+                                TsParamPropParam::Assign(param) => {
+                                    if let Pat::Ident(ident) = &*param.left
+                                        && platform_fetch(&param.right, module)
+                                    {
+                                        fetches.insert(ident.id.sym.to_string());
+                                    }
+                                }
+                            },
+                            ParamOrTsParamProp::Param(param) => {
+                                fetch_bindings(&param.pat, module, &mut fetch_params);
                             }
-                            ParamOrTsParamProp::Param(_) => {}
                         }
                     }
                     let Some(body) = &ctor.body else {
@@ -2784,6 +2913,13 @@ impl Reader<'_> {
                         match this_assignment(stmt) {
                             Some((name, value)) => {
                                 value.visit_with(&mut nested);
+                                let handed = matches!(
+                                    crate::graphql_document_sites::unwrap_expression(value),
+                                    Expr::Ident(ident) if fetch_params.contains(&ident_key(ident))
+                                );
+                                if handed || platform_fetch(value, module) {
+                                    fetches.insert(name.clone());
+                                }
                                 let client = self.factory_call(value, &scope);
                                 let value = self.eval(value, &scope);
                                 assign(name, value, client, &mut fields);
@@ -2813,6 +2949,7 @@ impl Reader<'_> {
         }
         contested.extend(writes.fields);
         contested.extend(redeclared.into_iter().flatten().cloned());
+        fetches.retain(|name| !contested.contains(name));
         for name in contested {
             receivers.remove(&name);
             fields.insert(name.clone(), Value::opaque(format!("this.{name}")));
@@ -2838,6 +2975,7 @@ impl Reader<'_> {
             class: class.span.lo.0,
             values,
             receivers,
+            fetches,
         }
     }
 
@@ -2849,12 +2987,18 @@ impl Reader<'_> {
         captured: &Captured,
     ) -> FnIr {
         let params = function.params.iter().map(|p| pat_key(&p.pat)).collect();
+        let mut fetches = captured.fetches.clone();
+        for param in &function.params {
+            fetch_bindings(&param.pat, module, &mut fetches);
+        }
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
             let_makers: HashMap::new(),
+            bodies: HashMap::new(),
+            fetches,
             fields,
             module,
         };
@@ -2875,12 +3019,18 @@ impl Reader<'_> {
         captured: &Captured,
     ) -> FnIr {
         let params = arrow.params.iter().map(pat_key).collect();
+        let mut fetches = captured.fetches.clone();
+        for param in &arrow.params {
+            fetch_bindings(param, module, &mut fetches);
+        }
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
             let_makers: HashMap::new(),
+            bodies: HashMap::new(),
+            fetches,
             fields,
             module,
         };
@@ -2892,6 +3042,7 @@ impl Reader<'_> {
             BlockStmtOrExpr::Expr(expr) => {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
+                ir.body_returns.push(body_return(expr, &scope.bodies));
                 self.walk(expr, &scope, &mut ir);
             }
         }
@@ -2914,6 +3065,10 @@ impl Reader<'_> {
             stmt.visit_with(&mut reassigned);
             stmt.visit_with(&mut declared);
         }
+        // A parameter the body assigns again may hold anything.
+        scope
+            .fetches
+            .retain(|(name, _)| !reassigned.names.contains(name));
         for (index, stmt) in stmts.iter().enumerate() {
             if let Stmt::Decl(Decl::Var(var)) = stmt {
                 for declarator in &var.decls {
@@ -2968,6 +3123,15 @@ impl Reader<'_> {
                             scope.texts.insert(key.clone(), pieces);
                         }
                         scope.locals.insert(key.clone(), value);
+                        // What a call or its parsed response leaves in it,
+                        // for what a `return` of it hands back (carrick#1601).
+                        match (!unsettled)
+                            .then(|| body_source(init, &scope.bodies))
+                            .flatten()
+                        {
+                            Some(source) => scope.bodies.insert(key.clone(), source),
+                            None => scope.bodies.remove(&key),
+                        };
                         scope.local_receivers.remove(&key);
                         if let Some(client) = client
                             && declared.name_count(&name) == 1
@@ -3316,15 +3480,24 @@ impl Reader<'_> {
         };
         let is_fetch = match &**callee {
             // Only the global: a parameter, a local or a block's own binding
-            // named `fetch` is someone's own function (carrick#1648).
+            // named `fetch` is someone's own function (carrick#1648). A
+            // parameter that holds the global unless a caller hands another,
+            // and a field set to one, are the global too (carrick#1562).
             Expr::Ident(ident) => {
-                ident.sym == *"fetch"
-                    && scope.module.declared_below.binding_count(&ident_key(ident)) == 0
+                (ident.sym == *"fetch"
+                    && scope.module.declared_below.binding_count(&ident_key(ident)) == 0)
+                    || scope.fetches.contains(&ident_key(ident))
             }
             Expr::Member(member) => {
-                member_prop(member).as_deref() == Some("fetch")
+                (member_prop(member).as_deref() == Some("fetch")
                     && matches!(&*member.obj, Expr::Ident(obj)
-                        if obj.sym == *"window" || obj.sym == *"globalThis")
+                        if obj.sym == *"window" || obj.sym == *"globalThis"))
+                    || (matches!(&*member.obj, Expr::This(_))
+                        && this_field(member).is_some_and(|field| {
+                            scope
+                                .fields
+                                .is_some_and(|fields| fields.fetches.contains(&field))
+                        }))
             }
             _ => false,
         };
@@ -3679,6 +3852,69 @@ fn this_field(member: &MemberExpr) -> Option<String> {
     }
 }
 
+/// Every binding `pat` introduces whose default is the platform's `fetch`
+/// ([`platform_fetch`]): `fetchImpl = fetch`, `{ fetchImpl = fetch }`,
+/// `{ fetch: impl = fetch } = {}` (carrick#1562).
+fn fetch_bindings(pat: &Pat, module: &ModuleScope, out: &mut HashSet<BindingKey>) {
+    match pat {
+        Pat::Assign(assign) => match &*assign.left {
+            Pat::Ident(ident) if platform_fetch(&assign.right, module) => {
+                out.insert(ident_key(&ident.id));
+            }
+            other => fetch_bindings(other, module, out),
+        },
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::Assign(assign)
+                        if assign
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| platform_fetch(value, module)) =>
+                    {
+                        out.insert(ident_key(&assign.key.id));
+                    }
+                    ObjectPatProp::KeyValue(kv) => fetch_bindings(&kv.value, module, out),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `expr` is the platform's `fetch`, as a default or a fallback
+/// names it (carrick#1562): the global (no binding of the module or below
+/// it is named `fetch`), `globalThis.fetch` or `window.fetch`, either bound
+/// to the global object, or a `??`/`||` falling back to one.
+fn platform_fetch(expr: &Expr, module: &ModuleScope) -> bool {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Ident(ident) => {
+            ident.sym == *"fetch" && module.declared_below.binding_count(&ident_key(ident)) == 0
+        }
+        Expr::Member(member) => {
+            member_prop(member).as_deref() == Some("fetch")
+                && matches!(&*member.obj, Expr::Ident(obj)
+                    if obj.sym == *"window" || obj.sym == *"globalThis")
+        }
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) => {
+                match crate::graphql_document_sites::unwrap_expression(callee) {
+                    Expr::Member(bind) if member_prop(bind).as_deref() == Some("bind") => {
+                        platform_fetch(&bind.obj, module)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+            platform_fetch(&bin.right, module)
+        }
+        _ => false,
+    }
+}
+
 /// The library instances a function written inside another can read: the
 /// enclosing function's, less any name it declares again itself.
 fn inherited_receivers<N>(captured: &Captured, node: &N) -> HashMap<BindingKey, ClientRef>
@@ -3722,10 +3958,14 @@ struct CallWalker<'r, 's, 'i> {
 
 impl Visit for CallWalker<'_, '_, '_> {
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        // `produce()`: the body invokes a parameter.
+        // `produce()`: the body invokes a parameter. One that holds the
+        // platform's `fetch` unless a caller hands another is a `fetch`
+        // (carrick#1562).
         let invokes_param = match &call.callee {
             Callee::Expr(callee) => match &**callee {
-                Expr::Ident(ident) => self.scope.param_index(ident),
+                Expr::Ident(ident) if !self.scope.fetches.contains(&ident_key(ident)) => {
+                    self.scope.param_index(ident)
+                }
                 _ => None,
             },
             _ => None,
@@ -3912,6 +4152,11 @@ impl Visit for CallWalker<'_, '_, '_> {
             .map(|arg| self.reader.returned_instances(arg, self.scope))
             .unwrap_or_default();
         self.ir.returns.push((ret.span.lo.0, returned));
+        self.ir
+            .body_returns
+            .push(ret.arg.as_deref().map_or(BodyReturn::Other, |arg| {
+                body_return(arg, &self.scope.bodies)
+            }));
         ret.visit_children_with(self);
     }
 
@@ -3958,6 +4203,7 @@ impl CallWalker<'_, '_, '_> {
                 .map(|(key, pieces)| (key.clone(), pieces.clone()))
                 .collect(),
             receivers: self.scope.local_receivers.clone(),
+            fetches: self.scope.fetches.clone(),
         }
     }
 }
@@ -4281,6 +4527,11 @@ struct Summary {
     complete: bool,
     /// Parameters the function invokes.
     invokes: BTreeSet<usize>,
+    /// The function sends one request and every `return` hands back that
+    /// request's parsed body unchanged, here or through a call to a function
+    /// that does the same (carrick#1601). A call of it is worth the body,
+    /// so a row stated at that call can be typed by the call's value.
+    passes_body: bool,
 }
 
 /// A row this pass states at one call site.
@@ -4301,6 +4552,12 @@ pub struct SummaryRow {
     /// The request primitive's own line (`fetch(...)` itself), where the
     /// passes that read a site's own source state it too and are kept.
     pub own_site: bool,
+    /// The row is restated at a call to a function the service declares,
+    /// which makes the request inside it (carrick#1601). The call at this
+    /// site is that function's call, not the request's, so its value is
+    /// whatever the function returns (a boolean, a token, a mapped object)
+    /// and says nothing about the response body.
+    pub at_caller: bool,
     /// The library-semantics claim ids the row was read through
     /// (carrick#1564), sorted. Empty on every other row.
     pub library_semantics: Vec<String>,
@@ -4639,6 +4896,7 @@ impl Composer<'_> {
             effects: BTreeSet::new(),
             complete: !ir.bodyless && !ir.unfollowed,
             invokes: ir.invoked_params.clone(),
+            passes_body: false,
         };
         for call in &ir.calls {
             if call.invokes_param.is_some() {
@@ -4691,7 +4949,37 @@ impl Composer<'_> {
                 }
             }
         }
+        summary.passes_body = summary.effects.len() == 1
+            && !ir.body_returns.is_empty()
+            && ir
+                .body_returns
+                .iter()
+                .all(|returned| self.hands_back_body(file, ir, *returned));
         summary
+    }
+
+    /// Whether one `return` of `ir` hands back its request's parsed body
+    /// unchanged (carrick#1601): the response a request this body makes
+    /// answers with, parsed, or what a call of a function that does the
+    /// same returns.
+    fn hands_back_body(&mut self, file: &Path, ir: &FnIr, returned: BodyReturn) -> bool {
+        let (BodyReturn::Parsed(at) | BodyReturn::Value(at)) = returned else {
+            return false;
+        };
+        let Some(call) = ir
+            .calls
+            .iter()
+            .find(|call| call.site.lo == at && call.invokes_param.is_none())
+        else {
+            return false;
+        };
+        match (returned, self.callee(file, call)) {
+            (BodyReturn::Parsed(_), None) => {
+                shape_of(call, file, self.semantics, &self.clients).is_some()
+            }
+            (BodyReturn::Value(_), Some((_, callee))) => callee.passes_body,
+            _ => false,
+        }
     }
 }
 
@@ -4774,7 +5062,14 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         // already states it.
                         continue;
                     };
-                    match row(&instantiated, file, composer.files, call, reaches, false) {
+                    // A function that hands back its one request's parsed
+                    // body makes its call worth that body (carrick#1601).
+                    let at = if callee.passes_body {
+                        RowSite::PassThrough
+                    } else {
+                        RowSite::Caller
+                    };
+                    match row(&instantiated, file, composer.files, call, reaches, at) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -4805,7 +5100,12 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                     if library || (request.kind != RequestKind::Verb && !request.url_inline) {
                         let effect = Effect::from_shape(&request, file, call.site.line);
                         if !effect.has_params() {
-                            match row(&effect, file, composer.files, call, None, !library) {
+                            let at = if library {
+                                RowSite::Library
+                            } else {
+                                RowSite::Own
+                            };
+                            match row(&effect, file, composer.files, call, None, at) {
                                 Some(row) => rows.push(row),
                                 None => index.undetermined += 1,
                             }
@@ -4829,6 +5129,22 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
     }
 }
 
+/// Where a row's call expression sits relative to the request it states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSite {
+    /// The request primitive itself (`fetch(...)`).
+    Own,
+    /// A call through a verified library client: the call is the request.
+    Library,
+    /// A call to a function the service declares, which makes the request
+    /// inside it and hands back something else (carrick#1601).
+    Caller,
+    /// A call to a function the service declares, which makes one request
+    /// and hands back its parsed body unchanged: the call's value is the
+    /// body ([`Summary::passes_body`]).
+    PassThrough,
+}
+
 /// The row an effect supports at `site`, when its URL and method are both
 /// stated.
 fn row(
@@ -4837,7 +5153,7 @@ fn row(
     files: &HashMap<PathBuf, FileIr>,
     call: &CallIr,
     reaches_request: Option<String>,
-    own_site: bool,
+    at: RowSite,
 ) -> Option<SummaryRow> {
     let site = call.site;
     let MethodValue::Lit(method) = &effect.method else {
@@ -4864,7 +5180,8 @@ fn row(
         target,
         body_literals,
         reaches_request,
-        own_site,
+        own_site: at == RowSite::Own,
+        at_caller: at == RowSite::Caller,
         library_semantics: effect.semantics.iter().cloned().collect(),
         base_fallbacks: effect
             .base_scope
