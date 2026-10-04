@@ -77,18 +77,36 @@ export interface ResolvedAnchor {
   namesUnemittedModule?: true;
 }
 
-/** Repo-root-relative source file -> extensionless specifier from entryDir. */
+/**
+ * Repo-root-relative source file -> the specifier the surface entry imports
+ * it by: its path from `entryDir`, in the form the entry resolves.
+ *
+ * With the extension removed (`./a`), where `resolveFromEntry` says the entry
+ * resolves that to the module. It does not always (carrick#1911): under
+ * `module` `node16`..`nodenext` an entry in a `"type": "module"` package is
+ * an ES module, which must name the file the module compiles to, and a `.mts`
+ * or `.cts` module has no extensionless form under any setting. There, and
+ * with no resolver to ask, the specifier is that output name: `./a.js` for
+ * `.ts` and `.tsx`, `./a.mjs` for `.mts`, `./a.cjs` for `.cts`, which every
+ * module setting maps back to the source and, in the stub, to its
+ * declaration.
+ */
 export function entryRelativeSpecifier(
   entryDir: string,
   repoRoot: string,
-  sourceFile: string
+  sourceFile: string,
+  resolveFromEntry?: (specifier: string) => string | undefined
 ): string {
-  const target = path
-    .join(repoRoot, sourceFile)
-    .replace(/\.(ts|tsx|mts|cts)$/, '');
-  let rel = path.relative(entryDir, target).split(path.sep).join('/');
-  if (!rel.startsWith('.')) rel = `./${rel}`;
-  return rel;
+  const target = path.join(repoRoot, sourceFile);
+  const from = (file: string): string => {
+    const rel = path.relative(entryDir, file).split(path.sep).join('/');
+    return rel.startsWith('.') ? rel : `./${rel}`;
+  };
+  const bare = from(target.replace(/\.(ts|tsx|mts|cts)$/, ''));
+  const resolved = resolveFromEntry?.(bare);
+  if (resolved !== undefined && realPath(resolved) === realPath(target)) return bare;
+  const kind = /(?:\.d)?\.([cm]?)[jt]sx?$/.exec(target);
+  return kind ? from(`${target.slice(0, kind.index)}.${kind[1]}js`) : bare;
 }
 
 function moduleExport(
@@ -199,7 +217,12 @@ export function resolveAnchor(
   if (!sourceFile) {
     return demote(`source file not in program: ${request.source_file}`);
   }
-  const spec = entryRelativeSpecifier(args.entryDir, args.repoRoot, request.source_file);
+  const spec = entryRelativeSpecifier(
+    args.entryDir,
+    args.repoRoot,
+    request.source_file,
+    args.resolveFromEntry
+  );
 
   if (request.kind === 'symbol') {
     const exported = moduleExport(checker, sourceFile, request.symbol_name);
@@ -626,7 +649,12 @@ function qualifyNamesFromSource(
     const rel = path.relative(args.repoRoot, file.fileName);
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
     if (rel.split(path.sep).includes('node_modules')) return undefined;
-    return entryRelativeSpecifier(args.entryDir, args.repoRoot, rel.split(path.sep).join('/'));
+    return entryRelativeSpecifier(
+      args.entryDir,
+      args.repoRoot,
+      rel.split(path.sep).join('/'),
+      args.resolveFromEntry
+    );
   };
 
   const imports = new Map<string, ImportedName | undefined>();

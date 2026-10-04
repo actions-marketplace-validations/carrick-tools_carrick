@@ -8,7 +8,7 @@ use crate::cloud_storage::{
     UploadOutcome, get_current_commit_hash, mount_graph_to_api_details,
 };
 use crate::config::Config;
-use crate::file_finder::find_service_files;
+use crate::file_finder::walk_service;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::{IntentsInFlight, PreviousIntents, RunIntentMemo};
 use crate::logging;
@@ -666,9 +666,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // The run's ceilings on waiting out a refusing model: the one its
     // service-level calls and its in-run retry share (carrick#1126), and each
     // route's for the per-file calls a capacity refusal holds up
-    // (carrick#1893).
+    // (carrick#1893). With them, what the cloud has stated it can do, which
+    // is heard afresh in every run (carrick#1897).
     crate::retry_budget::reset();
-    crate::agent_service::reset_refusal_budgets();
+    crate::agent_service::reset_for_run();
 
     // Said before the scan, not after it: the point is that a capture pass set
     // up this way costs a full pass and leaves nothing behind (carrick#966).
@@ -6216,7 +6217,12 @@ fn resolve_types_if_available(
 /// stub artifact on its `CloudRepoData`. Returns the on-disk stub dir for
 /// the definitions re-point (caller cleans it up). Non-fatal: a degraded
 /// capture leaves `capture_stub` unset — the service's cross-repo pairs then
-/// verdict unverifiable, never silently compatible.
+/// verdict unverifiable, never silently compatible — and says why on the
+/// service ([`record_capture_failure`]).
+///
+/// The capture runs in a sidecar process started for it, so the sidecar this
+/// returns with is not the process it was called with: it is scoped the same
+/// and has built nothing yet (carrick#1916).
 #[allow(clippy::too_many_arguments)]
 fn run_capture_for_service(
     sidecar: &TypeSidecar,
@@ -6339,44 +6345,66 @@ fn run_capture_for_service(
         &backfill_texts,
         config.tsconfig.as_deref(),
     ) {
-        Some((stub_dir, artifact)) => {
+        Ok((stub_dir, artifact)) => {
             cloud_data.capture_stub = Some(artifact);
             Some(stub_dir)
         }
-        None => {
-            // A capture degrades benignly when this service simply emitted no
-            // usable stub. A capture that degraded because the sidecar is no
-            // longer running is a different event: everything downstream of it
-            // loses its types too. Probing separates the two — the capture call
-            // itself only reports "no stub".
-            match sidecar.health_check() {
-                Ok(_) => {
-                    if cloud_data.type_extraction_status.is_none() {
-                        cloud_data.type_extraction_status = Some(
-                            "v2 type capture degraded: no stub package was produced; cross-repo \
-                             type compatibility for this service will report unverifiable"
-                                .to_string(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Type capture failed and the sidecar is not responding: {}",
-                        e
-                    );
-                    cloud_data.type_extraction_status = Some(format!(
-                        "type capture failed: the type sidecar is no longer running ({})",
-                        e
-                    ));
-                    cloud_data.types_degraded = Some(TypeDegradation {
-                        stage: "capture".to_string(),
-                        detail: e.to_string(),
-                    });
-                }
-            }
+        Err(failure) => {
+            record_capture_failure(cloud_data, &failure);
             None
         }
     }
+}
+
+/// Say on the service why its capture produced no stub (carrick#1921).
+///
+/// The capture reports its own failure, so nothing is asked of the sidecar
+/// afterwards to find out. A health probe used to stand here to tell a dead
+/// sidecar from a capture that emitted nothing, and it could only say what
+/// the sidecar was like once the capture was over: after a timed-out capture
+/// it reached the process started in the old one's place, and the service was
+/// recorded as an empty stub with the timeout nowhere but the log.
+///
+/// Three causes, in two classes:
+///
+/// - The sidecar answered and the answer was not a stub. The service's other
+///   types are what they were, so this is a status and not a degradation,
+///   and it does not replace a status already there (the one about wrapper
+///   rules, set before capture runs).
+/// - The capture timed out, or its process died and died again on the retry.
+///   The service lost its surface to the machine or the run rather than to
+///   anything in its code, so both are `types_degraded` at stage `capture`,
+///   which is what reports the loss as a finding (carrick#535).
+///
+/// Either way the service ships without a surface, and every cross-repo pair
+/// it is part of reads unverifiable.
+fn record_capture_failure(
+    cloud_data: &mut CloudRepoData,
+    failure: &type_compat_v2::CaptureFailure,
+) {
+    use type_compat_v2::CaptureFailure;
+    const CONSEQUENCE: &str =
+        "cross-repo type compatibility for this service will report unverifiable";
+    let status = match failure {
+        CaptureFailure::Failed(detail) => {
+            if cloud_data.type_extraction_status.is_none() {
+                cloud_data.type_extraction_status = Some(format!(
+                    "v2 type capture degraded: no stub package was produced ({detail}); \
+                     {CONSEQUENCE}"
+                ));
+            }
+            return;
+        }
+        CaptureFailure::TimedOut => format!("type capture timed out: {failure}; {CONSEQUENCE}"),
+        CaptureFailure::SidecarDied(_) => {
+            format!("type capture failed: {failure}; {CONSEQUENCE}")
+        }
+    };
+    cloud_data.type_extraction_status = Some(status);
+    cloud_data.types_degraded = Some(TypeDegradation {
+        stage: "capture".to_string(),
+        detail: failure.to_string(),
+    });
 }
 
 /// Discover files and extract symbols for MultiAgentOrchestrator
@@ -6491,6 +6519,83 @@ fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> V
         .collect()
 }
 
+/// How many places a left-out line names before it counts the rest.
+const MAX_NAMED_CHECKOUTS: usize = 3;
+
+/// The checkouts a service's walk did not enter
+/// ([`crate::file_finder::git_boundary`], carrick#1902), as a reader would
+/// name them: how many, and where under the repo. `None` when there are none.
+///
+/// Up to [`MAX_NAMED_CHECKOUTS`] are named one by one. More than that are
+/// counted by the folder that holds them, because that is the shape the case
+/// takes: a tool keeps its worktrees side by side in one folder, and eight
+/// paths that differ in their last segment say less than "8 in" that folder.
+fn checkouts_left_out(repo_path: &str, checkouts: &[PathBuf]) -> Option<String> {
+    if checkouts.is_empty() {
+        return None;
+    }
+    let relative: Vec<String> = checkouts
+        .iter()
+        .map(|checkout| {
+            checkout
+                .strip_prefix(repo_path)
+                .unwrap_or(checkout)
+                .components()
+                .filter_map(|part| match part {
+                    std::path::Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    // (what the reader is shown, how many checkouts it stands for)
+    let places: Vec<(String, usize)> = if relative.len() <= MAX_NAMED_CHECKOUTS {
+        relative.iter().map(|path| (path.clone(), 1)).collect()
+    } else {
+        let mut by_parent: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+        for path in &relative {
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            by_parent.entry(parent).or_default().push(path);
+        }
+        by_parent
+            .into_iter()
+            .map(|(parent, inside)| match (inside.as_slice(), parent) {
+                ([only], _) => ((*only).clone(), 1),
+                (many, "") => (format!("{} in the repo root", many.len()), many.len()),
+                (many, parent) => (format!("{} in {parent}", many.len()), many.len()),
+            })
+            .collect()
+    };
+    let named: Vec<&str> = places
+        .iter()
+        .take(MAX_NAMED_CHECKOUTS)
+        .map(|(place, _)| place.as_str())
+        .collect();
+    let rest: usize = places
+        .iter()
+        .skip(MAX_NAMED_CHECKOUTS)
+        .map(|(_, count)| count)
+        .sum();
+    Some(format!(
+        "{} folder(s) with their own .git: {}{}",
+        relative.len(),
+        named.join(", "),
+        if rest > 0 {
+            format!(" and {rest} more")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// What a scan prints when a service's walk left checkouts out: how many,
+/// which, and how to scan one. A file that is missing from the index because
+/// of where it sits is never a silent decision.
+fn checkouts_left_out_line(left_out: &str) -> String {
+    format!("Left out {left_out}. Name one under \"include\" in carrick.json to scan it.")
+}
+
 fn discover_files_and_symbols(
     repo_path: &str,
     service: &Config,
@@ -6503,7 +6608,8 @@ fn discover_files_and_symbols(
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
     let walk_started = Instant::now();
-    let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
+    let walk = walk_service(repo_path, service, &ignore_patterns);
+    let files = walk.files;
     // Timed separately from the parse that follows: the walk and the parse
     // scale with different things, and a scan that spends minutes in the walk
     // is a walk reaching somewhere it should not (carrick#751).
@@ -6513,6 +6619,7 @@ fn discover_files_and_symbols(
         service.directory.as_deref().unwrap_or("the repo root"),
         walk_started.elapsed().as_secs_f64()
     );
+    let left_out = checkouts_left_out(repo_path, &walk.checkouts_left_out);
 
     // Zero files means the scan target is wrong (typo'd path, empty checkout):
     // proceeding would upload an empty service and silently erase its
@@ -6522,12 +6629,24 @@ fn discover_files_and_symbols(
             Some(dir) => format!("service directory '{}'", dir),
             None => "repository root".to_string(),
         };
+        // A folder of checkouts holds source and none of it is this walk's:
+        // the error names them, so the fix is not searched for in the config.
+        let advice = match &left_out {
+            Some(left_out) => format!(
+                "Left out {left_out}. Scan one of them, or name it under \"include\" in \
+                 carrick.json."
+            ),
+            None => {
+                "Check the scan path and the directory/include entries in carrick.json.".to_string()
+            }
+        };
         return Err(format!(
-            "No JS/TS source files found under {} in '{}'. Check the scan path \
-             and the directory/include entries in carrick.json.",
-            scope, repo_path
+            "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
         )
         .into());
+    }
+    if let Some(left_out) = &left_out {
+        info!("{}", checkouts_left_out_line(left_out));
     }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
@@ -8763,6 +8882,62 @@ mod tests {
         );
     }
 
+    /// The line carrick#1902 adds, pinned: how many, which, and how to scan
+    /// one. A file missing from an index because of the folder it sits in is
+    /// a decision the scan states.
+    #[test]
+    fn checkouts_a_walk_left_out_are_counted_named_and_given_a_way_back() {
+        let line = |checkouts: &[&str]| {
+            let checkouts: Vec<PathBuf> = checkouts.iter().map(PathBuf::from).collect();
+            super::checkouts_left_out("/work/shop", &checkouts)
+                .map(|left_out| super::checkouts_left_out_line(&left_out))
+        };
+        assert_eq!(line(&[]), None);
+        // Few enough to name. A service declared at `.` walks `<repo>/./…`.
+        assert_eq!(
+            line(&["/work/shop/./vendor/clone"]).as_deref(),
+            Some(
+                "Left out 1 folder(s) with their own .git: vendor/clone. Name one under \
+                 \"include\" in carrick.json to scan it."
+            )
+        );
+
+        // The measured shape: a tool's worktrees side by side in one folder.
+        let worktrees: Vec<String> = (1..=8)
+            .map(|n| format!("/work/shop/.agent/worktrees/task-{n}"))
+            .chain(["/work/shop/vendor/clone".to_string()])
+            .collect();
+        let worktrees: Vec<&str> = worktrees.iter().map(String::as_str).collect();
+        let counted = line(&worktrees).expect("a line");
+        assert_eq!(
+            counted,
+            "Left out 9 folder(s) with their own .git: 8 in .agent/worktrees, vendor/clone. Name \
+             one under \"include\" in carrick.json to scan it."
+        );
+        assert!(
+            counted.split_whitespace().count() <= 22,
+            "the count, the folders and what to do, and nothing about what the copies cost: \
+             {counted}"
+        );
+
+        // More places than the line names: the rest are counted, by checkout.
+        let scattered = line(&[
+            "/work/shop/a/one",
+            "/work/shop/b/two",
+            "/work/shop/c/three",
+            "/work/shop/d/four",
+            "/work/shop/d/five",
+            "/work/shop/top",
+        ])
+        .expect("a line");
+        assert!(
+            scattered.starts_with(
+                "Left out 6 folder(s) with their own .git: top, a/one, b/two and 3 more."
+            ),
+            "{scattered}"
+        );
+    }
+
     /// A blob with only the fields every generation has carried, so the test
     /// states what it is about and nothing else.
     fn bare_blob() -> CloudRepoData {
@@ -8996,16 +9171,24 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         let inits: Vec<_> = requests.iter().filter(|r| r["action"] == "init").collect();
+        // Two per service: the service's own, and the same scope given to the
+        // fresh process its capture runs in (carrick#1916).
         assert_eq!(
             inits.len(),
-            2,
+            4,
             "root service must reinitialize after a member"
         );
-        assert_eq!(
-            Path::new(inits[0]["repo_root"].as_str().unwrap()),
-            root.join("api")
-        );
-        assert_eq!(Path::new(inits[1]["repo_root"].as_str().unwrap()), root);
+        for member_init in &inits[..2] {
+            assert_eq!(
+                Path::new(member_init["repo_root"].as_str().unwrap()),
+                root.join("api")
+            );
+            assert_eq!(member_init["tsconfig_path"], "tsconfig.json");
+        }
+        for root_init in &inits[2..] {
+            assert_eq!(Path::new(root_init["repo_root"].as_str().unwrap()), root);
+            assert!(root_init.get("tsconfig_path").is_none());
+        }
         let capture = requests
             .iter()
             .find(|r| r["action"] == "capture_v2")
@@ -9054,6 +9237,303 @@ mod tests {
                 .all(|anchor| Path::new(anchor["source_file"].as_str().unwrap()).is_relative()),
             "a trailing /. on the capture root must not leak absolute anchors and trigger literal fallback"
         );
+    }
+
+    /// One service's capture through a stand-in sidecar (carrick#1916,
+    /// carrick#1921): a few lines of Node speaking the stdout protocol, as in
+    /// `tests/sidecar_operation_timeout_test.rs`.
+    ///
+    /// What the stand-in does with a capture is named by the service's one
+    /// anchor:
+    /// - `Dies` writes the start of an answer with no newline and exits, as a
+    ///   process that ran out of heap mid-answer does;
+    /// - `DiesOnce` does that the first time it is asked, and answers the
+    ///   next time;
+    /// - `Slow` blocks its event loop for longer than the operation deadline;
+    /// - `Refused` answers that the capture failed;
+    /// - anything else writes a one-file stub package and answers with it.
+    ///
+    /// Each process notes its pid in `pids` and each capture it is asked for
+    /// in `captures`, so a test can say which process was asked what.
+    struct CaptureThroughStandIn {
+        dir: tempfile::TempDir,
+        sidecar: TypeSidecar,
+        data: CloudRepoData,
+        stub_dir: Option<PathBuf>,
+    }
+
+    impl CaptureThroughStandIn {
+        const DEADLINE: Duration = Duration::from_millis(1500);
+
+        fn run(anchor: &str) -> Self {
+            use crate::services::type_sidecar::SymbolRequest;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            std::fs::write(
+                root.join("types.ts"),
+                format!("export interface {anchor} {{ id: string }}"),
+            )
+            .unwrap();
+            let script = root.join("stand-in-sidecar.cjs");
+            std::fs::write(
+                &script,
+                r#"
+const fs = require('fs');
+const path = require('path');
+const note = (file, text) => fs.appendFileSync(path.join(__dirname, file), text + '\n');
+const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\n');
+const block = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// The start of an answer, cut off: no newline, then the process is gone.
+const die = (request_id) => {
+  fs.writeSync(1, JSON.stringify({ request_id, status: 'success', result: { stub_dir: '/half' } }).slice(0, 40));
+  process.exit(134);
+};
+note('pids', String(process.pid));
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  if (request.action !== 'capture_v2') return write({ request_id, status: 'error', errors: ['not a capture'] });
+  const what = request.anchors[0].alias;
+  note('captures', `${process.pid} ${what}`);
+  if (what === 'Dies') die(request_id);
+  if (what === 'DiesOnce' && !fs.existsSync(path.join(__dirname, 'died'))) {
+    note('died', String(process.pid));
+    die(request_id);
+  }
+  if (what === 'Slow') block(6000);
+  if (what === 'Refused') return write({ request_id, status: 'error', errors: ['the stand-in refuses this capture'] });
+  fs.mkdirSync(path.join(request.out_dir, 'types'), { recursive: true });
+  fs.writeFileSync(path.join(request.out_dir, 'types', 'surface.d.ts'), `export type ${what} = { id: string };\n`);
+  write({ request_id, status: 'success', result: {
+    success: true, stub_dir: request.out_dir, package_name: '@carrick-stub/stand-in',
+    aliases: [], bare_checkout: false, ts_version: '5.8.0',
+    fidelity: { total_aliases: 1, by_serialization: {}, by_self_check: {}, by_anchor_origin: {}, usable_rate: 1 },
+  } });
+});
+"#,
+            )
+            .unwrap();
+            let sidecar = TypeSidecar::spawn(&script)
+                .unwrap()
+                .with_operation_timeout(Self::DEADLINE);
+            scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &Config::default());
+            assert!(sidecar.is_ready(), "the stand-in answers init");
+
+            let mut data = service_data("fixture", None);
+            let stub_dir = run_capture_for_service(
+                &sidecar,
+                &FileOrchestrator::new(crate::agent_service::AgentService::new()),
+                &HashMap::new(),
+                root.to_str().unwrap(),
+                &MountGraph::default(),
+                &Config::default(),
+                &service_module_index(root.to_str().unwrap(), &Config::default()),
+                &[SymbolRequest {
+                    symbol_name: anchor.into(),
+                    source_file: "types.ts".into(),
+                    alias: Some(anchor.into()),
+                    array_depth: None,
+                    payload_borrow_witness: false,
+                }],
+                &[],
+                &TypeResolutionResult {
+                    dts_content: None,
+                    explicit_manifest: vec![],
+                    inferred_types: vec![],
+                    symbol_failures: vec![],
+                    errors: vec![],
+                    anchor_changes: vec![],
+                },
+                &mut data,
+            );
+            Self {
+                dir,
+                sidecar,
+                data,
+                stub_dir,
+            }
+        }
+
+        fn notes(&self, file: &str) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join(file))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The pid of every process the stand-in ran as, oldest first.
+        fn pids(&self) -> Vec<String> {
+            self.notes("pids")
+        }
+
+        /// The pid each capture request was asked of, oldest first.
+        fn asked(&self) -> Vec<String> {
+            self.notes("captures")
+                .iter()
+                .map(|line| line.split(' ').next().unwrap().to_owned())
+                .collect()
+        }
+
+        fn status(&self) -> &str {
+            self.data.type_extraction_status.as_deref().unwrap_or("")
+        }
+
+        /// The sidecar still answers: the next service can be scoped to it.
+        fn assert_the_sidecar_still_serves(&self) {
+            assert!(
+                self.sidecar.is_ready(),
+                "the capture left the scan without a ready sidecar: {:?}",
+                self.sidecar.get_state()
+            );
+            let next = self.dir.path().join("next-service");
+            std::fs::create_dir(&next).unwrap();
+            scope_sidecar_to_service(
+                Some(&self.sidecar),
+                next.to_str().unwrap(),
+                &Config::default(),
+            );
+            assert!(
+                self.sidecar.is_ready(),
+                "the service after this one could not be scoped: {:?}",
+                self.sidecar.get_state()
+            );
+        }
+    }
+
+    impl Drop for CaptureThroughStandIn {
+        fn drop(&mut self) {
+            if let Some(stub_dir) = &self.stub_dir {
+                let _ = std::fs::remove_dir_all(stub_dir);
+            }
+        }
+    }
+
+    /// A capture is asked of a process started for it, not of the one that
+    /// served the service's inference (carrick#1916): that one holds the
+    /// service's program and everything inferred over it, and the capture
+    /// builds a program of its own beside them.
+    #[test]
+    fn a_capture_is_asked_of_a_process_started_for_it() {
+        let run = CaptureThroughStandIn::run("Fine");
+        let pids = run.pids();
+        assert_eq!(pids.len(), 2, "expected the first process and one more");
+        assert_eq!(
+            run.asked(),
+            [pids[1].clone()],
+            "the capture went to the process that had served the service"
+        );
+        let stub = run.data.capture_stub.as_ref().expect("the stub is kept");
+        assert!(stub.files.contains_key("types/surface.d.ts"));
+        assert_eq!(run.data.type_extraction_status, None);
+        assert!(run.data.types_degraded.is_none());
+        // What runs after capture in the same service reads the stub through
+        // the sidecar, and finds it ready.
+        assert!(run.stub_dir.is_some());
+        run.assert_the_sidecar_still_serves();
+    }
+
+    /// A sidecar that dies with the capture in hand costs the service nothing
+    /// when a second process can do it: the capture is asked once more, of
+    /// another fresh process, and that answer is the service's stub.
+    #[test]
+    fn a_capture_whose_sidecar_dies_is_asked_once_more_of_another_process() {
+        let run = CaptureThroughStandIn::run("DiesOnce");
+        let pids = run.pids();
+        assert_eq!(
+            pids.len(),
+            3,
+            "expected the first process, the capture's and the retry's"
+        );
+        assert_eq!(
+            run.asked(),
+            pids[1..],
+            "expected one capture in each of the two fresh processes"
+        );
+        assert!(
+            run.data.capture_stub.is_some(),
+            "the retry's stub was not kept: {}",
+            run.status()
+        );
+        assert_eq!(run.data.type_extraction_status, None);
+        assert!(run.data.types_degraded.is_none());
+    }
+
+    /// Dying twice is the end of it for this service, which is recorded as
+    /// degraded with the cause. It is not the end for the scan: a process is
+    /// left in place for the services after it.
+    #[test]
+    fn a_capture_whose_sidecar_dies_twice_degrades_the_service_and_not_the_scan() {
+        let run = CaptureThroughStandIn::run("Dies");
+        let pids = run.pids();
+        assert_eq!(
+            pids.len(),
+            4,
+            "expected the first process, the capture's, the retry's, and one left for the \
+             rest of the scan"
+        );
+        assert_eq!(
+            run.asked(),
+            pids[1..3],
+            "expected the capture and exactly one retry"
+        );
+        assert!(run.data.capture_stub.is_none());
+        assert!(
+            run.status().starts_with("type capture failed: ")
+                && run.status().contains("process ended during the capture")
+                && run.status().contains("retried in a fresh process"),
+            "the status does not say the sidecar died: {}",
+            run.status()
+        );
+        assert!(
+            !run.status().contains("Deserialization"),
+            "an answer cut off by the death was reported as the failure: {}",
+            run.status()
+        );
+        let degraded = run.data.types_degraded.as_ref().expect("types_degraded");
+        assert_eq!(degraded.stage, "capture");
+        run.assert_the_sidecar_still_serves();
+    }
+
+    /// A capture that runs out of time says so on the service, and degrades it
+    /// as a dead sidecar does (carrick#1921). The sidecar the timeout left in
+    /// place answers, which is why a probe after the capture could not tell.
+    #[test]
+    fn a_capture_that_times_out_says_so_and_degrades_the_service() {
+        let run = CaptureThroughStandIn::run("Slow");
+        assert!(run.data.capture_stub.is_none());
+        assert!(
+            run.status().starts_with("type capture timed out: "),
+            "the status does not say the capture timed out: {}",
+            run.status()
+        );
+        let degraded = run.data.types_degraded.as_ref().expect("types_degraded");
+        assert_eq!(degraded.stage, "capture");
+        assert_eq!(
+            run.asked().len(),
+            1,
+            "a capture that timed out was asked again"
+        );
+        run.assert_the_sidecar_still_serves();
+    }
+
+    /// A capture the sidecar answers with a failure names that failure, and
+    /// is not a degradation: the sidecar is well and the service's other
+    /// types are what they were.
+    #[test]
+    fn a_capture_the_sidecar_refuses_names_the_reason() {
+        let run = CaptureThroughStandIn::run("Refused");
+        assert!(run.data.capture_stub.is_none());
+        assert_eq!(
+            run.status(),
+            "v2 type capture degraded: no stub package was produced (the stand-in refuses \
+             this capture); cross-repo type compatibility for this service will report \
+             unverifiable"
+        );
+        assert!(run.data.types_degraded.is_none());
+        assert_eq!(run.asked().len(), 1, "a refused capture was asked again");
     }
 
     #[test]
