@@ -136,8 +136,14 @@ fn committed_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
 /// add a source file of its own and still start from a tree `git diff` reports
 /// as clean.
 fn committed_fixture_with(tmp: &Path, extra: &[(&str, &str)]) -> (PathBuf, PathBuf) {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/env-var-whole-url");
+    committed_copy_of("env-var-whole-url", tmp, extra)
+}
+
+/// A committed copy of any fixture that carries its own cassette in `__llm__`.
+fn committed_copy_of(name: &str, tmp: &Path, extra: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     let repo_path = tmp.join("service");
     copy_dir(&fixture, &repo_path);
     for (relative, contents) in extra {
@@ -325,6 +331,71 @@ async fn an_unchanged_scan_replays_the_cached_model_answer_and_re_emits_the_rest
             .any(|call| call.key.to_string().contains("/api/answer")),
         "the projection must still carry the resolved whole-URL call: {:#?}",
         scan_two.calls
+    );
+}
+
+/// Every row the stored generation holds, as `service side key site source`,
+/// sorted, so two scans' rows compare whatever order they were stated in.
+fn stored_rows(storage: &StubStorage) -> Vec<String> {
+    let mut rows = Vec::new();
+    for blob in storage.repos.lock().unwrap().iter() {
+        let service = blob.service_name.as_deref().unwrap_or_default();
+        for (side, list) in [("endpoint", &blob.endpoints), ("call", &blob.calls)] {
+            for row in list {
+                rows.push(format!(
+                    "{service} {side} {} {} {:?}",
+                    row.key.canonical(),
+                    row.file_path.display(),
+                    row.resolution_source
+                ));
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// carrick#1874: a rescan of an unchanged tree states the rows the cold scan
+/// stated.
+///
+/// The tree is two services around an in-process event bus: one calls
+/// `bus.emit("itemArchived", ...)` and the other `bus.on("itemArchived", ...)`.
+/// The event-bus pass and the model both read each call, and the pass defers
+/// to the model's row for the same site. A rescan holds the model's answers
+/// under repo-relative keys and the pass's rows under the path each file was
+/// discovered at, so the two were never seen as one site, and from the second
+/// scan on every such call was stated twice.
+#[tokio::test]
+#[serial]
+async fn a_rescan_states_the_rows_the_cold_scan_stated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_copy_of("pubsub-wrapper-monorepo", tmp.path(), &[]);
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+
+    let (_, dispatched_cold) = scan(&storage, &repo_path).await;
+    assert!(dispatched_cold > 0, "scan #1 is the cold scan");
+    let cold = stored_rows(&storage);
+    let on_the_bus = |rows: &[String]| {
+        rows.iter()
+            .filter(|row| row.contains("pubsub|itemArchived"))
+            .count()
+    };
+    assert_eq!(
+        on_the_bus(&cold),
+        2,
+        "the cold scan states the publish and the subscription once each: {cold:#?}"
+    );
+
+    let (_, dispatched_rescan) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_rescan, 0,
+        "an unchanged tree reaches the model zero times"
+    );
+    assert_eq!(
+        stored_rows(&storage),
+        cold,
+        "the rescan and the cold scan state different rows for one tree"
     );
 }
 
@@ -864,4 +935,150 @@ async fn an_unchanged_graphql_consumer_keeps_its_located_result_type() {
         Some("OrderUpdate"),
         "the warm scan replays the same answer, so it must anchor the consumer the same way"
     );
+}
+
+/// Every blob one scan uploaded, as the text the upload sends
+/// (`serde_json::to_string`, as `upload_repo_data` writes it), keyed by
+/// service.
+///
+/// Two fields state the run and not the tree, so they are pinned:
+/// `last_updated` is when the scan ran, and `boundary.files_attempted` is how
+/// many files this run sent to the model, which a rescan that replays every
+/// stored answer puts at zero. Everything else is a statement about the tree.
+fn uploaded_text(storage: &StubStorage) -> std::collections::BTreeMap<String, String> {
+    storage
+        .repos
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|blob| {
+            let mut blob = blob.clone();
+            blob.last_updated = chrono::DateTime::UNIX_EPOCH;
+            if let Some(boundary) = blob.boundary.as_mut() {
+                boundary.files_attempted = 0;
+            }
+            let service = blob.service_name.clone().unwrap_or_default();
+            (
+                format!("{}/{service}", blob.repo_name),
+                serde_json::to_string(&blob).expect("the upload serializes"),
+            )
+        })
+        .collect()
+}
+
+/// The blob's top-level fields whose text differs between two uploads of one
+/// service, each with the text around its first differing byte.
+///
+/// Read as raw text per field, never as parsed values: a parsed object
+/// compares equal whatever order its keys were written in, which is the
+/// difference this test exists to see.
+fn fields_that_differ(first: &str, second: &str) -> Vec<String> {
+    type Fields = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
+    let first: Fields = serde_json::from_str(first).expect("a blob is a JSON object");
+    let second: Fields = serde_json::from_str(second).expect("a blob is a JSON object");
+    let mut names: Vec<&String> = first.keys().chain(second.keys()).collect();
+    names.sort();
+    names.dedup();
+    let mut out = Vec::new();
+    for name in names {
+        let a = first.get(name).map(|raw| raw.get()).unwrap_or("<absent>");
+        let b = second.get(name).map(|raw| raw.get()).unwrap_or("<absent>");
+        if a == b {
+            continue;
+        }
+        let at = a
+            .bytes()
+            .zip(b.bytes())
+            .position(|(x, y)| x != y)
+            .unwrap_or_else(|| a.len().min(b.len()));
+        let window = |text: &str| {
+            let bytes = text.as_bytes();
+            let from = at.saturating_sub(60);
+            let to = (at + 100).min(bytes.len());
+            String::from_utf8_lossy(&bytes[from..to]).into_owned()
+        };
+        out.push(format!(
+            "{name} (first difference at byte {at}):\n    one scan:   {}\n    the other:  {}",
+            window(a),
+            window(b)
+        ));
+    }
+    out
+}
+
+fn assert_same_bytes(
+    fixture: &str,
+    what: &str,
+    first: &std::collections::BTreeMap<String, String>,
+    second: &std::collections::BTreeMap<String, String>,
+) {
+    assert_eq!(
+        first.keys().collect::<Vec<_>>(),
+        second.keys().collect::<Vec<_>>(),
+        "{fixture}: {what} uploaded a different set of services"
+    );
+    let mut differing = Vec::new();
+    for (service, text) in first {
+        for field in fields_that_differ(text, &second[service]) {
+            differing.push(format!("[{service}] {field}"));
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "{fixture}: {what} of one tree uploaded different bytes in {} field(s):\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
+}
+
+/// carrick#1847: two scans of one tree upload the same bytes.
+///
+/// The blob is compared byte for byte by whatever stores it, so an unchanged
+/// tree whose blob differs reads as changed and costs a recomputation. Its
+/// maps were hash maps, which are written in a different order by every
+/// process and every map, so no two uploads of one tree were ever equal.
+///
+/// Three trees of different shapes (an HTTP service with mounted routers, a
+/// thirty-file service that publishes and subscribes, and five GraphQL
+/// services in one repo), each scanned cold twice (the second from an empty
+/// store, so nothing is replayed) and then once more over the stored
+/// generation, as an ordinary rescan runs. Without the type sidecar: the type
+/// text it writes has a member order of its own (carrick#1598).
+#[tokio::test]
+#[serial]
+async fn two_scans_of_one_tree_upload_the_same_bytes() {
+    for fixture in [
+        "llm-mocked-api",
+        "in-process-publish",
+        "graphql-walked-vendor-schema",
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, cassette) = committed_copy_of(fixture, tmp.path(), &[]);
+        mock_env(&cassette);
+
+        let storage = StubStorage::default();
+        scan(&storage, &repo_path).await;
+        let cold = uploaded_text(&storage);
+        assert!(
+            cold.values().any(|text| text.len() > 2_000),
+            "{fixture}: the scan must upload a blob worth comparing"
+        );
+
+        let other_store = StubStorage::default();
+        scan(&other_store, &repo_path).await;
+        assert_same_bytes(
+            fixture,
+            "two cold scans",
+            &cold,
+            &uploaded_text(&other_store),
+        );
+
+        scan(&storage, &repo_path).await;
+        assert_same_bytes(
+            fixture,
+            "a cold scan and the rescan after it",
+            &cold,
+            &uploaded_text(&storage),
+        );
+    }
 }

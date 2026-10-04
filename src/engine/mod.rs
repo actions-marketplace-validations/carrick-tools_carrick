@@ -4380,6 +4380,14 @@ impl LibrarySiteIndex {
         index
     }
 
+    /// `file` relative to the repo root, whichever form the caller holds.
+    ///
+    /// The model's answers are keyed as discovered on a full scan and
+    /// repo-relative on a rescan, and a deterministic pass's rows always carry
+    /// the path the file was discovered at. So every fold that asks whether
+    /// two rows are one site compares both sides through this, the socket-twin
+    /// and event-bus folds included (carrick#1874): compared as written, the
+    /// two forms never met on a rescan and both rows were stated.
     fn relative(&self, file: &Path) -> PathBuf {
         let file = normalize_protocol_file(file);
         file.strip_prefix(&self.repo_root)
@@ -4626,7 +4634,7 @@ fn append_event_bus_operations(
     if event_bus.is_empty() {
         return;
     }
-    let reported = llm_pubsub_sites(file_results);
+    let reported = llm_pubsub_sites(file_results, library);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut deferred = 0usize;
@@ -4641,11 +4649,7 @@ fn append_event_bus_operations(
                 deferred += 1;
                 continue;
             }
-            let site = (
-                normalize_protocol_file(&op.file_path),
-                op.event.clone(),
-                role,
-            );
+            let site = (library.relative(&op.file_path), op.event.clone(), role);
             if reported.contains(&site) {
                 debug!(
                     event = %op.event,
@@ -4679,17 +4683,18 @@ fn append_event_bus_operations(
     );
 }
 
-/// Sites the file-analyzer already reported as pub/sub, as (normalized file,
-/// topic, role). Read by [`append_event_bus_operations`] to know which of its
-/// own rows would be a second copy of one the model already produced. An op
-/// with no role names no site: it was dropped from `cloud_data` entirely, so it
-/// covers nothing.
+/// Sites the file-analyzer already reported as pub/sub, as (file relative to
+/// the repo root, topic, role). Read by [`append_event_bus_operations`] to know
+/// which of its own rows would be a second copy of one the model already
+/// produced. An op with no role names no site: it was dropped from
+/// `cloud_data` entirely, so it covers nothing.
 fn llm_pubsub_sites(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    files: &LibrarySiteIndex,
 ) -> HashSet<(PathBuf, String, crate::operation::PubsubRole)> {
     let mut sites = HashSet::new();
     for (path, result) in file_results {
-        let file_norm = normalize_protocol_file(Path::new(path));
+        let file_norm = files.relative(Path::new(path));
         for op in &result.pubsub_operations {
             if let Some(role) = op.role {
                 sites.insert((file_norm.clone(), op.topic.clone(), role));
@@ -4730,15 +4735,18 @@ fn normalize_protocol_file(p: &Path) -> PathBuf {
 /// without socket ops) safe.
 ///
 /// Keyed as a map of file → event set (rather than a set of owned pairs) so
-/// membership checks borrow `&Path`/`&str` without per-op cloning.
+/// membership checks borrow `&Path`/`&str` without per-op cloning. The file is
+/// relative to the repo root ([`LibrarySiteIndex::relative`]), and so is the
+/// `file_results` key every reader looks up with.
 fn socket_event_twins(
     sockets: &crate::socket_io::SocketExtraction,
+    files: &LibrarySiteIndex,
 ) -> HashMap<PathBuf, HashSet<String>> {
     let mut twins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for op in sockets.listeners.iter().chain(sockets.emitters.iter()) {
         if let Some(event) = op.key.socket_event() {
             twins
-                .entry(normalize_protocol_file(&op.file_path))
+                .entry(files.relative(&op.file_path))
                 .or_default()
                 .insert(event.to_string());
         }
@@ -4793,7 +4801,7 @@ fn append_pubsub_operations(
 ) {
     use crate::operation::PubsubRole;
 
-    let twins = socket_event_twins(sockets);
+    let twins = socket_event_twins(sockets, library);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut dropped = 0usize;
@@ -4805,7 +4813,7 @@ fn append_pubsub_operations(
     paths.sort();
     for path in paths {
         let result = &file_results[path];
-        let file_norm = normalize_protocol_file(Path::new(path));
+        let file_norm = library.relative(Path::new(path));
         for op in &result.pubsub_operations {
             // Same-file socket twin → the file-analyzer double-classified a
             // socket emit/listen site; keep the deterministic socket op, drop
@@ -4924,13 +4932,13 @@ fn append_pubsub_manifest_entries(
 ) {
     use crate::operation::PubsubRole;
 
-    let twins = socket_event_twins(sockets);
+    let twins = socket_event_twins(sockets, library);
     // Deterministic order: sort paths before emitting manifest entries.
     let mut paths: Vec<&String> = file_results.keys().collect();
     paths.sort();
     for path in paths {
         let result = &file_results[path];
-        let file_norm = normalize_protocol_file(Path::new(path));
+        let file_norm = library.relative(Path::new(path));
         for op in &result.pubsub_operations {
             // Folded into a same-file socket twin: dropped from cloud_data, so
             // emit no orphan anchor here either.
@@ -7610,12 +7618,19 @@ fn reported_declaration_home(
 /// It runs after the restamp and before enrichment, whose fill then reaches
 /// only the entries this leaves without an anchor.
 ///
+/// The root is the outer named type of the statement, whatever type
+/// arguments are written at it: `res.json() as Promise<Page<Order>>` is
+/// anchored at `Page`, with the generic's own declaration as its home, as
+/// the fill anchors an instantiated generic interface at its bare name. The
+/// argument (`Order`) is the element the arbitration already refuses.
+///
 /// The entry keeps no anchor when the root is:
-/// - written with type arguments (`Page<Order>`): what such a row should
-///   name is not decided;
 /// - not declared in the repo under that name, so no home can be stated
-///   (the compiler's own globals, such as `Blob`, fall here);
+///   (the compiler's own globals and generics, such as `Blob` and `Record`,
+///   fall here, and so does a name the reading file imported under another);
 /// - transport machinery, which never anchors a row.
+///
+/// A union of several types has no root at all, so it anchors nothing.
 fn anchor_stated_body_roots(
     manifest: &mut [TypeManifestEntry],
     inferred: &[crate::services::type_sidecar::InferredType],
@@ -7637,11 +7652,7 @@ fn anchor_stated_body_roots(
         let Some(inf) = first_by_alias.get(entry.type_alias.as_str()) else {
             continue;
         };
-        let Some(stated) = inf
-            .stated_body
-            .as_ref()
-            .filter(|stated| stated.root_type_arguments.is_none())
-        else {
+        let Some(stated) = inf.stated_body.as_ref() else {
             continue;
         };
         let (Some(root), Some(source_file)) = (stated.root.as_ref(), stated.root_source.as_ref())
@@ -16379,6 +16390,84 @@ mod tests {
         assert_eq!(manifest[2].defined_in, None);
     }
 
+    /// The module the generic #1817 fixtures declare their bodies in: an
+    /// envelope with one type parameter and a keyed pair with two, an
+    /// interface and a type alias, away from the file that reads them.
+    const GENERIC_SOURCE: &str = "export interface Order {\n  id: string;\n}\n\nexport interface Envelope<T> {\n  data: T;\n  cursor: string | null;\n}\n\nexport type Keyed<K extends string, V> = {\n  key: K;\n  value: V;\n};\n";
+
+    /// The source states the body as an instantiation of a generic
+    /// (`res.json() as Promise<Envelope<Order>>`): the row is anchored at
+    /// the outer named type, `Envelope`, with the generic's own declaration
+    /// as its home, as the fill anchors an instantiated generic interface.
+    /// The type argument is never the anchor: a model that named it is
+    /// dropped by the arbitration, and the row ends at `Envelope` whichever
+    /// name the model picked, or none. How many arguments are written does
+    /// not matter.
+    #[test]
+    fn stated_generic_root_anchors_at_the_outer_named_type() {
+        let (repo, _) = stated_repo();
+        std::fs::write(repo.path().join("src/envelope.ts"), GENERIC_SOURCE).expect("write");
+        let declaring = repo
+            .path()
+            .join("src/envelope.ts")
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        let instantiated = |root: &str, arguments: u32| {
+            let mut stated = stated_root(root, &declaring);
+            stated.root_type_arguments = Some(arguments);
+            stated
+        };
+        let mut dropped_call = consumer_entry("Orders_Response_Call1");
+        dropped_call.primary_type_symbol = Some("Order".to_string());
+        let mut manifest = vec![
+            dropped_call,
+            consumer_entry("Orders_Response_Call2"),
+            consumer_entry("Orders_Request_Call2"),
+            consumer_entry("Orders_Response_Call3"),
+        ];
+        manifest[2].type_kind = ManifestTypeKind::Request;
+        let mut resolution = empty_resolution();
+        resolution.anchor_changes = vec![dropped("Orders_Response_Call1", "Order")];
+        resolution.inferred_types = vec![
+            stated_call("Orders_Response_Call1", instantiated("Envelope", 1)),
+            stated_call("Orders_Response_Call2", instantiated("Envelope", 1)),
+            stated_call("Orders_Response_Call3", instantiated("Keyed", 2)),
+        ];
+
+        let repo_path = repo.path().to_string_lossy();
+        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
+        anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        let home = |symbol: &str, line_number: u32| crate::cloud_storage::TypeHome {
+            file_path: "src/envelope.ts".to_string(),
+            line_number,
+            symbol: symbol.to_string(),
+        };
+        for (entry, symbol, line_number) in [
+            (&manifest[0], "Envelope", 5),
+            (&manifest[1], "Envelope", 5),
+            (&manifest[3], "Keyed", 10),
+        ] {
+            assert_eq!(
+                entry.primary_type_symbol.as_deref(),
+                Some(symbol),
+                "{}",
+                entry.type_alias
+            );
+            assert_eq!(
+                entry.defined_in,
+                Some(home(symbol, line_number)),
+                "{}",
+                entry.type_alias
+            );
+        }
+        assert_eq!(manifest[2].primary_type_symbol, None);
+        assert_eq!(manifest[2].defined_in, None);
+    }
+
     /// An anchor the row already has is not the stated root's to replace:
     /// the model's, kept because it is the root or because several requests
     /// fan in to the alias, and a re-aimed root.
@@ -16418,12 +16507,9 @@ mod tests {
             .join("src/transport.ts")
             .canonicalize()
             .expect("canonical");
-        let mut generic = stated_root("MemberPage", &declaring);
-        generic.root_type_arguments = Some(1);
         let mut no_source = stated_root("MemberPage", &declaring);
         no_source.root_source = None;
         let cases = [
-            ("written with type arguments", generic),
             ("declared nowhere the sidecar found", no_source),
             (
                 "declared outside the repo",
@@ -20330,6 +20416,122 @@ mod tests {
                 .count(),
             1,
             "the model's op must keep its anchor"
+        );
+    }
+
+    /// carrick#1874: the two folds above hold on a rescan too.
+    ///
+    /// A rescan keys the model's answers repo-relative, and a deterministic
+    /// pass's rows always carry the path the file was discovered at, under the
+    /// repo root. The two are one site whichever form each side is in: the
+    /// event-bus row defers to the model's row, and the model's pub/sub row
+    /// folds into its socket twin, exactly as on the cold scan. Before, a
+    /// rescan compared the two forms as written, found no site in common, and
+    /// stated both rows.
+    #[test]
+    fn a_rescan_s_relative_keys_and_a_pass_s_discovered_paths_are_one_site() {
+        use crate::operation::{PubsubRole, SocketDirection};
+
+        let repo_root = "/checkout/shop";
+        let emit_file = "worker-svc/src/event-bus.ts";
+        let socket_file = "payments-svc/realtime/server.ts";
+        let discovered = |file: &str| PathBuf::from(format!("{repo_root}/{file}"));
+
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![],
+                publishers: vec![crate::event_emitter::BusOp {
+                    key: OperationKey::pubsub("workerNotification"),
+                    event: "workerNotification".to_string(),
+                    file_path: discovered(emit_file),
+                    line: 389,
+                }],
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![],
+                emitters: vec![crate::socket_io::SocketOp {
+                    key: OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
+                    file_path: discovered(socket_file),
+                    line: 28,
+                    payload_type_symbol: None,
+                    payload_type_source: None,
+                }],
+            },
+            ..Default::default()
+        };
+
+        // The model's answers, keyed as a rescan holds them.
+        let model_row = |topic: &str| FileAnalysisResult {
+            pubsub_operations: vec![pubsub_op(
+                topic,
+                PubsubRole::Publisher,
+                Some("Payload"),
+                Some("./types"),
+            )],
+            ..Default::default()
+        };
+        let file_results: HashMap<String, FileAnalysisResult> = [
+            (emit_file.to_string(), model_row("workerNotification")),
+            (socket_file.to_string(), model_row("payment:settled")),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut cloud_data = repo_with_bundle("shop", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            repo_root,
+            &Config::default(),
+        );
+
+        let rows = |key: &str| -> Vec<&ApiEndpointDetails> {
+            cloud_data
+                .calls
+                .iter()
+                .filter(|call| call.key.canonical() == key)
+                .collect()
+        };
+        let bus_rows = rows("pubsub|workerNotification");
+        assert_eq!(
+            bus_rows.len(),
+            1,
+            "one emit is one row: the event-bus row defers to the model's: {bus_rows:#?}"
+        );
+        assert_eq!(
+            bus_rows[0].file_path,
+            PathBuf::from(format!("{emit_file}:14")),
+            "the row kept is the model's, which carries the payload anchor"
+        );
+        assert_eq!(
+            rows("socket|SERVER->CLIENT|payment:settled").len(),
+            1,
+            "the socket emit is stated once, as the socket row"
+        );
+        assert_eq!(
+            rows("pubsub|payment:settled").len(),
+            0,
+            "the model's pub/sub row for the same emit folds into its socket twin"
+        );
+
+        // The manifest folds the same way: no anchor for a row that was not
+        // stated. The index is rooted at the repo, as both scan paths build it.
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &extractions.sockets,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::of(&Default::default(), repo_root),
+            repo_root,
+        );
+        let anchored: Vec<String> = entries.iter().map(|entry| entry.key.canonical()).collect();
+        assert_eq!(
+            anchored,
+            vec!["pubsub|workerNotification".to_string()],
+            "only the row that was stated anchors a manifest entry"
         );
     }
 

@@ -88,6 +88,7 @@ jobs:
           --test client_semantics_test
           --test commonjs_require_callers_test
           --test dependency_analysis_test
+          --test derive_matches_scan_test
           --test dispatch_resume_test
           --test env_var_template_call_segment_test
           --test eval_xrepo
@@ -115,6 +116,7 @@ jobs:
           --test log_value_guard_test
           --test mock_storage_test
           --test module_resolution_parity_test
+          --test nested_service_walk_test
           --test new_url_target_test
           --test nonhttp_source_labels_test
           --test object_export_surface_test
@@ -197,6 +199,7 @@ jobs:
           --test run_log_isolation_test
           --test scan_leaves_repo_unedited_test
           --test spread_options_verb_test
+          --test stated_generic_body_anchor_test
           --test undeclared_external_host_test
           --test unprepared_refusal_test
           --test wrapper_call_route_test
