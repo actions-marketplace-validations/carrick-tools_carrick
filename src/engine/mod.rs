@@ -663,8 +663,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // What every upload of this run passes through last (carrick#1204).
     let boundary = upload_boundary::UploadBoundary::for_scan(repo_path);
     debug!(upload = should_upload, "Running Carrick in CI mode");
-    // The run's one ceiling on waiting out a refusing model (carrick#1126).
+    // The run's ceilings on waiting out a refusing model: the one its
+    // service-level calls and its in-run retry share (carrick#1126), and each
+    // route's for the per-file calls a capacity refusal holds up
+    // (carrick#1893).
     crate::retry_budget::reset();
+    crate::agent_service::reset_refusal_budgets();
 
     // Said before the scan, not after it: the point is that a capture pass set
     // up this way costs a full pass and leaves nothing behind (carrick#966).
@@ -948,9 +952,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // 4b. The work the run still owes gets one more try before it ends: a
     // deferred service's detection, the files and intents the model did not
-    // answer for. After minutes, not
-    // seconds, because what usually causes all of them is a shared model
-    // quota that refills on that scale.
+    // answer for. After minutes when the model refused any of it for
+    // capacity, because that is a shared model quota that refills on that
+    // scale; at once when it refused none, because nothing else that is owed
+    // is nearer for a wait (carrick#1896).
     let retrying: Vec<usize> = runs
         .iter()
         .enumerate()
@@ -969,29 +974,46 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             crate::retry_budget::BUDGET_ENV
         );
     } else if !retrying.is_empty() && !crate::local_mode::no_model() {
-        // The wait is charged to the run's budget and never outlasts it.
-        let delay = durability::retry_delay(
-            retrying
-                .iter()
-                .any(|index| runs[*index].owed.thins_the_index()),
-        )
-        .min(retry_budget_left);
+        // The most the model refused any of them for capacity decides the
+        // wait. It is charged to the run's budget and never outlasts it.
+        let refused = retrying
+            .iter()
+            .filter_map(|index| runs[*index].owed.refused_for_capacity())
+            .max();
+        let delay = durability::retry_delay(refused).min(retry_budget_left);
+        // The decision, in the run's log: a wait that depends on why work is
+        // owed is one a reader of the log cannot work out from its length.
+        info!(
+            "{}",
+            durability::retry_wait_line(retrying.len(), delay, refused)
+        );
         let names: Vec<String> = retrying
             .iter()
             .map(|index| format!("{} ({})", runs[*index].label, runs[*index].owed.describe()))
             .collect();
-        durability::wait_with_progress(delay, |left| {
+        if delay.is_zero() {
             logging::progress(
                 &sp,
                 &format!(
-                    "{} service(s) still owe model work: {}. Retrying them once in {}s",
+                    "{} service(s) still owe model work: {}. Asking again now",
                     retrying.len(),
-                    names.join(", "),
-                    left.as_secs()
+                    names.join(", ")
                 ),
             );
-        })
-        .await;
+        } else {
+            durability::wait_with_progress(delay, |left| {
+                logging::progress(
+                    &sp,
+                    &format!(
+                        "{} service(s) still owe model work: {}. Retrying them once in {}s",
+                        retrying.len(),
+                        names.join(", "),
+                        left.as_secs()
+                    ),
+                );
+            })
+            .await;
+        }
         for index in retrying {
             let service = &services[index];
             // Whatever this service lost is recorded again if it is lost again.
@@ -2978,8 +3000,8 @@ async fn analyze_current_repo_incremental(
                     let extraction = match &prev.cached_extraction_config {
                         Some(config) => Some(config.clone()),
                         None => {
-                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
-                            generate_extraction_config(&agent, &det, packages).await
+                            generate_extraction_config(&extraction_config_agent(), &det, packages)
+                                .await
                         }
                     };
                     ModelSetup::ready(det, guid.clone(), extraction)
@@ -3661,10 +3683,7 @@ async fn model_setup(
     };
 
     let guidance_agent = FrameworkGuidanceAgent::new(patient);
-    // The extraction config is non-fatal and asked under the ordinary policy:
-    // a service that goes without it keeps machinery types wrapped, which is
-    // not worth ten minutes of waiting.
-    let extraction_agent = FrameworkGuidanceAgent::new(AgentService::new());
+    let extraction_agent = extraction_config_agent();
     // Guidance and extraction config both depend only on detection — run
     // them concurrently instead of paying a lone extra lambda round-trip.
     let (guidance, extraction_config) = tokio::join!(
@@ -3680,6 +3699,15 @@ async fn model_setup(
         Ok(guidance) => ModelSetup::ready(detection, guidance, extraction_config),
         Err(error) => ModelSetup::guidance_deferred(detection, extraction_config, error.as_ref()),
     }
+}
+
+/// The agent the extraction config is asked through. The config is non-fatal:
+/// a service that goes without it keeps machinery types wrapped, which is not
+/// worth ten minutes of waiting, so it is asked neither under the patient
+/// policy nor under the per-file one, whose capacity refusals wait on a
+/// route's refusal budget (carrick#1893). Seven attempts, whatever refuses.
+fn extraction_config_agent() -> FrameworkGuidanceAgent {
+    FrameworkGuidanceAgent::new(AgentService::new().with_retry_policy(RetryPolicy::BRIEF))
 }
 
 /// Generate machinery-unwrap rules via the cloud's extraction_config task.
@@ -6084,14 +6112,19 @@ fn resolve_types_if_available(
                     );
                     cloud_data.bundled_types = type_resolution.dts_content.clone();
                     if let Some(ref mut manifest) = cloud_data.type_manifest {
-                        // Before enrichment, whose inference-anchor fill reads
-                        // only rows left without a symbol.
+                        // In this order: each pass anchors only the rows the
+                        // ones before it left without a symbol.
                         restamp_arbitrated_anchors(
                             manifest,
                             &type_resolution.anchor_changes,
                             repo_path,
                         );
                         anchor_stated_body_roots(
+                            manifest,
+                            &type_resolution.inferred_types,
+                            repo_path,
+                        );
+                        anchor_inferred_symbols(
                             manifest,
                             &type_resolution.inferred_types,
                             repo_path,
@@ -7396,7 +7429,8 @@ struct AnchorAtSite {
 /// symbol is the type of the response it sends and a data call's is the type
 /// the call expects back, and the explicit type request built from it targets
 /// the response alias alone. On the request entry it named the response type
-/// over the request body; enrichment anchors that entry from its own inference.
+/// over the request body; `anchor_inferred_symbols` anchors that entry from
+/// its own inference.
 ///
 /// The symbol-side line is normalized exactly as the manifest side
 /// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
@@ -7528,8 +7562,8 @@ fn absolute_source_path(file_path: &str, repo_path: &str) -> PathBuf {
 /// naming the element inside it. Each change reaches every entry of the same
 /// op at the same site that still carries the rejected symbol. A re-aimed
 /// root becomes the anchor, with the declaration the sidecar found for it. A
-/// dropped one leaves no anchor and no home, so enrichment fills the anchor
-/// from each entry's own inference.
+/// dropped one leaves no anchor and no home, so `anchor_inferred_symbols`
+/// anchors each entry from its own inference.
 fn restamp_arbitrated_anchors(
     manifest: &mut [TypeManifestEntry],
     changes: &[crate::services::type_sidecar::AnchorChange],
@@ -7611,12 +7645,12 @@ fn reported_declaration_home(
 /// annotates the body it reads (`(await res.json()) as MemberPage`), and the
 /// row serves that statement. Its root is the named type the data-call schema
 /// asks the model for. The inference's own anchor cannot stand in for it: it
-/// is the call's type, `Response` for `fetch`, which enrichment's fill never
-/// writes. So a response entry left without an anchor, because the model
-/// named none or because `restamp_arbitrated_anchors` took back one the
+/// is the call's type, `Response` for `fetch`, which `anchor_inferred_symbols`
+/// never writes. So a response entry left without an anchor, because the
+/// model named none or because `restamp_arbitrated_anchors` took back one the
 /// arbitration dropped, is anchored at the stated root, with its declaration.
-/// It runs after the restamp and before enrichment, whose fill then reaches
-/// only the entries this leaves without an anchor.
+/// It runs after the restamp and before `anchor_inferred_symbols`, which then
+/// reaches only the entries this leaves without an anchor.
 ///
 /// The root is the outer named type of the statement, whatever type
 /// arguments are written at it: `res.json() as Promise<Page<Order>>` is
@@ -7671,6 +7705,81 @@ fn anchor_stated_body_roots(
         };
         entry.primary_type_symbol = Some(root.symbol);
         entry.defined_in = Some(home);
+    }
+}
+
+/// Anchor an entry at the type its own inference resolved (#240), with the
+/// declaration the sidecar found for it (carrick#1819).
+///
+/// The sidecar resolves each inferred type's real source symbol (`Payment`)
+/// off the ts-morph `Type`, so an entry nothing has anchored is anchored
+/// from it. The join is by `alias`, the key enrichment marries an
+/// `InferredType` to its entry by. A `(file_path, line)` join would be
+/// fragile: the sidecar's `source_location` is an absolute ts-morph path
+/// while `entry.file_path` is repo-relative, so the coordinates need not
+/// line up. The first inference that names a type wins per alias, so a later
+/// one cannot clobber an earlier real symbol.
+///
+/// It is the last of the anchor passes: an entry still without an anchor
+/// here has none from the model, from the arbitration or from the source's
+/// own statement. A request entry never has the model's, since the model's
+/// symbol names the response. An anchor already there is never replaced, so
+/// an op the model anchored correctly is never regressed, and neither is its
+/// home.
+///
+/// Transport machinery never anchors a row (carrick#1779). A consumer
+/// call's inference anchors on the call's own type, which for `fetch` is
+/// `Response`: the thing the body is read out of, not the body.
+///
+/// The home is read off the same inference (`primary_type_symbol_source`)
+/// and resolved as a re-aimed root's is (`reported_declaration_home`): the
+/// declaration's line, in a file inside the repo. A package installed under
+/// the repo's `node_modules` is inside the repo, and its home is the path it
+/// is installed at. The anchor is written with no home when the sidecar
+/// reported no source, when the file is outside the repo, and when the file
+/// does not declare the symbol as a type under that name: a file that only
+/// re-exports it, or one that declares it as a value.
+fn anchor_inferred_symbols(
+    manifest: &mut [TypeManifestEntry],
+    inferred: &[crate::services::type_sidecar::InferredType],
+    repo_path: &str,
+) {
+    let mut named: HashMap<&str, (&str, Option<&str>)> = HashMap::new();
+    for inf in inferred {
+        if let Some(symbol) = inf
+            .primary_type_symbol
+            .as_deref()
+            .filter(|symbol| !TypeSidecar::is_untyped_response_type(symbol))
+        {
+            named
+                .entry(inf.alias.as_str())
+                .or_insert((symbol, inf.primary_type_symbol_source.as_deref()));
+        }
+    }
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+    // One read of a declaring file per symbol, however many entries name it.
+    let mut homes: HashMap<(&str, &str), Option<crate::cloud_storage::TypeHome>> = HashMap::new();
+    for entry in manifest
+        .iter_mut()
+        .filter(|entry| entry.primary_type_symbol.is_none())
+    {
+        let Some(&(symbol, source)) = named.get(entry.type_alias.as_str()) else {
+            continue;
+        };
+        entry.primary_type_symbol = Some(symbol.to_string());
+        entry.defined_in = source.and_then(|source_file| {
+            homes
+                .entry((source_file, symbol))
+                .or_insert_with(|| {
+                    let root = crate::services::type_sidecar::AnchorRoot {
+                        symbol: symbol.to_string(),
+                        source_file: source_file.to_string(),
+                    };
+                    reported_declaration_home(&root, repo_path, &cm, &handler)
+                })
+                .clone()
+        });
     }
 }
 
@@ -7766,32 +7875,6 @@ fn enrich_manifest_with_type_resolution(
         }
     }
 
-    // Deterministic anchor source (#240): the sidecar resolves each inferred
-    // type's real source symbol (`Payment`) off the ts-morph `Type`, so a
-    // manifest entry whose anchor the LLM left unset can be filled from it.
-    // Join by `alias` — the same key the resolved-type lookup below uses to
-    // marry an `InferredType` to its manifest entry. A `(file_path, line)` join
-    // would be fragile: the sidecar's `source_location` is an absolute ts-morph
-    // path while `entry.file_path` is repo-relative, so the coordinates need not
-    // line up. First non-None wins per alias, so a later inferred entry can't
-    // clobber an earlier real symbol.
-    //
-    // Transport machinery never anchors a row (carrick#1779). A consumer
-    // call's inference anchors on the call's own type, which for `fetch` is
-    // `Response`: the thing the body is read out of, not the body.
-    let mut inferred_symbols: HashMap<String, String> = HashMap::new();
-    for inferred in &type_resolution.inferred_types {
-        if let Some(symbol) = inferred
-            .primary_type_symbol
-            .as_ref()
-            .filter(|symbol| !TypeSidecar::is_untyped_response_type(symbol))
-        {
-            inferred_symbols
-                .entry(inferred.alias.clone())
-                .or_insert_with(|| symbol.clone());
-        }
-    }
-
     // Why an inference came back `any` (carrick#376). Joined on the same
     // `alias` key as everything else here. The inferrer is the only layer that
     // knows the difference between a type that IS `any` and a recovery that
@@ -7840,17 +7923,6 @@ fn enrich_manifest_with_type_resolution(
 
     // Update manifest entries
     for entry in manifest.iter_mut() {
-        // Fill the deterministic anchor ONLY when the LLM left it unset, so the
-        // ops where the model already emitted a correct symbol (POST /payments,
-        // socket) are never regressed. Stamping runs before enrichment, so any
-        // entry still `None` here had no LLM anchor of its own: a request
-        // entry never does, since the model's symbol names the response.
-        if entry.primary_type_symbol.is_none()
-            && let Some(symbol) = inferred_symbols.get(&entry.type_alias)
-        {
-            entry.primary_type_symbol = Some(symbol.clone());
-        }
-
         if let Some(provenance) = inferred_provenance.get(&entry.type_alias) {
             merge_any_provenance(&mut entry.any_provenance, provenance.iter().cloned());
         }
@@ -15880,7 +15952,7 @@ mod tests {
     /// #240: the deterministic anchor fills `primary_type_symbol` from the
     /// inferred symbol, joined by `alias`, when the LLM left it None.
     #[test]
-    fn enrich_fills_anchor_from_inferred_symbol_when_llm_none() {
+    fn inferred_symbol_fills_anchor_when_llm_none() {
         let mut manifest = vec![consumer_entry("OrderView")];
         // The LLM stamped nothing onto this op.
         assert_eq!(manifest[0].primary_type_symbol, None);
@@ -15890,7 +15962,7 @@ mod tests {
             .inferred_types
             .push(inferred_with_symbol("OrderView"));
 
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -15903,7 +15975,7 @@ mod tests {
     /// the inferred symbol — the deterministic fill is None-only so POST
     /// /payments and socket ops keep their model-emitted symbol.
     #[test]
-    fn enrich_does_not_override_existing_llm_anchor() {
+    fn inferred_symbol_does_not_override_existing_llm_anchor() {
         let mut manifest = vec![consumer_entry("OrderView")];
         // The LLM already stamped the real symbol for this op.
         manifest[0].primary_type_symbol = Some("Payment".to_string());
@@ -15914,7 +15986,7 @@ mod tests {
             .inferred_types
             .push(inferred_with_symbol("OrderView"));
 
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -15927,16 +15999,203 @@ mod tests {
     /// `Response`, while its text is the body the source reads out of it. The
     /// transport is not the row's type, so it fills no anchor.
     #[test]
-    fn enrich_never_fills_an_anchor_with_transport_machinery() {
+    fn inferred_symbol_never_fills_an_anchor_with_transport_machinery() {
         let mut manifest = vec![consumer_entry("OrderView")];
         let mut resolution = empty_resolution();
         resolution
             .inferred_types
             .push(inferred_with_symbol("Response"));
 
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
 
         assert_eq!(manifest[0].primary_type_symbol, None);
+    }
+
+    // -----------------------------------------------------------------
+    // carrick#1819: an anchor the inference fills states its home
+    // -----------------------------------------------------------------
+
+    /// What `src/events.ts` of the #1819 fixtures declares: a payload type at
+    /// line 1, an alias at line 5, and a schema constant at line 7, which is
+    /// a value and no type declaration.
+    const EVENTS_SOURCE: &str = "export interface OrderPlaced {\n  orderId: string;\n}\n\nexport type OrderId = string;\n\nexport const OrderSchema = { parse: (value: unknown) => value };\n";
+
+    /// A repo for the #1819 fixtures. `src/events.ts` is `EVENTS_SOURCE`,
+    /// `src/index.ts` re-exports the payload type and declares nothing, and
+    /// an installed package declares a type under `node_modules`.
+    fn filled_anchor_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let package = repo.path().join("node_modules/events-kit");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::create_dir_all(&package).expect("mkdir");
+        std::fs::write(repo.path().join("src/events.ts"), EVENTS_SOURCE).expect("write");
+        std::fs::write(
+            repo.path().join("src/index.ts"),
+            "export { OrderPlaced } from \"./events\";\n",
+        )
+        .expect("write");
+        std::fs::write(
+            package.join("index.d.ts"),
+            "export interface Receipt {\n  id: string;\n}\n",
+        )
+        .expect("write");
+        repo
+    }
+
+    /// A path as the sidecar spells it: absolute and resolved
+    /// (`/private/var/...` on macOS). A file that is not there keeps the
+    /// spelling it was given.
+    fn as_reported(path: &Path) -> String {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// An inference that resolved `symbol` and, when the sidecar found one,
+    /// the file that declares it.
+    fn inferred_from(symbol: &str, source: Option<&Path>) -> InferredType {
+        let mut inferred = inferred_with_symbol(symbol);
+        inferred.primary_type_symbol_source = source.map(as_reported);
+        inferred
+    }
+
+    /// The one entry of a manifest the model anchored nothing in, after the
+    /// inference fill has read `inferred` for a scan of `repo`.
+    fn filled(inferred: Vec<InferredType>, repo: &Path) -> TypeManifestEntry {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        anchor_inferred_symbols(&mut manifest, &inferred, &repo.to_string_lossy());
+        manifest.remove(0)
+    }
+
+    /// The inference reports where the type it resolved is declared, so the
+    /// anchor it fills carries that declaration as its home, as an anchor the
+    /// model named does: the file, repo-relative, and the declaration's own
+    /// line. A package installed inside the repo is a file inside the repo,
+    /// and its home is the path it is installed at.
+    #[test]
+    fn inferred_anchor_states_where_its_type_is_declared() {
+        let repo = filled_anchor_repo();
+        let events = repo.path().join("src/events.ts");
+        let installed = repo.path().join("node_modules/events-kit/index.d.ts");
+        let cases = [
+            ("OrderPlaced", &events, "src/events.ts", 1),
+            ("OrderId", &events, "src/events.ts", 5),
+            (
+                "Receipt",
+                &installed,
+                "node_modules/events-kit/index.d.ts",
+                1,
+            ),
+        ];
+        for (symbol, source, file_path, line_number) in cases {
+            let entry = filled(vec![inferred_from(symbol, Some(source))], repo.path());
+
+            assert_eq!(entry.primary_type_symbol.as_deref(), Some(symbol));
+            assert_eq!(
+                entry.defined_in,
+                Some(crate::cloud_storage::TypeHome {
+                    file_path: file_path.to_string(),
+                    line_number,
+                    symbol: symbol.to_string(),
+                }),
+                "{symbol}"
+            );
+        }
+    }
+
+    /// The anchor is still filled where no home can be stated for it. Each
+    /// source here is one the row cannot point a reader at.
+    #[test]
+    fn inferred_anchor_states_no_home_it_cannot_find() {
+        let repo = filled_anchor_repo();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let outside = elsewhere.path().join("events.ts");
+        std::fs::write(&outside, EVENTS_SOURCE).expect("write");
+        let events = repo.path().join("src/events.ts");
+        let barrel = repo.path().join("src/index.ts");
+        let missing = repo.path().join("src/gone.ts");
+        let cases = [
+            ("no source reported", "OrderPlaced", None),
+            ("declared outside the repo", "OrderPlaced", Some(&outside)),
+            (
+                "a file that re-exports the name and declares nothing",
+                "OrderPlaced",
+                Some(&barrel),
+            ),
+            ("declared as a value", "OrderSchema", Some(&events)),
+            ("a file that is not there", "OrderPlaced", Some(&missing)),
+        ];
+        for (why, symbol, source) in cases {
+            let entry = filled(
+                vec![inferred_from(symbol, source.map(|path| path.as_path()))],
+                repo.path(),
+            );
+
+            assert_eq!(entry.primary_type_symbol.as_deref(), Some(symbol), "{why}");
+            assert_eq!(entry.defined_in, None, "{why}");
+        }
+    }
+
+    /// The home is read off the inference the symbol came from. The first
+    /// inference that names a type anchors the alias; a later one's source is
+    /// another type's, and transport machinery in front of it is skipped
+    /// with its source.
+    #[test]
+    fn inferred_anchor_takes_its_home_from_the_inference_that_named_it() {
+        let repo = filled_anchor_repo();
+        let events = repo.path().join("src/events.ts");
+
+        let entry = filled(
+            vec![
+                inferred_from("OrderId", None),
+                inferred_from("OrderPlaced", Some(&events)),
+            ],
+            repo.path(),
+        );
+        assert_eq!(entry.primary_type_symbol.as_deref(), Some("OrderId"));
+        assert_eq!(entry.defined_in, None);
+
+        let entry = filled(
+            vec![
+                inferred_from("Response", Some(&events)),
+                inferred_from("OrderPlaced", Some(&events)),
+            ],
+            repo.path(),
+        );
+        assert_eq!(entry.primary_type_symbol.as_deref(), Some("OrderPlaced"));
+        assert_eq!(
+            entry.defined_in,
+            Some(crate::cloud_storage::TypeHome {
+                file_path: "src/events.ts".to_string(),
+                line_number: 1,
+                symbol: "OrderPlaced".to_string(),
+            })
+        );
+    }
+
+    /// The fill states a home only for an anchor it writes. An anchor the
+    /// model named with no home the stamp could resolve keeps none, even
+    /// where the inference resolved the same name and reports its file:
+    /// that row is not the fill's.
+    #[test]
+    fn inferred_anchor_leaves_a_model_anchor_without_a_home_as_it_is() {
+        let repo = filled_anchor_repo();
+        let events = repo.path().join("src/events.ts");
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].primary_type_symbol = Some("OrderPlaced".to_string());
+
+        anchor_inferred_symbols(
+            &mut manifest,
+            &[inferred_from("OrderPlaced", Some(&events))],
+            &repo.path().to_string_lossy(),
+        );
+
+        assert_eq!(
+            manifest[0].primary_type_symbol.as_deref(),
+            Some("OrderPlaced")
+        );
+        assert_eq!(manifest[0].defined_in, None);
     }
 
     // -----------------------------------------------------------------
@@ -15946,7 +16205,7 @@ mod tests {
     /// An endpoint's symbol is the type of the response it sends and a data
     /// call's is the type the call expects back, so both anchor the site's
     /// response entry. The request entry keeps no anchor and no home from the
-    /// model; enrichment anchors it from its own inference.
+    /// model; the inference fill anchors it from its own inference.
     #[test]
     fn stamp_anchors_the_response_entry_only() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -16073,9 +16332,9 @@ mod tests {
 
     /// The source casts the body it reads to a wrapper and the model named the
     /// element: the arbitration dropped the model's symbol, so the call's
-    /// response may not keep it or its home, and enrichment then anchors each
-    /// entry of the call from its own inference. Another op on the same line,
-    /// and the same op at another site, are not that call.
+    /// response may not keep it or its home, and the inference fill then
+    /// anchors each entry of the call from its own inference. Another op on
+    /// the same line, and the same op at another site, are not that call.
     #[test]
     fn restamp_lets_go_of_a_dropped_model_anchor() {
         let mut manifest = vec![
@@ -16136,7 +16395,7 @@ mod tests {
         }
 
         restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, "/repo");
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "/repo");
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -16145,7 +16404,8 @@ mod tests {
         );
         assert_eq!(
             manifest[0].defined_in, None,
-            "no home for a symbol it never had"
+            "the dropped symbol's home is not the new anchor's, and this \
+             inference reports none"
         );
         assert_eq!(
             manifest[1].primary_type_symbol.as_deref(),
@@ -16365,7 +16625,7 @@ mod tests {
         let repo_path = repo.path().to_string_lossy();
         restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
         anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, &repo_path);
 
         let home = crate::cloud_storage::TypeHome {
             file_path: "src/api.ts".to_string(),
@@ -16439,7 +16699,7 @@ mod tests {
         let repo_path = repo.path().to_string_lossy();
         restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
         anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
-        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, &repo_path);
 
         let home = |symbol: &str, line_number: u32| crate::cloud_storage::TypeHome {
             file_path: "src/envelope.ts".to_string(),
@@ -16533,12 +16793,9 @@ mod tests {
             let mut resolution = empty_resolution();
             resolution.inferred_types = vec![stated_call("Members_Response_Call1", stated)];
 
-            anchor_stated_body_roots(
-                &mut manifest,
-                &resolution.inferred_types,
-                &repo.path().to_string_lossy(),
-            );
-            enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+            let repo_path = repo.path().to_string_lossy();
+            anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
+            anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, &repo_path);
 
             assert_eq!(manifest[0].primary_type_symbol, None, "{why}");
             assert_eq!(manifest[0].defined_in, None, "{why}");

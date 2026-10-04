@@ -1084,7 +1084,8 @@ export class TypeInferrer {
       this.getNodeLocation(func),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
-      anchor.depth
+      anchor.depth,
+      this.primaryTypeSymbolSource(anchor.element)
     );
     if (provenance && provenance.length > 0) {
       inferred.any_provenance = provenance;
@@ -1449,7 +1450,8 @@ export class TypeInferrer {
       this.getNodeLocation(payloadNode),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
-      anchor.depth
+      anchor.depth,
+      this.primaryTypeSymbolSource(anchor.element)
     );
   }
 
@@ -1513,6 +1515,12 @@ export class TypeInferrer {
     const stated = recovered.statedTypeNode;
     const writtenAnchor =
       resolvedSymbol === undefined && stated ? this.writtenAnchorOf(stated) : undefined;
+    // carrick#1819: a symbol the resolved type carries has a declaration file
+    // as much as one read off the annotation does.
+    const resolvedSource =
+      resolvedSymbol !== undefined && recoveredAnchor
+        ? this.primaryTypeSymbolSource(recoveredAnchor.element)
+        : undefined;
     return this.createInferredType(
       request,
       recovered.typeString,
@@ -1521,7 +1529,7 @@ export class TypeInferrer {
       undefined,
       resolvedSymbol ?? writtenAnchor?.symbol,
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
-      writtenAnchor?.source
+      writtenAnchor ? writtenAnchor.source : resolvedSource
     );
   }
 
@@ -1749,6 +1757,20 @@ export class TypeInferrer {
     const resultIsCarrier =
       !explicitType && this.resultCarrierArguments(returnType, terminalNode) !== undefined;
 
+    // carrick#1877: the terminal holds a thenable the names do not peel, a
+    // subclass of `Promise` or a class with a `then` of its own. What a
+    // caller receives is what `await` yields for it, as it is for the
+    // `Promise<T>` the text unwrap at the end of this function peels: the
+    // class is transport. A rule that matched the type as written, a type the
+    // source states and a carrier behind the thenable have each answered
+    // already and keep their answers.
+    if (!unwrapResult.wasUnwrapped && !explicitType && !resultIsCarrier) {
+      const yielded = this.awaitedBeyondPromise(returnType);
+      if (yielded) {
+        typeString = typeText(yielded, terminalNode);
+      }
+    }
+
     // The rules verified what the carrier holds as transport and read no
     // payload out of it (`Reply<unknown>`). That is the decision carrick#1841
     // makes below, and it is decided here for the same reason: left
@@ -1913,12 +1935,22 @@ export class TypeInferrer {
     // to no single payload (union join, verified machinery) carries no
     // payloadType and anchors nothing; the wrapper's own symbol must never
     // anchor via that path.
-    const callPayloadType = this.unwrapPromiseType(callExpr.getType());
-    const callUnwrap = this.unwrapTypeWithConfig(
-      callPayloadType,
-      callExpr,
-      extractionConfig
-    );
+    //
+    // carrick#1877: the call's payload is what `await` yields for the call's
+    // type. Where no rule matched that type as the names peel it, the same
+    // protocol reading the text takes is read here, so a subclass of
+    // `Promise` anchors the row on what it resolves to and never on itself.
+    let callPayloadType = this.unwrapPromiseType(callExpr.getType());
+    let callUnwrap = this.unwrapTypeWithConfig(callPayloadType, callExpr, extractionConfig);
+    let readByProtocol = false;
+    if (!callUnwrap.wasUnwrapped) {
+      const yielded = this.awaitedBeyondPromise(callPayloadType);
+      if (yielded) {
+        callPayloadType = yielded;
+        callUnwrap = this.unwrapTypeWithConfig(yielded, callExpr, extractionConfig);
+        readByProtocol = true;
+      }
+    }
     // carrick#1376: the carrier's own symbol must never anchor either. The
     // surface pre-claims the alias from the anchor, so anchoring on the
     // carrier makes the capture emit the transport's bookkeeping as the
@@ -1930,13 +1962,14 @@ export class TypeInferrer {
     // result too. A rule for `Task` alone turns `Task<Outcome<T, E>>` into
     // `Outcome<T, E>` here, and where the terminal's read took no payload out
     // of it (an open payload, or a terminal further down a chain) the
-    // carrier's alias would otherwise be the anchor.
+    // carrier's alias would otherwise be the anchor. The same holds for a
+    // carrier the protocol reading left (carrick#1877).
     const callAfterRules = callUnwrap.wasUnwrapped ? callUnwrap.payloadType : callPayloadType;
-    const ruleLeftCarrier =
-      callUnwrap.wasUnwrapped &&
+    const leftCarrier =
+      (callUnwrap.wasUnwrapped || readByProtocol) &&
       !!callAfterRules &&
       this.resultCarrierArguments(callAfterRules, callExpr) !== undefined;
-    const anchorSource = carrierPayload ?? (ruleLeftCarrier ? undefined : callAfterRules);
+    const anchorSource = carrierPayload ?? (leftCarrier ? undefined : callAfterRules);
     let anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
       : undefined;
@@ -1996,7 +2029,8 @@ export class TypeInferrer {
       this.getNodeLocation(terminalNode),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
-      anchor?.depth
+      anchor?.depth,
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
     );
     // carrick#1749: say when the text is the source's own statement of the
     // body, and what that statement is rooted at, so the scanner can tell a
@@ -3057,12 +3091,44 @@ export class TypeInferrer {
   }
 
   /**
-   * `Future<T>` -> `T` for a promise-like of the source's own making, read off
-   * the await protocol rather than a name: a `then` whose first parameter is a
-   * callback, whose own first parameter is the value awaiting it yields.
-   * `Promise` and `PromiseLike` are peeled by `unwrapPromiseType` before this.
+   * `Future<T>` -> `T` for a thenable, read off the await protocol rather
+   * than a name: a `then` whose first parameter is a callback, whose own
+   * first parameter is the value awaiting it yields. `Promise` and
+   * `PromiseLike` are peeled by `unwrapPromiseType` before this.
+   *
+   * The callback is read through `null` and `undefined` (carrick#1877). A
+   * `then` of the source's own making declares `(value: T) => void`; the
+   * platform's declares `onfulfilled?: ((value: T) => ...) | null`, and that
+   * is the `then` a subclass of `Promise` inherits. Read as written, an
+   * optional, nullable callback has no call signature, and the subclass was
+   * not seen as a thenable at all.
+   *
+   * A `then` that cannot be called, or whose first parameter is no callback,
+   * is no protocol, and the type is returned as it is.
+   *
+   * The compiler's own awaited type arbitrates. This walk reads the first
+   * signature of `then`; the language reads all of them. Where awaiting the
+   * type and awaiting what this walk found are not the same thing to the
+   * compiler (an overloaded `then` whose first signature is not the one
+   * `await` takes), the walk did not read the protocol, and the type is
+   * returned as it is rather than published as a guess.
    */
   private unwrapThenableType(type: Type): Type {
+    const yielded = this.firstThenValue(type);
+    if (yielded === type) return type;
+    try {
+      const checker = this.project.getTypeChecker().compilerObject;
+      const awaited = checker.getAwaitedType(type.compilerType);
+      return awaited !== undefined && awaited === checker.getAwaitedType(yielded.compilerType)
+        ? yielded
+        : type;
+    } catch {
+      return type;
+    }
+  }
+
+  /** The value `then`'s first signature hands its callback, read until it stops changing. */
+  private firstThenValue(type: Type): Type {
     let current = type;
     for (let depth = 0; depth < 8; depth++) {
       const then = current.getProperty('then');
@@ -3074,7 +3140,8 @@ export class TypeInferrer {
           .getTypeAtLocation(declaration)
           .getCallSignatures()[0]
           ?.getParameters()[0]
-          ?.getTypeAtLocation(declaration);
+          ?.getTypeAtLocation(declaration)
+          .getNonNullableType();
       } catch {
         return current;
       }
@@ -3086,6 +3153,19 @@ export class TypeInferrer {
       current = value;
     }
     return current;
+  }
+
+  /**
+   * What `await` yields for `type` where the names do not say: `type` is,
+   * once `Promise` and `PromiseLike` are peeled, a thenable by the protocol
+   * (a subclass of `Promise`, a class with a `then` of its own). `undefined`
+   * where the names say it all or `type` is no thenable, so a caller keeps
+   * the reading it had (carrick#1877).
+   */
+  private awaitedBeyondPromise(type: Type): Type | undefined {
+    const named = this.unwrapPromiseType(type);
+    const yielded = this.unwrapThenableType(named);
+    return yielded === named ? undefined : yielded;
   }
 
   /**
@@ -5058,11 +5138,19 @@ export class TypeInferrer {
   /**
    * Declaration file (absolute path) of the anchor symbol
    * `primaryTypeSymbol` reports for this type, or `undefined` when the type
-   * has no user-facing anchor or no source declaration. The scanner's
-   * pub/sub two-anchor arbitration (carrick#413) uses this to re-aim a
-   * demoted explicit bundle request: the bundler resolves a `SymbolRequest`
-   * only against declarations IN its `source_file`, so the request must
-   * point at the file that actually declares the tsc-witnessed payload type.
+   * has no user-facing anchor or no source declaration. Every path that
+   * reports the symbol reports this beside it (carrick#1819): it is where a
+   * reader finds the type an anchor names. The scanner's pub/sub two-anchor
+   * arbitration (carrick#413) also uses it to re-aim a demoted explicit
+   * bundle request: the bundler resolves a `SymbolRequest` only against
+   * declarations IN its `source_file`, so the request must point at the file
+   * that actually declares the tsc-witnessed payload type.
+   *
+   * The declarations read are those of the type's own symbol, so a name
+   * imported through a barrel reports the file that declares it, and a name
+   * two files declare reports the one this type resolves to. A declaration in
+   * an installed package or a TypeScript lib is reported as it is found, as
+   * an absolute path; what a reader is shown for it is the scanner's call.
    *
    * Only declaration kinds the bundler's `validateSymbols` can resolve
    * (interface, type alias, class, enum, function, variable) count. A
