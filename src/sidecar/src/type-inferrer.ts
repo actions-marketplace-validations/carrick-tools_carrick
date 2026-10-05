@@ -41,6 +41,7 @@ import {
 import type {
   InferRequestItem,
   InferResult,
+  InferSlotTiming,
   InferredType,
   InferKind,
   SourceLocation,
@@ -54,6 +55,7 @@ import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { functionAtLine } from './function-line-index.js';
+import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -340,7 +342,9 @@ const TYPE_TEXT_FLAGS =
   ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias;
 
 function typeText(type: Type, enclosingNode?: Node): string {
-  const text = type.getText(enclosingNode, TYPE_TEXT_FLAGS);
+  // Timed as the print (carrick#1985): the type is already computed when it
+  // gets here, so this is what its length costs.
+  const text = timedPhase('print', () => type.getText(enclosingNode, TYPE_TEXT_FLAGS));
   notePrintedType(type, enclosingNode, text);
   return text;
 }
@@ -517,6 +521,12 @@ export class TypeInferrer {
    */
   private readonly readNodes = new WeakMap<SourceLocation, Node>();
   private readonly unwidenedBudgetMs: number;
+  /**
+   * The files a request has named to this inferrer, as the requests named
+   * them (carrick#1985). It lives as long as the project does, so the first
+   * request of a file is the first of the process, not of a batch.
+   */
+  private readonly filesAsked = new Set<string>();
 
   constructor(options: TypeInferrerOptions) {
     this.project = options.project;
@@ -557,8 +567,15 @@ export class TypeInferrer {
     const errors: string[] = [];
     /** Response inferences the unwidened reading re-reads (carrick#1516). */
     const responses: Array<{ request: InferRequestItem; result: InferredType }> = [];
+    /** How long each request took, in the order they were done (carrick#1985). */
+    const timings: InferSlotTiming[] = [];
 
     for (const request of requests) {
+      const slotStarted = performance.now();
+      const phasesStarted = phaseClock();
+      const firstInFile = !this.filesAsked.has(request.file_path);
+      this.filesAsked.add(request.file_path);
+      let printedLength = 0;
       try {
         // Plain JavaScript has no type annotations to extract, and `checkJs` is
         // off, so inferring against a `.js` file yields nothing useful — it only
@@ -583,6 +600,7 @@ export class TypeInferrer {
         const prints = new PrintedTypes();
         const result = prints.during(() => this.inferSingle(request, extractionConfig));
         if (result) {
+          printedLength = result.type_string.length;
           this.recordPrintedNames(result, request, prints);
           inferredTypes.push(result);
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
@@ -600,6 +618,20 @@ export class TypeInferrer {
           `Error inferring type at ${request.file_path}:${loc}: ${error}`
         );
       } finally {
+        // Before the caller is told: what it does with the news (a progress
+        // frame) is not this request's time.
+        const phases = phaseClock();
+        timings.push({
+          ...(request.alias === undefined ? {} : { alias: request.alias }),
+          file_path: request.file_path,
+          line_number: request.line_number,
+          infer_kind: request.infer_kind,
+          ms: elapsedMs(slotStarted, performance.now()),
+          type_ms: elapsedMs(phasesStarted.type, phases.type),
+          print_ms: elapsedMs(phasesStarted.print, phases.print),
+          printed_length: printedLength,
+          first_in_file: firstInFile,
+        });
         onRequestDone?.();
       }
     }
@@ -620,6 +652,7 @@ export class TypeInferrer {
     return {
       success: errors.length === 0 || inferredTypes.length > 0,
       inferred_types: inferredTypes.length > 0 ? inferredTypes : undefined,
+      timing: inferTiming(timings),
       errors: errors.length > 0 ? errors : undefined,
     };
   }
@@ -1127,7 +1160,10 @@ export class TypeInferrer {
     }
 
     const isExplicit = func.getReturnTypeNode() !== undefined;
-    const typeString = typeText(func.getReturnType(), func);
+    // The compiler call is timed apart from the print of what it returns
+    // (carrick#1985).
+    const returnType = timedPhase('type', () => func.getReturnType());
+    const typeString = typeText(returnType, func);
 
     return this.createInferredType(
       request,
@@ -1171,7 +1207,7 @@ export class TypeInferrer {
     }
 
     const isExplicit = target.param.getTypeNode() !== undefined;
-    const paramType = target.node.getType();
+    const paramType = timedPhase('type', () => target.node.getType());
     const typeString = typeText(paramType, target.node);
 
     // Deterministic anchor for the pub/sub two-anchor arbitration
