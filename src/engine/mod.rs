@@ -3846,6 +3846,12 @@ fn scan_protocol_extractions(
     let declared =
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
+    // A schema file the service excludes serves nothing (carrick#1990),
+    // unless the service also names it in `graphqlSchemas`.
+    let exclusion = crate::file_finder::Exclusion::of_service(Path::new(repo_path), service);
+    graphql.producers.retain(|op| {
+        declared.files.contains(&op.file_path) || !exclusion.excludes(&op.file_path, false)
+    });
     merge_graphql_resolver_locations(&mut graphql, file_results);
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
@@ -5842,7 +5848,12 @@ fn attach_external_call_candidates(
 ) {
     let repo_root = std::path::Path::new(repo_path);
     let started = Instant::now();
-    let sdk_rows = workspace.rows_for_service(files, repo_root);
+    // A file the service excludes states no row (carrick#1990), and the
+    // workspace pass reaches it through an import of a file that is not
+    // excluded.
+    let exclusion = crate::file_finder::Exclusion::of_service(repo_root, config);
+    let mut sdk_rows = workspace.rows_for_service(files, repo_root);
+    sdk_rows.retain(|row| !exclusion.excludes(&repo_root.join(&row.file), false));
     debug!(
         "External call candidates: workspace pass in {:.1}s",
         started.elapsed().as_secs_f64()
@@ -6552,15 +6563,21 @@ fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> V
 /// How many places a left-out line names before it counts the rest.
 const MAX_NAMED_CHECKOUTS: usize = 3;
 
-/// The checkouts a service's walk did not enter
-/// ([`crate::file_finder::git_boundary`], carrick#1902), as a reader would
-/// name them: how many, and where under the repo. `None` when there are none.
+/// What a walk left out of each kind ([`crate::file_finder::git_boundary`]),
+/// as a reader is told it.
+const CHECKOUTS: &str = "folder(s) with their own .git";
+const UNTRACKED_DOT_FOLDERS: &str = "dot folder(s) git tracks nothing in";
+
+/// The folders of one kind a service's walk did not enter
+/// ([`crate::file_finder::git_boundary`], carrick#1902, carrick#1607), as a
+/// reader would name them: how many, what they are, and where under the
+/// repo. `None` when there are none.
 ///
 /// Up to [`MAX_NAMED_CHECKOUTS`] are named one by one. More than that are
 /// counted by the folder that holds them, because that is the shape the case
 /// takes: a tool keeps its worktrees side by side in one folder, and eight
 /// paths that differ in their last segment say less than "8 in" that folder.
-fn checkouts_left_out(repo_path: &str, checkouts: &[PathBuf]) -> Option<String> {
+fn folders_left_out(repo_path: &str, checkouts: &[PathBuf], what: &str) -> Option<String> {
     if checkouts.is_empty() {
         return None;
     }
@@ -6608,7 +6625,7 @@ fn checkouts_left_out(repo_path: &str, checkouts: &[PathBuf]) -> Option<String> 
         .map(|(_, count)| count)
         .sum();
     Some(format!(
-        "{} folder(s) with their own .git: {}{}",
+        "{} {what}: {}{}",
         relative.len(),
         named.join(", "),
         if rest > 0 {
@@ -6619,11 +6636,22 @@ fn checkouts_left_out(repo_path: &str, checkouts: &[PathBuf]) -> Option<String> 
     ))
 }
 
-/// What a scan prints when a service's walk left checkouts out: how many,
+/// What a scan prints when a service's walk left folders out: how many,
 /// which, and how to scan one. A file that is missing from the index because
 /// of where it sits is never a silent decision.
-fn checkouts_left_out_line(left_out: &str) -> String {
+fn left_out_line(left_out: &str) -> String {
     format!("Left out {left_out}. Name one under \"include\" in carrick.json to scan it.")
+}
+
+/// What a scan prints when the service states `exclude` patterns
+/// (carrick#1990): how many, and how many source files they left out, so a
+/// file missing from the index is never a silent decision. Printed for a
+/// pattern that matched nothing too: that is how a mistyped one shows.
+fn excluded_line(excluded: crate::file_finder::ExcludedFiles) -> String {
+    format!(
+        "Left out {} file(s) matching the {} exclude pattern(s) in carrick.json.",
+        excluded.files, excluded.patterns
+    )
 }
 
 /// `repo_path` as every path of a scan is read from: canonical, so two runs
@@ -6702,7 +6730,13 @@ fn discover_files_and_symbols(
         service.directory.as_deref().unwrap_or("the repo root"),
         walk_started.elapsed().as_secs_f64()
     );
-    let left_out = checkouts_left_out(repo_path, &walk.checkouts_left_out);
+    let left_out: Vec<String> = [
+        folders_left_out(repo_path, &walk.checkouts_left_out, CHECKOUTS),
+        folders_left_out(repo_path, &walk.dot_folders_left_out, UNTRACKED_DOT_FOLDERS),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     // Zero files means the scan target is wrong (typo'd path, empty checkout):
     // proceeding would upload an empty service and silently erase its
@@ -6714,22 +6748,29 @@ fn discover_files_and_symbols(
         };
         // A folder of checkouts holds source and none of it is this walk's:
         // the error names them, so the fix is not searched for in the config.
-        let advice = match &left_out {
-            Some(left_out) => format!(
-                "Left out {left_out}. Scan one of them, or name it under \"include\" in \
-                 carrick.json."
-            ),
-            None => {
-                "Check the scan path and the directory/include entries in carrick.json.".to_string()
-            }
+        let advice = if walk.excluded.files > 0 {
+            format!(
+                "{} Narrow \"exclude\" in carrick.json.",
+                excluded_line(walk.excluded)
+            )
+        } else if left_out.is_empty() {
+            "Check the scan path and the directory/include entries in carrick.json.".to_string()
+        } else {
+            format!(
+                "Left out {}. Scan one of them, or name it under \"include\" in carrick.json.",
+                left_out.join("; ")
+            )
         };
         return Err(format!(
             "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
         )
         .into());
     }
-    if let Some(left_out) = &left_out {
-        info!("{}", checkouts_left_out_line(left_out));
+    for left_out in &left_out {
+        info!("{}", left_out_line(left_out));
+    }
+    if walk.excluded.patterns > 0 {
+        info!("{}", excluded_line(walk.excluded));
     }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
@@ -8972,8 +9013,8 @@ mod tests {
     fn checkouts_a_walk_left_out_are_counted_named_and_given_a_way_back() {
         let line = |checkouts: &[&str]| {
             let checkouts: Vec<PathBuf> = checkouts.iter().map(PathBuf::from).collect();
-            super::checkouts_left_out("/work/shop", &checkouts)
-                .map(|left_out| super::checkouts_left_out_line(&left_out))
+            super::folders_left_out("/work/shop", &checkouts, super::CHECKOUTS)
+                .map(|left_out| super::left_out_line(&left_out))
         };
         assert_eq!(line(&[]), None);
         // Few enough to name. A service declared at `.` walks `<repo>/./…`.
@@ -9018,6 +9059,25 @@ mod tests {
                 "Left out 6 folder(s) with their own .git: top, a/one, b/two and 3 more."
             ),
             "{scattered}"
+        );
+    }
+
+    /// carrick#1607: the dot folders a walk left out because git tracks
+    /// nothing in them, said the same way.
+    #[test]
+    fn untracked_dot_folders_a_walk_left_out_are_counted_and_named() {
+        let dirs = [
+            PathBuf::from("/work/shop/.venv"),
+            PathBuf::from("/work/shop/web/.next"),
+        ];
+        assert_eq!(
+            super::folders_left_out("/work/shop", &dirs, super::UNTRACKED_DOT_FOLDERS)
+                .map(|left_out| super::left_out_line(&left_out))
+                .as_deref(),
+            Some(
+                "Left out 2 dot folder(s) git tracks nothing in: .venv, web/.next. Name one \
+                 under \"include\" in carrick.json to scan it."
+            )
         );
     }
 
