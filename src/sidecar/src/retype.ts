@@ -36,6 +36,7 @@ import {
   type Statuses,
 } from './failure-path.js';
 import { lineIndex } from './line-index.js';
+import { typeToStringAsDeclared } from './print-type.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import type {
   InferRequestItem,
@@ -302,7 +303,16 @@ export class Retyper {
     }
     return (
       `the consumer call takes no type argument and returns ` +
-      `'${call.getType().getText(call)}', so it cannot be retyped`
+      `'${typeToStringAsDeclared(
+        call.getProject().getTypeChecker().compilerObject,
+        call.getType().compilerType,
+        call.compilerNode,
+        // ts-morph's own default for Type.getText, which this print used.
+        ts.TypeFormatFlags.UseTypeOfFunction |
+          ts.TypeFormatFlags.NoTruncation |
+          ts.TypeFormatFlags.UseFullyQualifiedType |
+          ts.TypeFormatFlags.WriteTypeArgumentsOfSignature
+      )}', so it cannot be retyped`
     );
   }
 
