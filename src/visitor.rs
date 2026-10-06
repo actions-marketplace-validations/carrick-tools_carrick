@@ -397,7 +397,7 @@ impl Visit for LexicalReceivers {
                         declared: false,
                         local_member: None,
                         origin: (!import.type_only && !type_only)
-                            .then(|| import.src.value.to_string()),
+                            .then(|| import.src.value.to_string_lossy().into_owned()),
                     },
                     ..Default::default()
                 },
@@ -418,7 +418,7 @@ impl Visit for LexicalReceivers {
                     imported_name: Some(decl.id.sym.to_string()),
                     declared: false,
                     local_member: None,
-                    origin: Some(external.expr.value.to_string()),
+                    origin: Some(external.expr.value.to_string_lossy().into_owned()),
                 },
                 ..Default::default()
             },
@@ -591,7 +591,7 @@ fn string_literal_token(raw: &str) -> Option<String> {
 /// `1_500` index as written rather than as a reconstruction of their value.
 fn literal_token(lit: &Lit) -> Option<String> {
     match lit {
-        Lit::Str(s) => string_literal_token(&s.value),
+        Lit::Str(s) => string_literal_token(&s.value.to_string_lossy()),
         Lit::Num(n) => Some(match &n.raw {
             Some(raw) => raw.to_string(),
             None if n.value.fract() == 0.0 && n.value.abs() < 1e15 => {
@@ -658,7 +658,9 @@ fn collect_pat_tokens(pat: &Pat, out: &mut Vec<String>) {
                         match &kv.key {
                             PropName::Ident(ident) => out.push(ident.sym.to_string()),
                             PropName::Str(s) => {
-                                if let Some(token) = string_literal_token(&s.value) {
+                                if let Some(token) =
+                                    string_literal_token(&s.value.to_string_lossy())
+                                {
                                     out.push(token);
                                 }
                             }
@@ -918,6 +920,18 @@ impl Visit for CalleeCollector<'_> {
         lit.visit_children_with(self);
     }
 
+    /// A JSX attribute's string value (`<Icon name="alert-circle" />`) is a
+    /// literal the parser stores in the attribute as a bare string, outside
+    /// any `Lit`, so `visit_lit` never sees it.
+    fn visit_jsx_attr_value(&mut self, value: &JSXAttrValue) {
+        if let JSXAttrValue::Str(text) = value
+            && let Some(token) = string_literal_token(&text.value.to_string_lossy())
+        {
+            self.literals.push(token);
+        }
+        value.visit_children_with(self);
+    }
+
     /// Template literals carry paths, URLs and header names as often as plain
     /// string literals do, and their static chunks are literals by any other
     /// name. The interpolations are ordinary expressions and are picked up by
@@ -925,10 +939,10 @@ impl Visit for CalleeCollector<'_> {
     fn visit_tpl(&mut self, tpl: &Tpl) {
         for quasi in &tpl.quasis {
             let raw = match &quasi.cooked {
-                Some(cooked) => cooked.as_str(),
-                None => quasi.raw.as_str(),
+                Some(cooked) => cooked.to_string_lossy(),
+                None => quasi.raw.as_str().into(),
             };
-            if let Some(token) = string_literal_token(raw) {
+            if let Some(token) = string_literal_token(&raw) {
                 self.literals.push(token);
             }
         }
@@ -995,7 +1009,7 @@ impl Default for ImportSymbolExtractor {
 
 impl Visit for ImportSymbolExtractor {
     fn visit_import_decl(&mut self, import: &ImportDecl) {
-        let source = import.src.value.to_string();
+        let source = import.src.value.to_string_lossy().into_owned();
 
         for specifier in &import.specifiers {
             match specifier {
@@ -1003,7 +1017,9 @@ impl Visit for ImportSymbolExtractor {
                     let local_name = named.local.sym.to_string();
                     let imported_name = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(str)) => str.value.to_string(),
+                        Some(ModuleExportName::Str(str)) => {
+                            str.value.to_string_lossy().into_owned()
+                        }
                         None => local_name.clone(),
                     };
                     self.imported_symbols.insert(
@@ -1465,7 +1481,7 @@ impl FunctionDefinitionExtractor {
                 ObjectPatProp::Assign(a) => a.key.sym.to_string(),
                 ObjectPatProp::KeyValue(kv) => match &kv.key {
                     PropName::Ident(i) => i.sym.to_string(),
-                    PropName::Str(s) => s.value.to_string(),
+                    PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                     _ => "_".to_string(),
                 },
                 ObjectPatProp::Rest(rest) => match &*rest.arg {
@@ -1559,7 +1575,10 @@ impl FunctionDefinitionExtractor {
     fn prop_name_to_string(key: &PropName) -> Option<String> {
         match key {
             PropName::Ident(ident) => Some(ident.sym.to_string()),
-            PropName::Str(s) if !s.value.contains('.') => Some(s.value.to_string()),
+            PropName::Str(s) => {
+                let name = s.value.to_string_lossy();
+                (!name.contains('.')).then(|| name.into_owned())
+            }
             _ => None,
         }
     }
@@ -1943,7 +1962,7 @@ impl Visit for FunctionDefinitionExtractor {
                 if let ExportSpecifier::Named(named) = spec {
                     let name = match &named.orig {
                         ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                        ModuleExportName::Str(s) => s.value.to_string(),
+                        ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
                     };
                     self.exported_names.insert(name);
                 }
@@ -2326,7 +2345,7 @@ fn extract_call_context(call: &CallExpr) -> Option<(String, Option<String>)> {
 
     // Get the first string argument if present
     let first_str = call.args.first().and_then(|arg| match &*arg.expr {
-        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
         Expr::Tpl(tpl) => {
             // Template literal — extract the first quasi
             tpl.quasis.first().map(|q| q.raw.to_string())
@@ -2387,8 +2406,14 @@ mod tests {
     };
 
     fn parse_ts(source: &str) -> (Lrc<SourceMap>, Module) {
+        parse_as(source, "input.ts")
+    }
+
+    /// Parse `source` through the production entry point, as a file named
+    /// `file_name`: the extension picks the syntax (`.tsx` reads JSX).
+    fn parse_as(source: &str, file_name: &str) -> (Lrc<SourceMap>, Module) {
         let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = tmp_dir.path().join("input.ts");
+        let file_path = tmp_dir.path().join(file_name);
         std::fs::write(&file_path, source).expect("write file");
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
@@ -2397,8 +2422,12 @@ mod tests {
     }
 
     fn extract(source: &str) -> HashMap<String, FunctionDefinition> {
-        let (cm, module) = parse_ts(source);
-        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from("test.ts"), cm);
+        extract_as(source, "test.ts")
+    }
+
+    fn extract_as(source: &str, file_name: &str) -> HashMap<String, FunctionDefinition> {
+        let (cm, module) = parse_as(source, file_name);
+        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from(file_name), cm);
         module.visit_with(&mut extractor);
         extractor.finalize_exports();
         extractor.function_definitions
@@ -3462,6 +3491,37 @@ second`): void {}
                 "{rejected:?} should not be a token: {tokens:?}"
             );
         }
+    }
+
+    /// A JSX attribute's string value is a literal like any other: the
+    /// `"alert-circle"` in `<Icon name="alert-circle" />` is what a question
+    /// about that component names. The parser puts it in the attribute as a
+    /// bare string node, outside any `Lit`, so it needs its own arm. Order is
+    /// part of the contract (the cap keeps the first tokens), so the values
+    /// must sit where the source writes them, between the literals around them.
+    #[test]
+    fn jsx_attribute_string_values_are_collected_in_source_order() {
+        let defs = extract_as(
+            "export function Banner(props) {\n\
+             \x20 const tone = \"before\";\n\
+             \x20 return <Box align=\"center\" gap={8}><Icon name=\"alert-circle\" />{\"after\"}</Box>;\n\
+             }\n",
+            "banner.tsx",
+        );
+        let tokens = &defs.get("Banner").expect("definition").tokens;
+        let position = |token: &str| {
+            tokens
+                .iter()
+                .position(|t| t == token)
+                .unwrap_or_else(|| panic!("{token} missing: {tokens:?}"))
+        };
+        assert!(
+            position("before") < position("center")
+                && position("center") < position("8")
+                && position("8") < position("alert-circle")
+                && position("alert-circle") < position("after"),
+            "literals out of source order: {tokens:?}"
+        );
     }
 
     #[test]
