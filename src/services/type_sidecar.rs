@@ -1878,6 +1878,31 @@ impl TypeSidecar {
         self
     }
 
+    /// The id of the process answering requests now (a restart replaces it).
+    pub fn pid(&self) -> u32 {
+        self.child.lock().unwrap().id()
+    }
+
+    /// Another process from the same sidecar script, with this one's
+    /// operation deadline and scan root, initialised to `repo_root` and
+    /// ready: a process for a [`crate::services::sidecar_pool::SidecarPool`]
+    /// (carrick#1996). Its program is built by its first request, as this
+    /// one's was.
+    pub fn spawn_scoped_like(
+        &self,
+        repo_root: &Path,
+        tsconfig_path: Option<&str>,
+    ) -> Result<Self, SidecarError> {
+        let sidecar =
+            Self::spawn(&self.sidecar_path)?.with_operation_timeout(self.operation_timeout);
+        if let Some(scan_root) = self.scan_root.lock().unwrap().clone() {
+            sidecar.set_scan_root(&scan_root);
+        }
+        sidecar.start_init(repo_root, tsconfig_path);
+        sidecar.wait_ready(ready_budget())?;
+        Ok(sidecar)
+    }
+
     /// Name the scanned repo's root: the upper bound of the sidecar's search
     /// for a tsconfig above a service that has none of its own (carrick#1776).
     /// Until it is set, only the service root is searched.
@@ -3240,6 +3265,35 @@ impl SidecarError {
     /// ended reads as the first of these (see [`SidecarProcess::spawn`]).
     pub fn is_process_death(&self) -> bool {
         matches!(self, SidecarError::ProcessDied | SidecarError::IoError(_))
+    }
+
+    /// Whether, after an operation failed this way, there is no process left
+    /// to ask: the next request would fail the same way, so a caller with
+    /// more to send counts it as unsent instead (the signature pass), and a
+    /// pool hands it to another process ([`SidecarPool::run`]).
+    ///
+    /// A timed-out operation has already had its process replaced by a fresh
+    /// one (carrick#1914), a frame that could not be written or read says
+    /// nothing about the process, and a failed resolution, capture or check
+    /// is the process's own answer. The rest say the process is gone or its
+    /// replacement never came up.
+    ///
+    /// [`SidecarPool::run`]: crate::services::sidecar_pool::SidecarPool::run
+    pub fn leaves_no_process(&self) -> bool {
+        match self {
+            SidecarError::Timeout
+            | SidecarError::SerializationError(_)
+            | SidecarError::DeserializationError(_)
+            | SidecarError::ResolutionFailed(_)
+            | SidecarError::CaptureFailed(_)
+            | SidecarError::CheckFailed(_) => false,
+            SidecarError::SpawnFailed(_)
+            | SidecarError::InitFailed(_)
+            | SidecarError::NotReady(_)
+            | SidecarError::ProcessDied
+            | SidecarError::IoError(_)
+            | SidecarError::Interrupted(_) => true,
+        }
     }
 }
 
