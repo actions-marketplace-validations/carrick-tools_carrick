@@ -1591,7 +1591,6 @@ pub struct PairCheckOutcome {
     pub consumer_alias: String,
     #[allow(dead_code)]
     pub producer_service: String,
-    #[allow(dead_code)]
     pub consumer_service: String,
     /// Whether this verdict is a FACT about two known types (carrick#707,
     /// R1d) — the field a structured finding's verdict state reads.
@@ -1750,6 +1749,11 @@ impl Analyzer {
 
     pub fn set_pair_outcomes(&mut self, outcomes: Vec<PairCheckOutcome>) {
         self.pair_outcomes = Some(outcomes);
+    }
+
+    /// The type check's outcomes, as stored. Empty when no check ran.
+    pub(crate) fn pair_outcomes(&self) -> &[PairCheckOutcome] {
+        self.pair_outcomes.as_deref().unwrap_or_default()
     }
 
     /// Store the merged manifest entries (all repos) for display-name mapping.
@@ -2290,7 +2294,7 @@ impl Analyzer {
                 // Extract request body fields from the handler function
                 let req_json = match &func_def.node_type {
                     FunctionNodeType::ArrowFunction(arrow) => {
-                        if let swc_ecma_ast::BlockStmtOrExpr::BlockStmt(block) = &*arrow.body {
+                        if let swc_ecma_ast::ArrowFunctionBody::FunctionBody(block) = &*arrow.body {
                             self.extract_req_body_fields(block)
                         } else {
                             None
