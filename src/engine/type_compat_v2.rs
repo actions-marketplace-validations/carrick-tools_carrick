@@ -1239,6 +1239,22 @@ fn paths_match(a: &str, b: &str) -> bool {
         .all(|(x, y)| x == y || x.starts_with(':') || y.starts_with(':'))
 }
 
+/// Whether the call has a placeholder at a position where the route states a
+/// literal segment (carrick#2004): `PATCH /things/${id}` against
+/// `PATCH /things/move`, or `POST /orgs/${id}/${target}` against every
+/// `POST /orgs/:orgId/<literal>`. The call's value there is unknown, so the
+/// pair is a guess that the call reaches this route and not another, and it
+/// is not compared. A route placeholder over a call literal is the ordinary
+/// case (`/users/:id` serves `/users/me`) and is not a guess.
+fn call_placeholder_over_route_literal(producer_path: &str, consumer_path: &str) -> bool {
+    let route = normalize_match_path(producer_path);
+    let call = normalize_match_path(consumer_path);
+    route
+        .split('/')
+        .zip(call.split('/'))
+        .any(|(route_seg, call_seg)| call_seg.starts_with(':') && !route_seg.starts_with(':'))
+}
+
 /// Producer-specificity score, ported from ts_check's `calculateMatchScore`:
 /// literal routes outrank parameterized ones for the same consumer.
 fn match_score(producer_path: &str, consumer_path: &str) -> u8 {
@@ -1299,13 +1315,23 @@ struct ServiceEntry<'a> {
     entry: &'a TypeManifestEntry,
 }
 
-/// Build check pairs from every participating repo's manifest, cross-service
-/// only (same-identity pairs are dropped by every matcher, #397/#410).
+/// Build check pairs from every participating repo's manifest.
 ///
 /// Port of the ts_check manifest-matcher pairing semantics:
 /// - HTTP: method + route-aware path match + type_kind, keeping only the
-///   most specific producer(s) per consumer.
-/// - socket/graphql/pubsub: exact operation-key match + type_kind.
+///   most specific producer(s) per consumer. A route that states a literal
+///   where the call has a placeholder is never a candidate: which route the
+///   call reaches is then unknown, and the call is not compared
+///   (carrick#2004). The consumer's own service is a
+///   candidate like any other (carrick#1945): a call to a route of its own
+///   service is a consumer of that route (carrick#1926), and the HTTP matcher
+///   keeps that edge (carrick#1944). Its routes are ranked with every
+///   sibling's by the one specificity score, so a sibling's literal route
+///   wins over the caller's own parameterized one, and the other way round.
+/// - socket/graphql/pubsub: exact operation-key match + type_kind, between
+///   two services only. The exact-key matcher drops a same-service edge for
+///   these protocols (#397/#410), so a pair here would be judged and stored
+///   against no edge.
 ///
 /// A side without a v2 capture surface produces a pair with a pre-set
 /// unverifiable verdict instead of a probe ("peer scanned without a v2 surface
@@ -1349,8 +1375,13 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
     for consumer in &consumers {
         // Candidate producers, protocol-dispatched.
         let mut candidates: Vec<(&ServiceEntry, u8)> = Vec::new();
+        // Routes the call could only be paired with by guessing its
+        // placeholder's value (carrick#2004).
+        let mut guessed: Vec<&str> = Vec::new();
         for producer in &producers {
-            if producer.service_id == consumer.service_id {
+            // One service on both ends is a pair for HTTP only (see above).
+            if producer.service_id == consumer.service_id && consumer.entry.key.as_http().is_none()
+            {
                 continue;
             }
             if producer.entry.type_kind != consumer.entry.type_kind {
@@ -1367,6 +1398,10 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                         path: cp,
                     },
                 ) if pm.eq_ignore_ascii_case(cm) && paths_match(pp, cp) => {
+                    if call_placeholder_over_route_literal(pp, cp) {
+                        guessed.push(pp.as_str());
+                        continue;
+                    }
                     candidates.push((producer, match_score(pp, cp)));
                 }
                 // Exact-key protocols: socket / graphql / pubsub.
@@ -1382,6 +1417,23 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             }
         }
         if candidates.is_empty() {
+            if !guessed.is_empty() {
+                guessed.sort_unstable();
+                guessed.dedup();
+                debug!(
+                    "v2 check: {} {} at {}:{} is not compared: its placeholder stands where {} route(s) state a literal segment ({})",
+                    consumer
+                        .entry
+                        .key
+                        .as_http()
+                        .map_or("", |(method, _)| method),
+                    consumer.entry.key.as_http().map_or("", |(_, path)| path),
+                    consumer.entry.file_path,
+                    consumer.entry.line_number,
+                    guessed.len(),
+                    guessed.join(", ")
+                );
+            }
             continue;
         }
         // HTTP specificity: keep only the best-scoring producer(s), mirroring
@@ -1687,11 +1739,49 @@ pub(crate) fn run_check(
         local_consumers,
         &mut outcomes,
     );
+    hold_back_same_service_mismatches(&mut outcomes);
 
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
     log_unresolved_pairs(&outcomes, &pairs, local_consumers);
     outcomes
+}
+
+/// Why a same-service half the check found incompatible is published as
+/// unverifiable (carrick#1945). The cloud's readers quote it, so it is one
+/// sentence, stated once.
+pub(crate) const SAME_SERVICE_MISMATCH_NOT_REPORTED: &str =
+    "a mismatch between a call and a route of its own service, which Carrick does not report yet";
+
+/// Publish every same-service pair the check found incompatible as
+/// unverifiable, saying why ([`SAME_SERVICE_MISMATCH_NOT_REPORTED`]).
+///
+/// Ruled for the first release that pairs a service with itself
+/// (carrick#1945): hand-checked on a one-service app, most of those
+/// mismatches came from the way a route's response is read (error sends
+/// joined to the success body, one handler's methods joined), not from a
+/// call that breaks. Until those causes are fixed a same-service mismatch is
+/// not a fact a pull request should fail on. A same-service `compatible`, an
+/// unverifiable half and every pair of two services are unchanged.
+///
+/// Done here, on the outcomes, because every reader starts from them: the
+/// stored verdict rows, the edges' `type_compatible`, and the findings a pull
+/// request's output is written from.
+fn hold_back_same_service_mismatches(outcomes: &mut [PairCheckOutcome]) {
+    for outcome in outcomes.iter_mut() {
+        if outcome.producer_service != outcome.consumer_service
+            || outcome.bucket != VerdictBucket::Incompatible
+        {
+            continue;
+        }
+        outcome.bucket = VerdictBucket::Unverifiable;
+        outcome.gate = Some("same_service".to_string());
+        outcome.diagnostic = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
+        outcome.resolved = false;
+        outcome.unresolved_reason = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
+        outcome.notes.clear();
+        outcome.consumer_reads.clear();
+    }
 }
 
 // ===========================================================================
@@ -1861,6 +1951,21 @@ fn retype_items<'a>(
     by_service
 }
 
+/// How many consumer calls one retype request carries (carrick#1945).
+///
+/// A service's calls used to go in one request, so one failure (an error
+/// frame, a timeout, a sidecar that died) cost every answer of the service.
+/// A one-service app that calls its own API puts hundreds of untyped calls in
+/// that request. In batches, a failure costs its own batch.
+const RETYPE_BATCH: usize = 50;
+
+/// The time one service's retype may spend across its batches: the budget
+/// the sidecar gives one request (`RETYPE_BUDGET_MS` in its `index.ts`),
+/// which bounded a service's retype while its calls went in one request. A
+/// batch is not sent once it is spent; its items abstain with the sentence
+/// the sidecar uses for an item its budget did not reach.
+const RETYPE_SERVICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Judge every HTTP response pair whose CONSUMER left the verdict unresolved
 /// by retyping the consumer's call with the producer's response type and
 /// reading the consumer file's own type-check (carrick#1491).
@@ -1880,37 +1985,77 @@ fn retype_consumer_calls(
 ) {
     let by_service = retype_items(pairs, consumer_blamed, local_consumers);
     for (service, items) in by_service {
-        let consumer = &local_consumers[service];
-        let answers = scope_to(sidecar, consumer).and_then(|()| sidecar.retype_check(&items));
-        let answers: HashMap<String, RetypeOutcome> = match answers {
-            Ok(answers) => answers
-                .into_iter()
-                .map(|answer| (answer.item_id.clone(), answer))
-                .collect(),
-            Err(e) => {
-                warn!("Retyping {service}'s consumer calls failed: {e}");
-                items
-                    .iter()
-                    .map(|item| {
-                        (
-                            item.item_id.clone(),
-                            RetypeOutcome {
-                                item_id: item.item_id.clone(),
-                                outcome: RetypeVerdict::Abstain,
-                                diagnostics: Vec::new(),
-                                reason: Some(format!("the retype check did not run: {e}")),
-                            },
-                        )
-                    })
-                    .collect()
-            }
-        };
+        let answers = retype_in_batches(
+            sidecar,
+            service,
+            &local_consumers[service],
+            &items,
+            RETYPE_BATCH,
+            RETYPE_SERVICE_BUDGET,
+        );
         for outcome in outcomes.iter_mut() {
             if let Some(answer) = answers.get(&outcome.pair_key) {
                 apply_retype(outcome, answer);
             }
         }
     }
+}
+
+/// Retype one service's items `batch` at a time, all of them within `budget`.
+///
+/// A batch that fails abstains its own items with the reason and costs no
+/// other batch's answers: the batches that finished keep theirs, and the
+/// batches after it are still sent. Each batch scopes the sidecar to the
+/// service first, which is a no-op while it is scoped and re-initialises a
+/// sidecar that was restarted after a failure.
+fn retype_in_batches(
+    sidecar: &TypeSidecar,
+    service: &str,
+    consumer: &LocalConsumer,
+    items: &[RetypeItem],
+    batch: usize,
+    budget: std::time::Duration,
+) -> HashMap<String, RetypeOutcome> {
+    let started = std::time::Instant::now();
+    let batches = items.len().div_ceil(batch.max(1));
+    let mut answers: HashMap<String, RetypeOutcome> = HashMap::new();
+    for (index, chunk) in items.chunks(batch.max(1)).enumerate() {
+        let result = if started.elapsed() >= budget {
+            Err(format!(
+                "the retype check ran out of its {}ms budget",
+                budget.as_millis()
+            ))
+        } else {
+            scope_to(sidecar, consumer)
+                .and_then(|()| sidecar.retype_check(chunk))
+                .map_err(|e| {
+                    warn!(
+                        "Retyping {service}'s consumer calls failed on batch {} of {batches}: {e}",
+                        index + 1
+                    );
+                    format!("the retype check did not run: {e}")
+                })
+        };
+        match result {
+            Ok(outcomes) => answers.extend(
+                outcomes
+                    .into_iter()
+                    .map(|answer| (answer.item_id.clone(), answer)),
+            ),
+            Err(reason) => answers.extend(chunk.iter().map(|item| {
+                (
+                    item.item_id.clone(),
+                    RetypeOutcome {
+                        item_id: item.item_id.clone(),
+                        outcome: RetypeVerdict::Abstain,
+                        diagnostics: Vec::new(),
+                        reason: Some(reason.clone()),
+                    },
+                )
+            })),
+        }
+    }
+    answers
 }
 
 /// Point the sidecar's project at the consumer service, unless it already is.
@@ -2440,6 +2585,117 @@ mod tests {
         )];
         let blamed_request = HashSet::from([request[0].spec.pair_key.clone()]);
         assert!(retype_items(&request, &blamed_request, &local).is_empty());
+    }
+
+    /// carrick#1945: a service's retype goes in batches, and a batch that
+    /// fails costs only its own items. The stand-in answers every item of a
+    /// request `agrees`, except that it fails the second request it is sent.
+    /// The batch before it keeps its answers, the batch after it is still
+    /// sent, and the failed batch's items abstain and say why.
+    ///
+    /// Sending every item in one request again fails this: all five come
+    /// back from the one failed request. A spent budget sends nothing and
+    /// abstains every item in the words the sidecar uses for its own budget.
+    #[test]
+    fn a_retype_batch_that_fails_costs_only_its_own_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+let retypes = 0;
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  retypes += 1;
+  if (retypes === 2) return write({ request_id, status: 'error', errors: ['the second batch broke'] });
+  write({ request_id, status: 'progress', phase: 'retype', message: `1 of ${request.items.length}` });
+  write({
+    request_id,
+    status: 'success',
+    outcomes: request.items.map((item) => ({ item_id: item.item_id, outcome: 'agrees', diagnostics: [] })),
+  });
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let consumer = LocalConsumer {
+            root: root.clone(),
+            tsconfig: None,
+            calls: HashMap::new(),
+        };
+        let items: Vec<RetypeItem> = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(|id| RetypeItem {
+                item_id: id.to_string(),
+                file_path: root.join("src/client.ts").display().to_string(),
+                line_number: 1,
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                producer_type: "{ id: string; }".to_string(),
+                producer_unwidened_type: None,
+                wire: true,
+            })
+            .collect();
+
+        let answers = retype_in_batches(
+            &sidecar,
+            "web",
+            &consumer,
+            &items,
+            2,
+            std::time::Duration::from_secs(600),
+        );
+        let read = |id: &str| {
+            let answer = &answers[id];
+            (answer.outcome, answer.reason.clone())
+        };
+        assert_eq!(answers.len(), 5);
+        for id in ["a", "b", "e"] {
+            assert_eq!(read(id), (RetypeVerdict::Agrees, None), "{id}");
+        }
+        for id in ["c", "d"] {
+            assert_eq!(
+                read(id),
+                (
+                    RetypeVerdict::Abstain,
+                    Some(
+                        "the retype check did not run: v2 check failed: the second batch broke"
+                            .to_string()
+                    )
+                ),
+                "{id}"
+            );
+        }
+
+        let spent = retype_in_batches(
+            &sidecar,
+            "web",
+            &consumer,
+            &items,
+            2,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(spent.len(), 5);
+        for answer in spent.values() {
+            assert_eq!(answer.outcome, RetypeVerdict::Abstain);
+            assert_eq!(
+                answer.reason.as_deref(),
+                Some("the retype check ran out of its 0ms budget")
+            );
+        }
     }
 
     /// carrick#1516: the producer's unwidened reading rides the retype item
@@ -4333,75 +4589,51 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
 
     // ---- build_check_pairs ------------------------------------------------
 
-    /// HTTP pairing is method + route-aware path + type_kind, cross-service
-    /// only, and a literal producer outranks a parameterized one for the same
-    /// consumer (the ts_check specificity rule).
+    /// HTTP keeps only the most specific producer for a consumer, and the
+    /// consumer's own service is ranked with the rest (carrick#1945): a
+    /// sibling's literal route beats the caller's own parameterized one, and
+    /// the caller's own literal route beats a sibling's parameterized one, in
+    /// which case the pair names one service twice.
     #[test]
-    fn build_pairs_http_specificity_and_cross_service_only() {
-        let key_param = OperationKey::http("GET", "/users/:id");
-        let key_literal = OperationKey::http("GET", "/users/me");
-        let consumer_key = OperationKey::http("GET", "/users/me");
-
-        let producer_repo = repo(
-            "api",
-            None,
-            vec![
-                entry(
-                    key_param.clone(),
-                    ManifestRole::Producer,
-                    ManifestTypeKind::Response,
-                    "P_param",
-                    "src/routes.ts",
-                    3,
-                    ManifestTypeState::Explicit,
-                ),
-                entry(
-                    key_literal.clone(),
-                    ManifestRole::Producer,
-                    ManifestTypeKind::Response,
-                    "P_literal",
-                    "src/routes.ts",
-                    9,
-                    ManifestTypeState::Explicit,
-                ),
-            ],
-            Some(fake_artifact()),
-        );
-        let consumer_repo = repo(
-            "web",
-            None,
-            vec![entry(
-                consumer_key.clone(),
-                ManifestRole::Consumer,
-                ManifestTypeKind::Response,
-                "C_me",
-                "src/client.ts",
-                12,
-                ManifestTypeState::Explicit,
-            )],
-            Some(fake_artifact()),
-        );
-        // A same-identity repo carrying both sides must produce no pair.
-        let self_repo = repo(
-            "web",
-            None,
-            vec![entry(
-                key_literal.clone(),
+    fn build_pairs_http_specificity_ranks_the_consumers_own_routes() {
+        let surfaced = |name: &str, entries: Vec<TypeManifestEntry>| {
+            repo(name, None, entries, Some(fake_artifact()))
+        };
+        let producer = |path: &str, alias: &str, line: u32| {
+            entry(
+                OperationKey::http("GET", path),
                 ManifestRole::Producer,
                 ManifestTypeKind::Response,
-                "P_self",
-                "src/self.ts",
-                1,
+                alias,
+                "src/routes.ts",
+                line,
                 ManifestTypeState::Explicit,
-            )],
-            Some(fake_artifact()),
+            )
+        };
+        let consumer = entry(
+            OperationKey::http("GET", "/users/me"),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            "C_me",
+            "src/client.ts",
+            12,
+            ManifestTypeState::Explicit,
         );
 
-        let pairs = build_check_pairs(&[producer_repo, consumer_repo, self_repo]);
+        // The sibling states the literal route; the caller's own is a param.
+        let pairs = build_check_pairs(&[
+            surfaced("api", vec![producer("/users/me", "P_api_literal", 9)]),
+            surfaced(
+                "web",
+                vec![producer("/users/:id", "P_web_param", 3), consumer.clone()],
+            ),
+        ]);
         assert_eq!(pairs.len(), 1, "one pair: the most specific producer wins");
         let pair = &pairs[0];
-        assert_eq!(pair.producer_alias, "P_literal");
+        assert_eq!(pair.producer_alias, "P_api_literal");
+        assert_eq!(pair.producer_service, "api");
         assert_eq!(pair.consumer_alias, "C_me");
+        assert_eq!(pair.consumer_service, "web");
         assert_eq!(pair.pseudo_method, "GET");
         assert_eq!(pair.identity, "/users/me");
         assert_eq!(pair.consumer_file, "src/client.ts");
@@ -4409,6 +4641,246 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(pair.pre_verdict.is_none());
         assert_eq!(pair.spec.protocol, ProbeProtocol::Http);
         assert_eq!(pair.spec.type_kind, ProbeTypeKind::Response);
+
+        // The caller's own route is the literal one: the pair is same-service.
+        let pairs = build_check_pairs(&[
+            surfaced("api", vec![producer("/users/:id", "P_api_param", 3)]),
+            surfaced(
+                "web",
+                vec![producer("/users/me", "P_web_literal", 9), consumer.clone()],
+            ),
+        ]);
+        assert_eq!(pairs.len(), 1, "one pair: the most specific producer wins");
+        let pair = &pairs[0];
+        assert_eq!(pair.producer_alias, "P_web_literal");
+        assert_eq!(pair.producer_service, "web");
+        assert_eq!(pair.consumer_service, "web");
+        assert_eq!(pair.spec.producer.service_name, "web");
+        assert_eq!(pair.spec.consumer.service_name, "web");
+        assert!(pair.pre_verdict.is_none());
+
+        // A one-service project: its call to its own route is paired.
+        let pairs = build_check_pairs(&[surfaced(
+            "web",
+            vec![producer("/users/:id", "P_web_param", 3), consumer],
+        )]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].producer_alias, "P_web_param");
+        assert_eq!(pairs[0].consumer_alias, "C_me");
+    }
+
+    /// carrick#1945: only a same-service `incompatible` is held back. Its
+    /// half reads unverifiable with the one sentence; a same-service
+    /// `compatible` and `unverifiable`, and a mismatch between two services,
+    /// are exactly as the check left them.
+    #[test]
+    fn a_same_service_mismatch_is_published_as_not_reported_and_nothing_else_moves() {
+        let outcome = |producer: &str, consumer: &str, bucket: VerdictBucket| PairCheckOutcome {
+            pair_key: format!("{producer}~{consumer}~{bucket:?}"),
+            pseudo_method: "GET".to_string(),
+            identity: "/api/items".to_string(),
+            consumer_file: "components/list.tsx".to_string(),
+            consumer_line: 12,
+            type_kind: ManifestTypeKind::Response,
+            bucket,
+            gate: (bucket == VerdictBucket::Unverifiable).then(|| "consumer:unknown".to_string()),
+            diagnostic: (bucket != VerdictBucket::Compatible)
+                .then(|| "the check's text".to_string()),
+            producer_alias: "P".to_string(),
+            consumer_alias: "C".to_string(),
+            producer_service: producer.to_string(),
+            consumer_service: consumer.to_string(),
+            resolved: bucket != VerdictBucket::Unverifiable,
+            unresolved_reason: (bucket == VerdictBucket::Unverifiable)
+                .then(|| "the consumer type is 'unknown'".to_string()),
+            notes: vec!["a note".to_string()],
+            consumer_reads: if bucket == VerdictBucket::Incompatible {
+                vec![14]
+            } else {
+                Vec::new()
+            },
+        };
+        let before = vec![
+            outcome("app", "app", VerdictBucket::Incompatible),
+            outcome("app", "app", VerdictBucket::Compatible),
+            outcome("app", "app", VerdictBucket::Unverifiable),
+            outcome("api", "web", VerdictBucket::Incompatible),
+        ];
+        let mut after = before.clone();
+        hold_back_same_service_mismatches(&mut after);
+
+        let held = &after[0];
+        assert_eq!(held.bucket, VerdictBucket::Unverifiable);
+        assert_eq!(held.gate.as_deref(), Some("same_service"));
+        assert_eq!(
+            held.diagnostic.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert_eq!(
+            held.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert!(!held.resolved);
+        assert!(held.notes.is_empty() && held.consumer_reads.is_empty());
+        assert_eq!(
+            format!("{:?}", &after[1..]),
+            format!("{:?}", &before[1..]),
+            "nothing else moves"
+        );
+
+        // Stored, the half reads unverifiable with the sentence, and the
+        // edge carries no mismatch.
+        let directions = crate::analyzer::PairDirections::from_outcomes(&after[..1]);
+        let edge = crate::analyzer::CrossRepoMatch {
+            producer_repo: "app".to_string(),
+            producer_key: "http|GET|/api/items".to_string(),
+            consumer_repo: "app".to_string(),
+            consumer_key: "http|GET|/api/items".to_string(),
+            consumer_location: Some("components/list.tsx:12".to_string()),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        };
+        let response = directions
+            .for_edge(&edge)
+            .response
+            .expect("the half is stored");
+        assert_eq!(
+            response.verdict,
+            crate::operation::TypeVerdict::Unverifiable
+        );
+        assert_eq!(response.reason, None);
+        assert_eq!(
+            response.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        let mut edges = vec![edge];
+        crate::analyzer::apply_pair_outcomes(&after[..1], &mut edges);
+        assert_eq!(edges[0].type_compatible, None);
+        assert_eq!(edges[0].mismatch_reason, None);
+    }
+
+    /// carrick#2004: a route that states a literal where the call has a
+    /// placeholder is never paired, because which route the call reaches is
+    /// unknown. A call path that is literal there keeps its pair, and a
+    /// placeholder route at that position is still the call's route.
+    #[test]
+    fn a_call_placeholder_over_a_route_literal_makes_no_pair() {
+        let producer = |method: &str, path: &str, alias: &str| {
+            entry(
+                OperationKey::http(method, path),
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                alias,
+                "pages/api/routes.ts",
+                1,
+                ManifestTypeState::Explicit,
+            )
+        };
+        let consumer = |method: &str, path: &str, alias: &str| {
+            entry(
+                OperationKey::http(method, path),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+                alias,
+                "components/form.tsx",
+                9,
+                ManifestTypeState::Explicit,
+            )
+        };
+        let paired = |entries: Vec<TypeManifestEntry>| -> Vec<(String, String)> {
+            build_check_pairs(&[repo("app", None, entries, Some(fake_artifact()))])
+                .into_iter()
+                .map(|pair| (pair.consumer_alias, pair.producer_alias))
+                .collect()
+        };
+        let siblings = || {
+            vec![
+                producer("POST", "/api/orgs/:orgId/folders", "P_folders"),
+                producer("POST", "/api/orgs/:orgId/documents", "P_documents"),
+                producer("POST", "/api/orgs/:orgId/agreements", "P_agreements"),
+            ]
+        };
+
+        // A placeholder last segment against three literal siblings: no pair.
+        let mut entries = siblings();
+        entries.push(consumer("POST", "/api/orgs/:id/:target", "C_target"));
+        assert_eq!(paired(entries), vec![]);
+
+        // The same call with its last segment literal keeps its one pair.
+        let mut entries = siblings();
+        entries.push(consumer("POST", "/api/orgs/:id/folders", "C_folders"));
+        assert_eq!(
+            paired(entries),
+            vec![("C_folders".to_string(), "P_folders".to_string())]
+        );
+
+        // `:id` against a literal `move` alone: no pair.
+        let move_only = vec![
+            producer("PATCH", "/api/things/move", "P_move"),
+            consumer("PATCH", "/api/things/:id", "C_thing"),
+        ];
+        assert_eq!(paired(move_only), vec![]);
+
+        // With an `:id` route beside it, the `:id` route only.
+        let both = vec![
+            producer("PATCH", "/api/things/move", "P_move"),
+            producer("PATCH", "/api/things/:thingId", "P_thing"),
+            consumer("PATCH", "/api/things/:id", "C_thing"),
+        ];
+        assert_eq!(
+            paired(both),
+            vec![("C_thing".to_string(), "P_thing".to_string())]
+        );
+    }
+
+    /// Only HTTP pairs a service with itself. The exact-key matcher drops a
+    /// same-service edge for GraphQL, socket and pub/sub (#397/#410), so a
+    /// pair of those would be judged against no edge (carrick#1945).
+    #[test]
+    fn build_pairs_exact_key_protocols_stay_between_two_services() {
+        let keys = [
+            OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, "orders"),
+            OperationKey::socket(
+                "order:placed",
+                crate::operation::SocketDirection::ClientToServer,
+            ),
+            OperationKey::pubsub("order.placed"),
+        ];
+        for key in keys {
+            let one_service = repo(
+                "orders",
+                None,
+                vec![
+                    entry(
+                        key.clone(),
+                        ManifestRole::Producer,
+                        ManifestTypeKind::Response,
+                        "P",
+                        "src/server.ts",
+                        4,
+                        ManifestTypeState::Explicit,
+                    ),
+                    entry(
+                        key.clone(),
+                        ManifestRole::Consumer,
+                        ManifestTypeKind::Response,
+                        "C",
+                        "src/client.ts",
+                        21,
+                        ManifestTypeState::Explicit,
+                    ),
+                ],
+                Some(fake_artifact()),
+            );
+            assert!(
+                build_check_pairs(&[one_service]).is_empty(),
+                "{key:?} pairs a service with itself"
+            );
+        }
     }
 
     /// Exact-key protocols pair on equal operation keys; socket/pubsub pairs
@@ -4786,6 +5258,137 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ),
         ];
         Some((sidecar, key, all_repo_data))
+    }
+
+    /// carrick#1945, end to end through the real sidecar: a service whose
+    /// calls reach its own route is checked with its one stub on both sides
+    /// of each pair, by the same judge as two services. A consumer read as
+    /// `any` is unverifiable and says why, never compatible; a consumer that
+    /// agrees is compatible; one that disagrees is found by the check and
+    /// published as unverifiable, not reported yet.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_service_paired_with_itself_is_judged_by_the_same_check() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let root = manifest_dir.join("tests/fixtures/xrepo-corpus-2/orders-engine");
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+
+        let key = OperationKey::http("GET", "/api/items");
+        let producer =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let literal = |alias: &str, type_text: &str| CaptureAnchor::Literal {
+            alias: alias.to_string(),
+            type_text: type_text.to_string(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            source_file: None,
+            printed_names: Vec::new(),
+            raw_text_read: false,
+        };
+        let mut anchors = vec![literal(&producer, "{ items: { id: string; }[]; }")];
+        let mut manifest = vec![entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            &producer,
+            "app/api/items/route.ts",
+            3,
+            ManifestTypeState::Explicit,
+        )];
+        let consumers = [
+            (10, "any"),
+            (20, "{ items: { id: string; }[]; }"),
+            (30, "{ items: { id: number; }[]; }"),
+        ];
+        for (line, type_text) in consumers {
+            let site = crate::type_manifest::build_site_id(
+                "components/list.tsx",
+                line,
+                &key,
+                root.to_str().unwrap(),
+            );
+            let alias = build_manifest_type_alias_with_site_id(
+                &key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                Some(&site),
+            );
+            anchors.push(literal(&alias, type_text));
+            manifest.push(entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                &alias,
+                "components/list.tsx",
+                line,
+                ManifestTypeState::Explicit,
+            ));
+        }
+        let (stub, artifact) = run_capture(
+            &sidecar,
+            root.to_str().unwrap(),
+            "app",
+            &anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("capture");
+        let _ = std::fs::remove_dir_all(&stub);
+        let all_repo_data = vec![repo("app", None, manifest, Some(artifact))];
+
+        let mut outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        outcomes.sort_by_key(|outcome| outcome.consumer_line);
+        // A gate that caught the `any` is stored as unverifiable too.
+        let stored = |bucket: VerdictBucket| match bucket {
+            VerdictBucket::GateCaughtBakedAny => VerdictBucket::Unverifiable,
+            other => other,
+        };
+        let read: Vec<(u32, &str, &str, VerdictBucket)> = outcomes
+            .iter()
+            .map(|o| {
+                (
+                    o.consumer_line,
+                    o.producer_service.as_str(),
+                    o.consumer_service.as_str(),
+                    stored(o.bucket),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (10, "app", "app", VerdictBucket::Unverifiable),
+                (20, "app", "app", VerdictBucket::Compatible),
+                (30, "app", "app", VerdictBucket::Unverifiable),
+            ],
+            "{outcomes:#?}"
+        );
+        // The mismatch the check found is published as not reported, and
+        // says so; nothing of the mismatch rides the half.
+        let held = &outcomes[2];
+        assert_eq!(held.gate.as_deref(), Some("same_service"));
+        assert_eq!(
+            held.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert!(!held.resolved && held.notes.is_empty() && held.consumer_reads.is_empty());
+        let any = &outcomes[0];
+        assert!(!any.resolved);
+        assert!(
+            any.unresolved_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty()),
+            "an unverifiable pair says why: {any:#?}"
+        );
+        assert!(outcomes[1].resolved, "{outcomes:#?}");
     }
 
     /// carrick#1821: when the check workspace's install fails, every pair the
