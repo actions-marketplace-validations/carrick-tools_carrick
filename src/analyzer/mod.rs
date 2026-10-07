@@ -1583,9 +1583,10 @@ pub struct PairCheckOutcome {
     pub type_kind: crate::cloud_storage::ManifestTypeKind,
     pub bucket: crate::services::type_sidecar::VerdictBucket,
     /// For gate buckets: which side and which gate fired.
-    #[allow(dead_code)]
     pub gate: Option<String>,
-    /// Scrubbed compiler diagnostic or synthesized reason.
+    /// Scrubbed compiler diagnostic or synthesized reason. On a same-service
+    /// mismatch held back as unverifiable it is still what the check found, and
+    /// only the run log reads it (carrick#2053).
     pub diagnostic: Option<String>,
     pub producer_alias: String,
     pub consumer_alias: String,
