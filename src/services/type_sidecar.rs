@@ -1158,7 +1158,11 @@ pub struct InferredType {
     /// (#306): `TimelineEvent[]` reports symbol `TimelineEvent` + depth 1.
     /// `resolve_all_types` copies this onto an explicit `SymbolRequest` for the
     /// same alias/symbol so the bundle keeps the use-site's array-ness instead
-    /// of the bare element. Absent when 0 or when there is no anchor symbol.
+    /// of the bare element. Absent when 0. Reported without an anchor symbol
+    /// too (carrick#1967): on a response read the join copies it onto the
+    /// model's symbol, which names the element the compiler printed
+    /// structurally. On a `call_result` it describes the call's result, which
+    /// is not always what `type_string` prints (a def-use walk's terminal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
     /// Declaration file (absolute path) of `primary_type_symbol`. Not every
@@ -3310,20 +3314,48 @@ fn arbitrate_stated_body(
 /// SDL list marker, #248) are never overwritten; a symbol disagreement means
 /// the anchor doesn't describe the inferred type, so the request is left
 /// untouched.
+///
+/// An element with no symbol of its own (carrick#1967) has no name to
+/// disagree with: a list of object literals, or of an alias the compiler
+/// prints structurally. On a response read the depth is the compiler's
+/// reading of the body: what a handler sends (`response_body`), or the
+/// result of the call a consumer makes (`call_result`, whose anchor is the
+/// call's result even where its text is a later read). The model's symbol
+/// names the element by schema contract, so the depth is copied. A status
+/// table the model named instead holds the list in its success row, and the
+/// bundle and the capture read that row without a depth. Not for request
+/// bodies or pub/sub payloads, which can be read at a value other than the
+/// payload (a wrapper's argument, a batch envelope).
 pub(crate) fn apply_inferred_array_depth(
     explicit: &[SymbolRequest],
     inferred: &[InferredType],
 ) -> Vec<SymbolRequest> {
     // First anchor-carrying inference per alias wins, mirroring the
-    // `or_insert` join `enrich_manifest_with_type_resolution` uses.
+    // `or_insert` join `enrich_manifest_with_type_resolution` uses. A named
+    // element decides; a response read's symbol-less one is read only where
+    // none is named.
     let mut depth_by_alias: HashMap<&str, (&str, u32)> = HashMap::new();
+    let mut unnamed_depth_by_alias: HashMap<&str, u32> = HashMap::new();
     for inf in inferred {
-        if let (Some(symbol), Some(depth)) = (inf.primary_type_symbol.as_deref(), inf.array_depth)
-            && depth > 0
-        {
-            depth_by_alias
-                .entry(inf.alias.as_str())
-                .or_insert((symbol, depth));
+        let Some(depth) = inf.array_depth.filter(|d| *d > 0) else {
+            continue;
+        };
+        match inf.primary_type_symbol.as_deref() {
+            Some(symbol) => {
+                depth_by_alias
+                    .entry(inf.alias.as_str())
+                    .or_insert((symbol, depth));
+            }
+            None if matches!(
+                inf.infer_kind,
+                InferKind::ResponseBody | InferKind::CallResult
+            ) =>
+            {
+                unnamed_depth_by_alias
+                    .entry(inf.alias.as_str())
+                    .or_insert(depth);
+            }
+            None => {}
         }
     }
 
@@ -3331,12 +3363,18 @@ pub(crate) fn apply_inferred_array_depth(
         .iter()
         .cloned()
         .map(|mut req| {
-            if req.array_depth.is_none()
-                && let Some(alias) = req.alias.as_deref()
-                && let Some((symbol, depth)) = depth_by_alias.get(alias)
-                && *symbol == req.symbol_name
-            {
-                req.array_depth = Some(*depth);
+            if req.array_depth.is_some() {
+                return req;
+            }
+            let Some(alias) = req.alias.as_deref() else {
+                return req;
+            };
+            let depth = match depth_by_alias.get(alias) {
+                Some((symbol, depth)) => (*symbol == req.symbol_name).then_some(*depth),
+                None => unnamed_depth_by_alias.get(alias).copied(),
+            };
+            if depth.is_some() {
+                req.array_depth = depth;
             }
             req
         })
@@ -4988,6 +5026,60 @@ mod tests {
         let adjusted = apply_inferred_array_depth(&explicit, &inferred);
 
         assert_eq!(adjusted[0].array_depth, None);
+    }
+
+    /// carrick#1967: a handler sends, or a consumer's call returns, a list
+    /// whose element has no symbol of its own (`rows.map(r => ({ ... }))`, or
+    /// an alias the compiler prints structurally). The model names the
+    /// element; the depth is copied onto it. A request body or a pub/sub
+    /// payload's symbol-less depth is not read. A named element at the same
+    /// alias still decides.
+    #[test]
+    fn inferred_array_depth_copies_a_response_reads_unnamed_list() {
+        let read = |kind: InferKind, symbol: Option<&str>| InferredType {
+            infer_kind: kind,
+            ..inferred("Alias_Response", symbol, Some(1))
+        };
+        let depth_after = |answers: Vec<InferredType>| {
+            apply_inferred_array_depth(
+                &[symbol_request("ItemDto", "Alias_Response", None)],
+                &answers,
+            )[0]
+            .array_depth
+        };
+
+        assert_eq!(
+            depth_after(vec![read(InferKind::ResponseBody, None)]),
+            Some(1)
+        );
+        assert_eq!(
+            depth_after(vec![read(InferKind::CallResult, None)]),
+            Some(1)
+        );
+        for kind in [
+            InferKind::RequestBody,
+            InferKind::FunctionParam,
+            InferKind::Expression,
+            InferKind::FunctionReturn,
+        ] {
+            let label = format!("{kind:?}");
+            assert_eq!(depth_after(vec![read(kind, None)]), None, "{label}");
+        }
+        assert_eq!(
+            depth_after(vec![
+                read(InferKind::ResponseBody, None),
+                read(InferKind::ResponseBody, Some("SomethingElse")),
+            ]),
+            None,
+            "a named element decides over an unnamed one"
+        );
+        assert_eq!(
+            depth_after(vec![
+                read(InferKind::ResponseBody, None),
+                read(InferKind::ResponseBody, Some("ItemDto")),
+            ]),
+            Some(1)
+        );
     }
 
     /// A scalar inference (no array_depth on the wire) and a different-alias

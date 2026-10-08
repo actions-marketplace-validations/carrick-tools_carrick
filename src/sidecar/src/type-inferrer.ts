@@ -8349,12 +8349,11 @@ export class TypeInferrer {
       infer_kind: request.infer_kind,
       payload_type_string: payloadTypeString,
       primary_type_symbol: primaryTypeSymbol,
-      // Only meaningful relative to the anchor symbol: without an element
-      // symbol there is nothing for the explicit-bundle correction to match.
-      array_depth:
-        primaryTypeSymbol !== undefined && arrayDepth !== undefined && arrayDepth > 0
-          ? arrayDepth
-          : undefined,
+      // Reported whether or not the element has a symbol (carrick#1967): an
+      // array whose element prints structurally is still a list. The Rust
+      // depth join copies it onto the model's symbol when the symbols agree,
+      // or, at a handler's send, when the element has no symbol to disagree.
+      array_depth: arrayDepth !== undefined && arrayDepth > 0 ? arrayDepth : undefined,
       // Same gate: a declaration source without an anchor symbol is useless.
       primary_type_symbol_source:
         primaryTypeSymbol !== undefined ? primaryTypeSymbolSource : undefined,

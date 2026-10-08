@@ -227,8 +227,14 @@ pub(crate) fn unwidened_alias(alias: &str) -> String {
 /// A symbol the answer names beside the bare top type is not part of the
 /// question. Whether that symbol witnesses an anchor is asked of the anchor's
 /// own symbol, by [`Sightings::none_of`].
+///
+/// An array level counts only beside an element symbol. A `call_result`
+/// reports the depth of the call's result even where its text is a decayed
+/// read of something after it, and a depth with no element named says nothing
+/// of the symbol this is asked about (carrick#1967).
 fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
-    inf.array_depth.is_none() && text_is_bare_top_type(&inf.type_string)
+    let peeled_a_named_list = inf.primary_type_symbol.is_some() && inf.array_depth.is_some();
+    !peeled_a_named_list && text_is_bare_top_type(&inf.type_string)
 }
 
 /// What the deterministic inferences saw at each alias, asked of one model
@@ -5176,6 +5182,33 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
         assert!(!texts.contains_key("C"), "poisoned texts never backfill");
         assert_eq!(texts.get("D").map(String::as_str), Some("{ ok: boolean; }"));
+    }
+
+    /// carrick#1967: the sidecar reports an array level whether or not the
+    /// element has a symbol, and the level can describe a value other than
+    /// the one the text prints (a call's result beside a decayed read). Where
+    /// the depth join copied nothing onto the request, a depth with no element
+    /// named is no sighting of the model symbol: a read that decayed to a bare
+    /// top type still withholds the symbol anchor, as it did before.
+    #[test]
+    fn an_unnamed_depth_beside_a_decayed_read_is_no_sighting() {
+        let alias = "Endpoint_orders_Request";
+        let mut read = inferred(alias, "unknown", None, Some(1));
+        read.infer_kind = InferKind::RequestBody;
+        let anchors = derive_capture_anchors(
+            &[order_explicit(alias)],
+            &[response_body_infer(alias)],
+            &[],
+            &[read],
+            &[],
+            "/repo",
+        );
+        assert!(
+            !anchors
+                .iter()
+                .any(|anchor| matches!(anchor, CaptureAnchor::Symbol { .. })),
+            "{anchors:?}"
+        );
     }
 
     // ---- build_check_pairs ------------------------------------------------
