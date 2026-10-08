@@ -2823,6 +2823,8 @@ class DeclarationReader {
    * repository checked out under a `node_modules` ancestor, is not installed.
    * An install hoisted above the service root (`../../node_modules/pkg`) and
    * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are.
+   * Mirrored by `installedPackageDirectory` in capture/, which the capture
+   * seam keeps from being shared.
    */
   private installedPackage(fileName: string): InstalledPackage | undefined {
     const segments = path.relative(this.root, this.realpath(fileName)).split(path.sep);
