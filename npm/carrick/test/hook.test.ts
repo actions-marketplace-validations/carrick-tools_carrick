@@ -47,31 +47,26 @@ test("MultiEdit payloads name their file the other way round", async (t) => {
   assert.match(run.stdout, /additionalContext/);
 });
 
-test("a file with no indexed rows still gets the boundary", async (t) => {
+test("a file with no indexed rows prints the header and no service-wide boundary", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
 
-  const clean = await runHook("post-edit.ts", {
-    payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-clean.json") }),
-  });
-  assert.equal(clean.code, 0);
-  const context = (
-    JSON.parse(clean.stdout) as { hookSpecificOutput: { additionalContext: string } }
-  ).hookSpecificOutput.additionalContext;
-  assert.match(context, /A local index holds what the deterministic passes state/);
+  for (const name of ["check-clean.json", "check-silent.json"]) {
+    const run = await runHook("post-edit.ts", {
+      payload: editPayload(workspace),
+      env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath(name) }),
+    });
+    assert.equal(run.code, 0, name);
+    const context = (
+      JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }
+    ).hookSpecificOutput.additionalContext;
+    assert.match(context, /^Carrick checked .+ against the workspace index \(user-service, indexed at 6a1b2c3\)\.$/, name);
+  }
 });
 
-test("the hook is silent when there is nothing to say", async (t) => {
+test("the hook is silent when the index cannot answer", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
-
-  const silent = await runHook("post-edit.ts", {
-    payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
-  });
-  assert.equal(silent.stdout, "");
-  assert.equal(silent.code, 0);
 
   const notIndexed = await runHook("post-edit.ts", {
     payload: editPayload(workspace),
@@ -556,4 +551,66 @@ test("the Codex hook is silent with nothing recorded, no session, or the channel
     env: fakeEnv({ HOME: home, CARRICK_CHANNEL: "off" }),
   });
   assert.equal(off.stdout, "");
+});
+
+// ---------------------------------------------------------------------------
+// Who uses the edited file (carrick#2067): shown once per file per session.
+
+function contextOf(stdout: string): string {
+  if (!stdout) return "";
+  return (JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } })
+    .hookSpecificOutput.additionalContext;
+}
+
+const USES_LINE =
+  "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
+
+test("a file's uses lines are shown once per session, and the header every time", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
+  const edit = (session?: string) =>
+    runHook("post-edit.ts", {
+      payload: session ? { ...editPayload(workspace), session_id: session } : editPayload(workspace),
+      env,
+    });
+
+  const first = contextOf((await edit("sess-u1")).stdout);
+  const second = contextOf((await edit("sess-u1")).stdout);
+  assert.ok(first.includes(USES_LINE), first);
+  assert.ok(second.startsWith("Carrick checked "), second);
+  assert.equal(second.includes(USES_LINE), false, second);
+  assert.equal(second, first.split("\n")[0]);
+
+  // Another session has not been shown them.
+  assert.ok(contextOf((await edit("sess-u2")).stdout).includes(USES_LINE));
+  // With no session to remember them in, every edit shows them.
+  assert.ok(contextOf((await edit()).stdout).includes(USES_LINE));
+  assert.ok(contextOf((await edit()).stdout).includes(USES_LINE));
+});
+
+test("a channel that prints nothing remembers nothing as shown", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const payload = { ...editPayload(workspace), session_id: "sess-u3" };
+  const fixture = fixturePath("check-uses.json");
+
+  const lsp = await runHook("post-edit.ts", {
+    payload,
+    env: fakeEnv({ HOME: home, CARRICK_CHANNEL: "lsp", CARRICK_FAKE_FIXTURE: fixture }),
+  });
+  assert.equal(lsp.stdout, "");
+  const record = path.join(home, ".carrick", "sessions", "sess-u3.json");
+  const told = fs.existsSync(record)
+    ? ((JSON.parse(fs.readFileSync(record, "utf8")) as { told?: string[] }).told ?? [])
+    : [];
+  assert.deepEqual(told, []);
+
+  const hook = await runHook("post-edit.ts", {
+    payload,
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixture }),
+  });
+  assert.ok(contextOf(hook.stdout).includes(USES_LINE));
 });

@@ -212,6 +212,83 @@ pub(crate) fn unwidened_alias(alias: &str) -> String {
     format!("{alias}_Unwidened")
 }
 
+/// The capture alias that carries one case of a response alias's modes
+/// (carrick#2054): the union the handler sends when the incoming message's
+/// field `read` holds `value`, or any value no other case names (`None`).
+/// Captured beside the published type like [`unwidened_alias`], and never a
+/// manifest alias of its own.
+pub(crate) fn mode_alias(
+    alias: &str,
+    read: &crate::services::type_sidecar::MessageRead,
+    value: Option<&str>,
+) -> String {
+    match value {
+        Some(value) => format!(
+            "{alias}_Mode{:016x}",
+            crate::type_manifest::fnv1a_hash(&format!(
+                "{}|{}|{}",
+                read.location.as_str(),
+                read.field,
+                value
+            ))
+        ),
+        None => format!("{alias}_ModeOther"),
+    }
+}
+
+/// The response modes of each alias, taken from the same inference that
+/// supplies its published text (the first usable one, as
+/// [`derive_capture_anchors`] takes it), with each case's capture alias and
+/// text (carrick#2054). A case whose text is unusable is left out, and a
+/// union with modes but no usable case keeps its `reads`.
+pub(crate) fn inferred_response_modes(
+    inferred: &[crate::services::type_sidecar::InferredType],
+) -> HashMap<&str, (crate::cloud_storage::ResponseModes, Vec<&str>)> {
+    let mut first: HashSet<&str> = HashSet::new();
+    let mut modes = HashMap::new();
+    for inf in inferred {
+        if usable_inferred_text(&inf.type_string).is_none() || !first.insert(inf.alias.as_str()) {
+            continue;
+        }
+        let Some(read_modes) = inf.response_modes.as_ref() else {
+            continue;
+        };
+        if read_modes.reads.is_empty() {
+            continue;
+        }
+        let placed = match read_modes.reads.as_slice() {
+            [read] if read.location != crate::services::type_sidecar::MessageSource::Unplaced => {
+                Some(read)
+            }
+            _ => None,
+        };
+        let mut cases = Vec::new();
+        let mut texts = Vec::new();
+        for case in placed.map_or(&[][..], |_| read_modes.cases.as_slice()) {
+            let (Some(read), Some(text)) = (placed, usable_inferred_text(&case.type_string)) else {
+                continue;
+            };
+            cases.push(crate::cloud_storage::ResponseModeCase {
+                value: case.value.clone(),
+                alias: mode_alias(&inf.alias, read, case.value.as_deref()),
+                expanded: None,
+            });
+            texts.push(text);
+        }
+        modes.insert(
+            inf.alias.as_str(),
+            (
+                crate::cloud_storage::ResponseModes {
+                    reads: read_modes.reads.clone(),
+                    cases,
+                },
+                texts,
+            ),
+        );
+    }
+    modes
+}
+
 /// True when an inference for an alias READ NO SHAPE: tsc resolved the use
 /// site to a bare `any`/`unknown` and peeled no array level off it. This is
 /// not "the type is scalar"; it is "the compiler could not see the type at
@@ -473,6 +550,36 @@ pub(crate) fn derive_capture_anchors(
             }
         }
     }
+    let modes = inferred_response_modes(inferred);
+    // carrick#2054: each case of an alias's modes, captured once, beside
+    // whichever anchor publishes the alias.
+    let mut moded: HashSet<&str> = HashSet::new();
+    let mut mode_anchors = |alias: &str, request: &InferRequestItem| -> Vec<CaptureAnchor> {
+        let Some((alias, (found, texts))) = modes.get_key_value(alias) else {
+            return Vec::new();
+        };
+        if !moded.insert(*alias) {
+            return Vec::new();
+        }
+        let names = printed_names
+            .get(alias)
+            .map_or_else(Vec::new, |names| names.to_vec());
+        let mut anchors: Vec<CaptureAnchor> = found
+            .cases
+            .iter()
+            .zip(texts)
+            .map(|(case, text)| CaptureAnchor::Literal {
+                alias: case.alias.clone(),
+                type_text: (*text).to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: Some(repo_relative(&request.file_path, repo_root)),
+                printed_names: names.clone(),
+                raw_text_read: false,
+            })
+            .collect();
+        anchors.sort_by(|a, b| a.alias().cmp(b.alias()));
+        anchors
+    };
     let sightings = Sightings::of(inferred);
     let decided: HashSet<&str> = inferred
         .iter()
@@ -530,6 +637,9 @@ pub(crate) fn derive_capture_anchors(
             continue;
         };
         if !seen.insert(alias.to_string()) {
+            // A symbol anchor publishes the alias; its modes are still what
+            // the handler sends for each value.
+            anchors.extend(mode_anchors(alias, request));
             continue;
         }
         // Kind-aware v1 inference result wins over a raw locator re-run.
@@ -556,6 +666,7 @@ pub(crate) fn derive_capture_anchors(
                 raw_text_read: raw_text.contains(alias),
             });
             anchors.extend(unwidened);
+            anchors.extend(mode_anchors(alias, request));
             continue;
         }
         // The inferrer decided there is no contract here; a raw locator re-run
@@ -1314,12 +1425,172 @@ pub(crate) struct BuiltPair {
     /// The consumer's published type for the same kind. With the producer's,
     /// it says whether either side states a request body at all.
     pub consumer_expanded: Option<String>,
+    /// Set when the producer's response depends on a field of the incoming
+    /// message and the call states no value that picks one case
+    /// (carrick#2054): why a mismatch on this pair is not reported. The pair
+    /// is still judged against the whole union, and only an incompatible
+    /// verdict is published unverifiable ([`abstain_on_unstated_modes`]).
+    pub unstated_mode: Option<String>,
+}
+
+/// What a call's stated message picks from a producer response's modes
+/// (carrick#2054).
+#[derive(Debug, PartialEq, Eq)]
+enum ModeSelection<'a> {
+    /// The response does not depend on the message: judged as published.
+    NoModes,
+    /// The call states the value of the one field the handler reads, and the
+    /// handler has a body for it: judged against that case alone.
+    Narrowed(&'a crate::cloud_storage::ResponseModeCase, &'a str),
+    /// The response depends on the message and nothing the call states
+    /// picks one case. The reason says why.
+    Unstated(String),
+}
+
+/// The sentence a call reads when the route's response depends on the value
+/// of one field of the request and the call states none of the values the
+/// handler distinguishes (carrick#2054).
+fn mode_unstated_reason(field: &str, cases: &[crate::cloud_storage::ResponseModeCase]) -> String {
+    let values = cases
+        .iter()
+        .filter_map(|case| case.value.as_deref())
+        .map(|value| format!("`{value}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Not compared: this route returns a different response for each value of `{field}` in the request ({values}), and this call does not set `{field}` to one of them."
+    )
+}
+
+/// Pick the case of `modes` a call that states `stated` receives
+/// (carrick#2054).
+///
+/// - No modes, or modes that read no field: [`ModeSelection::NoModes`].
+/// - One placed field with cases: the case the stated value names, else the
+///   case for any other value. A value with no case, or no value stated in
+///   the field's own location, is unstated.
+/// - Anything else (an unplaced read, two fields, a field whose values the
+///   handler tests in a way not read), or a case the capture could not
+///   publish: unstated, since no case can be told apart from the others.
+fn select_mode<'a>(
+    modes: Option<&'a crate::cloud_storage::ResponseModes>,
+    stated: &crate::cloud_storage::StatedValues,
+) -> ModeSelection<'a> {
+    let Some(modes) = modes.filter(|modes| !modes.reads.is_empty()) else {
+        return ModeSelection::NoModes;
+    };
+    let fields = || {
+        let mut fields: Vec<&str> = modes.reads.iter().map(|read| read.field.as_str()).collect();
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    };
+    let read = match modes.reads.as_slice() {
+        [read]
+            if read.location != crate::services::type_sidecar::MessageSource::Unplaced
+                && !modes.cases.is_empty() =>
+        {
+            read
+        }
+        _ => return ModeSelection::Unstated(case_unknown_reason(&fields())),
+    };
+    let value = stated
+        .get(&read.location)
+        .and_then(|values| values.get(&read.field));
+    let case = value.and_then(|value| {
+        modes
+            .cases
+            .iter()
+            .find(|case| case.value.as_deref() == Some(value.as_str()))
+            .or_else(|| modes.cases.iter().find(|case| case.value.is_none()))
+    });
+    match case {
+        Some(case) => match case.expanded.as_deref() {
+            Some(expanded) => ModeSelection::Narrowed(case, expanded),
+            None => ModeSelection::Unstated(case_unknown_reason(&fields())),
+        },
+        None => ModeSelection::Unstated(mode_unstated_reason(&read.field, &modes.cases)),
+    }
 }
 
 struct ServiceEntry<'a> {
     service_id: &'a str,
     has_surface: bool,
     entry: &'a TypeManifestEntry,
+    /// The dispatch case of every row this entry stands for (carrick#831):
+    /// on a producer, each case the route answers at this site (several cases
+    /// with no site of their own share the route's, and so its alias); on a
+    /// consumer, the case each call at this site sends. `[None]` is a plain
+    /// route, or a call that states no case, which is nearly every entry.
+    cases: Vec<Option<&'a crate::dispatch::Dispatch>>,
+}
+
+/// The sentence a call to a route that dispatches on a request field reads
+/// when the call states no case (carrick#2059). The analyzer keeps its edge
+/// to the route with the case unknown (`carrick_match::dispatch_outcome`), so
+/// the half is stored, and nothing was compared.
+fn case_unknown_reason(fields: &[&str]) -> String {
+    let fields = fields
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "Not compared: this route returns a different response depending on {fields} in the request, and Carrick cannot tell which one this call receives."
+    )
+}
+
+/// Each HTTP row's dispatch case, by the site and operation a manifest entry
+/// names. Joined on `(file, line, method, path)`, the identity
+/// [`build_type_manifest_entries`](crate::engine) builds the entry from.
+type CasesBySite<'a> =
+    HashMap<(String, u32, String, String), Vec<Option<&'a crate::dispatch::Dispatch>>>;
+
+fn cases_by_site(rows: &[crate::analyzer::ApiEndpointDetails]) -> CasesBySite<'_> {
+    let mut by_site: CasesBySite = HashMap::new();
+    for row in rows {
+        let Some((method, path)) = row.key.as_http() else {
+            continue;
+        };
+        let (file, line) =
+            crate::type_manifest::parse_file_location(&row.file_path.to_string_lossy());
+        by_site
+            .entry((
+                file,
+                line,
+                crate::type_manifest::normalize_manifest_method(method),
+                path.to_string(),
+            ))
+            .or_default()
+            .push(row.dispatch.as_ref());
+    }
+    by_site
+}
+
+/// What one candidate producer entry answers a consumer entry about the
+/// dispatch case, folded over the cases on each side
+/// (`carrick_match::dispatch_verdict`): any pair of cases that matches, or a
+/// producer that does not dispatch, is a match; else any case the call leaves
+/// unknown is unknown; else the call states a value no case here answers.
+fn entry_dispatch_verdict(
+    producer: &ServiceEntry,
+    consumer: &ServiceEntry,
+) -> carrick_match::DispatchVerdict {
+    use carrick_match::DispatchVerdict;
+    let key = |case: &Option<&crate::dispatch::Dispatch>| crate::dispatch::Dispatch::key_of(*case);
+    let mut verdict = DispatchVerdict::ValueMismatch;
+    for producer_case in &producer.cases {
+        for consumer_case in &consumer.cases {
+            match carrick_match::dispatch_verdict(key(producer_case), key(consumer_case)) {
+                DispatchVerdict::Matched | DispatchVerdict::NotDispatching => {
+                    return DispatchVerdict::Matched;
+                }
+                DispatchVerdict::ValueUnknown => verdict = DispatchVerdict::ValueUnknown,
+                DispatchVerdict::ValueMismatch => {}
+            }
+        }
+    }
+    verdict
 }
 
 /// Build check pairs from every participating repo's manifest.
@@ -1335,6 +1606,12 @@ struct ServiceEntry<'a> {
 ///   keeps that edge (carrick#1944). Its routes are ranked with every
 ///   sibling's by the one specificity score, so a sibling's literal route
 ///   wins over the caller's own parameterized one, and the other way round.
+///   Among those, a route that dispatches on a request field is decided case
+///   by case as the analyzer's matcher decides it
+///   (`carrick_match::dispatch_outcome`, carrick#2059): a call is paired with
+///   the case it sends, a call that sends a value no case answers is not
+///   paired, and a call that states no case gets one half per kind, stored
+///   unverifiable without a probe.
 /// - socket/graphql/pubsub: exact operation-key match + type_kind, between
 ///   two services only. The exact-key matcher drops a same-service edge for
 ///   these protocols (#397/#410), so a pair here would be judged and stored
@@ -1365,15 +1642,31 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         let Some(entries) = repo.type_manifest.as_ref() else {
             continue;
         };
+        let endpoint_cases = cases_by_site(&repo.endpoints);
+        let call_cases = cases_by_site(&repo.calls);
         for entry in entries {
-            let target = match entry.role {
-                ManifestRole::Producer => &mut producers,
-                ManifestRole::Consumer => &mut consumers,
+            let (target, rows) = match entry.role {
+                ManifestRole::Producer => (&mut producers, &endpoint_cases),
+                ManifestRole::Consumer => (&mut consumers, &call_cases),
             };
+            let cases = entry
+                .key
+                .as_http()
+                .and_then(|(method, path)| {
+                    rows.get(&(
+                        entry.file_path.clone(),
+                        entry.line_number,
+                        method.to_string(),
+                        path.to_string(),
+                    ))
+                })
+                .cloned()
+                .unwrap_or_else(|| vec![None]);
             target.push(ServiceEntry {
                 service_id,
                 has_surface,
                 entry,
+                cases,
             });
         }
     }
@@ -1446,13 +1739,59 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         // HTTP specificity: keep only the best-scoring producer(s), mirroring
         // routing semantics (a literal route wins over :param).
         let best = candidates.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        // Then the dispatch case, as the analyzer's matcher decides it after
+        // the same specificity filter (carrick#2059): the check pairs a call
+        // with exactly the producers its edge reaches, so a half it judges is
+        // a half the index stores.
+        let mut matched: Vec<&ServiceEntry> = Vec::new();
+        let mut case_unknown: Vec<&ServiceEntry> = Vec::new();
+        let mut case_mismatched = 0u32;
         for (producer, score) in candidates {
             if score != best {
                 continue;
             }
-            if let Some(pair) = build_pair(producer, consumer) {
-                pairs.push(pair);
+            match entry_dispatch_verdict(producer, consumer) {
+                carrick_match::DispatchVerdict::ValueUnknown => case_unknown.push(producer),
+                carrick_match::DispatchVerdict::ValueMismatch => case_mismatched += 1,
+                _ => matched.push(producer),
             }
+        }
+        match carrick_match::dispatch_outcome(
+            matched.len() as u32,
+            case_unknown.len() as u32,
+            case_mismatched,
+        ) {
+            carrick_match::DispatchOutcome::Matched => {
+                pairs.extend(
+                    matched
+                        .into_iter()
+                        .filter_map(|producer| build_pair(producer, consumer)),
+                );
+            }
+            // The call keeps one edge to the route with its case unknown, so
+            // it gets one half per kind, stored unverifiable without a probe:
+            // which case's type to compare against is the thing not known.
+            carrick_match::DispatchOutcome::RouteCaseUnknown => {
+                case_unknown.sort_by(|a, b| {
+                    (a.service_id, &a.entry.type_alias).cmp(&(b.service_id, &b.entry.type_alias))
+                });
+                let mut fields: Vec<&str> = case_unknown
+                    .iter()
+                    .flat_map(|producer| producer.cases.iter().flatten())
+                    .map(|case| case.field.as_str())
+                    .collect();
+                fields.sort_unstable();
+                fields.dedup();
+                if let Some(mut pair) = build_pair(case_unknown[0], consumer) {
+                    pair.pre_verdict =
+                        Some((VerdictBucket::Unverifiable, case_unknown_reason(&fields)));
+                    pair.pre_verdict_side = None;
+                    pairs.push(pair);
+                }
+            }
+            // A value no case answers, as the matcher: no edge, so no pair.
+            carrick_match::DispatchOutcome::NoCaseAnswers
+            | carrick_match::DispatchOutcome::NotMatched => {}
         }
     }
 
@@ -1527,6 +1866,29 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         None
     };
 
+    // carrick#2054: a response the handler chooses by a field of the
+    // incoming message is judged against the case the call states. The pair
+    // keeps the published alias's key, so its verdict lands where every other
+    // verdict for this call does.
+    let mut probed_alias = producer.entry.type_alias.clone();
+    let mut producer_expanded = producer.entry.expanded_definition.clone();
+    let mut producer_unwidened = producer.entry.unwidened_definition.clone();
+    let mut unstated_mode = None;
+    if producer.entry.type_kind == ManifestTypeKind::Response {
+        match select_mode(
+            producer.entry.response_modes.as_ref(),
+            &consumer.entry.stated_values,
+        ) {
+            ModeSelection::NoModes => {}
+            ModeSelection::Narrowed(case, expanded) => {
+                probed_alias = case.alias.clone();
+                producer_expanded = Some(expanded.to_string());
+                producer_unwidened = None;
+            }
+            ModeSelection::Unstated(reason) => unstated_mode = Some(reason),
+        }
+    }
+
     Some(BuiltPair {
         spec: CheckPairSpec {
             pair_key,
@@ -1534,7 +1896,7 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
             type_kind,
             producer: CheckPairEndpoint {
                 service_name: producer.service_id.to_string(),
-                alias: producer.entry.type_alias.clone(),
+                alias: probed_alias,
             },
             consumer: CheckPairEndpoint {
                 service_name: consumer.service_id.to_string(),
@@ -1552,9 +1914,10 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         consumer_service: consumer.service_id.to_string(),
         pre_verdict,
         pre_verdict_side,
-        producer_expanded: producer.entry.expanded_definition.clone(),
-        producer_unwidened: producer.entry.unwidened_definition.clone(),
+        producer_expanded,
+        producer_unwidened,
         consumer_expanded: consumer.entry.expanded_definition.clone(),
+        unstated_mode,
     })
 }
 
@@ -1746,12 +2109,49 @@ pub(crate) fn run_check(
         local_consumers,
         &mut outcomes,
     );
+    abstain_on_unstated_modes(&pairs, &mut outcomes);
     hold_back_same_service_mismatches(&mut outcomes);
 
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
     log_unresolved_pairs(&outcomes, &pairs, local_consumers);
     outcomes
+}
+
+/// The gate a mismatch against a response whose case the call does not
+/// state is stamped with (carrick#2054).
+const UNSTATED_MODE_GATE: &str = "producer:mode";
+
+/// Publish every pair [`BuiltPair::unstated_mode`] marks that the check found
+/// incompatible as unverifiable, with the pair's reason (carrick#2054).
+///
+/// The producer's handler sends a different body for each value of a field
+/// of the incoming message, and the call states no value that picks one, so
+/// the pair was judged against the union of them all. A read that fails
+/// against that union may be a read of the case this call receives: not a
+/// break anyone can act on. A compatible pair holds for every case and is
+/// kept. Like [`hold_back_same_service_mismatches`], what the check found
+/// stays as the outcome's `diagnostic` for the run log only.
+fn abstain_on_unstated_modes(pairs: &[BuiltPair], outcomes: &mut [PairCheckOutcome]) {
+    let unstated: HashMap<&str, &str> = pairs
+        .iter()
+        .filter_map(|pair| Some((pair.spec.pair_key.as_str(), pair.unstated_mode.as_deref()?)))
+        .collect();
+    for outcome in outcomes.iter_mut() {
+        if outcome.bucket != VerdictBucket::Incompatible {
+            continue;
+        }
+        let Some(reason) = unstated.get(outcome.pair_key.as_str()) else {
+            continue;
+        };
+        outcome.bucket = VerdictBucket::Unverifiable;
+        outcome.gate = Some(UNSTATED_MODE_GATE.to_string());
+        outcome.diagnostic = outcome.diagnostic.take().filter(|found| !found.is_empty());
+        outcome.resolved = false;
+        outcome.unresolved_reason = Some((*reason).to_string());
+        outcome.notes.clear();
+        outcome.consumer_reads.clear();
+    }
 }
 
 /// Why a same-service half the check found incompatible is published as
@@ -2398,11 +2798,17 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
         .or(outcome.diagnostic.as_deref())
         .unwrap_or("no reason recorded");
     // A held-back mismatch says what the check found after why it is not
-    // reported (carrick#2053); no other unverified pair's diagnostic is added.
+    // reported (carrick#2053, and carrick#2054 for a response whose case the
+    // call does not state); no other unverified pair's diagnostic is added.
     // On one line, as every pair's line is: a compiler's chain of "is not
     // assignable" lines would otherwise leave the rest of it out of a grep.
     let found = match outcome.diagnostic.as_deref() {
-        Some(found) if outcome.gate.as_deref() == Some(SAME_SERVICE_GATE) => {
+        Some(found)
+            if matches!(
+                outcome.gate.as_deref(),
+                Some(SAME_SERVICE_GATE | UNSTATED_MODE_GATE)
+            ) =>
+        {
             let one_line = found.split_whitespace().collect::<Vec<_>>().join(" ");
             format!("; what the check found: {one_line}")
         }
@@ -2602,6 +3008,8 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            response_modes: None,
+            stated_values: Default::default(),
             v1_state_before_demotion: None,
         }
     }
@@ -3796,6 +4204,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         }
     }
 
@@ -3963,6 +4372,373 @@ mod tests {
                 ("Endpoint_row_Response", names.as_slice()),
                 ("Endpoint_row_Response_Unwidened", names.as_slice()),
             ]
+        );
+    }
+
+    fn query_mode() -> crate::services::type_sidecar::MessageRead {
+        crate::services::type_sidecar::MessageRead {
+            location: crate::services::type_sidecar::MessageSource::Query,
+            field: "mode".to_string(),
+        }
+    }
+
+    fn modes_inference(alias: &str) -> crate::services::type_sidecar::InferredType {
+        use crate::services::type_sidecar::{InferredModeCase, InferredResponseModes};
+        let mut inference = inferred(alias, "{ x: number; } | { y: string; }", None, None);
+        inference.response_modes = Some(InferredResponseModes {
+            reads: vec![query_mode()],
+            cases: vec![
+                InferredModeCase {
+                    value: Some("a".to_string()),
+                    type_string: "{ x: number; }".to_string(),
+                },
+                InferredModeCase {
+                    value: None,
+                    type_string: "{ y: string; }".to_string(),
+                },
+            ],
+        });
+        inference
+    }
+
+    /// carrick#2054: each case of a response's modes is captured beside the
+    /// alias as a literal of its own, after the published anchor, sorted, and
+    /// with the inference's printed names; a symbol anchor that publishes the
+    /// alias does not stop them. A union with reads and no cases, or no
+    /// modes at all, captures exactly what main did.
+    #[test]
+    fn derive_anchors_capture_each_case_of_a_response_s_modes() {
+        let alias = "Endpoint_row_Response";
+        let infer = vec![response_body_infer(alias)];
+        let case_a = mode_alias(alias, &query_mode(), Some("a"));
+        let other = mode_alias(alias, &query_mode(), None);
+        let literals = |anchors: &[CaptureAnchor]| -> Vec<(String, String)> {
+            anchors
+                .iter()
+                .map(|anchor| match anchor {
+                    CaptureAnchor::Literal {
+                        alias, type_text, ..
+                    } => (alias.clone(), type_text.clone()),
+                    CaptureAnchor::Symbol { alias, .. } => (alias.clone(), "symbol".to_string()),
+                    other => panic!("unexpected anchor {other:?}"),
+                })
+                .collect()
+        };
+        let mut expected = vec![
+            (case_a.clone(), "{ x: number; }".to_string()),
+            (other.clone(), "{ y: string; }".to_string()),
+        ];
+        expected.sort();
+
+        let anchors =
+            derive_capture_anchors(&[], &infer, &[], &[modes_inference(alias)], &[], "/repo");
+        let mut want = vec![(
+            alias.to_string(),
+            "{ x: number; } | { y: string; }".to_string(),
+        )];
+        want.extend(expected.clone());
+        assert_eq!(literals(&anchors), want);
+        assert!(
+            anchors
+                .iter()
+                .all(|anchor| anchor.source_file() == Some("src/handler.ts")),
+            "{anchors:?}"
+        );
+
+        let symbol = order_explicit(alias);
+        let mut sighted = modes_inference(alias);
+        sighted.primary_type_symbol = Some("Order".to_string());
+        let anchors = derive_capture_anchors(&[symbol], &infer, &[], &[sighted], &[], "/repo");
+        let mut want = vec![(alias.to_string(), "symbol".to_string())];
+        want.extend(expected);
+        assert_eq!(literals(&anchors), want);
+
+        let mut reads_only = modes_inference(alias);
+        reads_only.response_modes.as_mut().unwrap().cases.clear();
+        let plain = inferred(alias, "{ x: number; } | { y: string; }", None, None);
+        for inference in [reads_only, plain] {
+            let anchors = derive_capture_anchors(&[], &infer, &[], &[inference], &[], "/repo");
+            assert_eq!(
+                literals(&anchors),
+                vec![(
+                    alias.to_string(),
+                    "{ x: number; } | { y: string; }".to_string()
+                )]
+            );
+        }
+    }
+
+    fn moded_modes(cases: &[(Option<&str>, Option<&str>)]) -> crate::cloud_storage::ResponseModes {
+        crate::cloud_storage::ResponseModes {
+            reads: vec![query_mode()],
+            cases: cases
+                .iter()
+                .map(|(value, expanded)| crate::cloud_storage::ResponseModeCase {
+                    value: value.map(str::to_string),
+                    alias: mode_alias("P", &query_mode(), *value),
+                    expanded: expanded.map(str::to_string),
+                })
+                .collect(),
+        }
+    }
+
+    fn stated(
+        source: crate::services::type_sidecar::MessageSource,
+        field: &str,
+        value: &str,
+    ) -> crate::cloud_storage::StatedValues {
+        crate::cloud_storage::StatedValues::from([(
+            source,
+            std::collections::BTreeMap::from([(field.to_string(), value.to_string())]),
+        )])
+    }
+
+    /// carrick#2054: which case a call's stated message picks.
+    #[test]
+    fn select_mode_picks_the_case_the_call_states() {
+        use crate::services::type_sidecar::{MessageRead, MessageSource};
+        let modes = moded_modes(&[
+            (Some("a"), Some("{ x: number; }")),
+            (Some("b"), None),
+            (None, Some("{ y: string; }")),
+        ]);
+        let query = |value: &str| stated(MessageSource::Query, "mode", value);
+        let none = crate::cloud_storage::StatedValues::new();
+        let placed = "Not compared: this route returns a different response for each value of `mode` in the request (`a`, `b`), and this call does not set `mode` to one of them.";
+        let unplaced = "Not compared: this route returns a different response depending on `mode` in the request, and Carrick cannot tell which one this call receives.";
+
+        assert_eq!(
+            select_mode(Some(&modes), &query("a")),
+            ModeSelection::Narrowed(&modes.cases[0], "{ x: number; }")
+        );
+        assert_eq!(
+            select_mode(Some(&modes), &query("z")),
+            ModeSelection::Narrowed(&modes.cases[2], "{ y: string; }"),
+            "a value no case names takes the case for any other value"
+        );
+        assert_eq!(
+            select_mode(Some(&modes), &none),
+            ModeSelection::Unstated(placed.to_string())
+        );
+        assert_eq!(
+            select_mode(Some(&modes), &stated(MessageSource::Body, "mode", "a")),
+            ModeSelection::Unstated(placed.to_string()),
+            "a value stated in the other location is not stated"
+        );
+        assert_eq!(
+            select_mode(Some(&modes), &query("b")),
+            ModeSelection::Unstated(unplaced.to_string()),
+            "a case the capture could not publish narrows nothing"
+        );
+        let no_other = moded_modes(&[(Some("a"), Some("{ x: number; }"))]);
+        assert_eq!(
+            select_mode(Some(&no_other), &query("z")),
+            ModeSelection::Unstated(
+                "Not compared: this route returns a different response for each value of `mode` in the request (`a`), and this call does not set `mode` to one of them.".to_string()
+            ),
+            "with no case for any other value, an unnamed value is unstated"
+        );
+
+        let mut reads_only = modes.clone();
+        reads_only.cases.clear();
+        assert_eq!(
+            select_mode(Some(&reads_only), &query("a")),
+            ModeSelection::Unstated(unplaced.to_string())
+        );
+        let mut unplaced_read = modes.clone();
+        unplaced_read.reads[0].location = MessageSource::Unplaced;
+        assert_eq!(
+            select_mode(Some(&unplaced_read), &query("a")),
+            ModeSelection::Unstated(unplaced.to_string())
+        );
+        let mut two_fields = modes.clone();
+        two_fields.reads.push(MessageRead {
+            location: MessageSource::Body,
+            field: "kind".to_string(),
+        });
+        assert_eq!(
+            select_mode(Some(&two_fields), &query("a")),
+            ModeSelection::Unstated(
+                "Not compared: this route returns a different response depending on `kind` and `mode` in the request, and Carrick cannot tell which one this call receives.".to_string()
+            )
+        );
+
+        assert_eq!(select_mode(None, &query("a")), ModeSelection::NoModes);
+        let mut no_reads = modes.clone();
+        no_reads.reads.clear();
+        assert_eq!(
+            select_mode(Some(&no_reads), &query("a")),
+            ModeSelection::NoModes
+        );
+    }
+
+    /// carrick#2054: a narrowed pair probes the case's alias and states the
+    /// case's text to the retype, with no unwidened reading; its key, its
+    /// producer alias and so its verdict key stay the published alias's. A
+    /// pair with no modes is built as before, and a request pair is never
+    /// narrowed.
+    #[test]
+    fn build_pair_narrows_a_moded_response_to_the_stated_case() {
+        use crate::services::type_sidecar::MessageSource;
+        let key = OperationKey::http("GET", "/items");
+        let pair_with =
+            |kind: ManifestTypeKind,
+             modes: Option<crate::cloud_storage::ResponseModes>,
+             stated_values: crate::cloud_storage::StatedValues| {
+                let mut producer = entry(
+                    key.clone(),
+                    ManifestRole::Producer,
+                    kind,
+                    "P",
+                    "src/routes.ts",
+                    3,
+                    ManifestTypeState::Implicit,
+                );
+                producer.expanded_definition = Some("{ x: number; } | { y: string; }".to_string());
+                producer.unwidened_definition = Some("{ x: 1; } | { y: string; }".to_string());
+                producer.response_modes = modes;
+                let mut consumer = entry(
+                    key.clone(),
+                    ManifestRole::Consumer,
+                    kind,
+                    "C",
+                    "src/client.ts",
+                    8,
+                    ManifestTypeState::Unknown,
+                );
+                consumer.stated_values = stated_values;
+                let mut pairs = build_check_pairs(&[
+                    repo("api", None, vec![producer], Some(fake_artifact())),
+                    repo("web", None, vec![consumer], Some(fake_artifact())),
+                ]);
+                assert_eq!(pairs.len(), 1);
+                pairs.remove(0)
+            };
+        let modes = moded_modes(&[
+            (Some("a"), Some("{ x: number; }")),
+            (None, Some("{ y: string; }")),
+        ]);
+        let a = stated(MessageSource::Query, "mode", "a");
+
+        let narrowed = pair_with(ManifestTypeKind::Response, Some(modes.clone()), a.clone());
+        assert_eq!(narrowed.spec.producer.alias, modes.cases[0].alias);
+        assert_eq!(
+            narrowed.producer_expanded.as_deref(),
+            Some("{ x: number; }")
+        );
+        assert_eq!(narrowed.producer_unwidened, None);
+        assert_eq!(narrowed.spec.pair_key, "api/P~web/C");
+        assert_eq!(narrowed.producer_alias, "P");
+        assert_eq!(narrowed.unstated_mode, None);
+
+        let unstated = pair_with(
+            ManifestTypeKind::Response,
+            Some(modes.clone()),
+            Default::default(),
+        );
+        assert_eq!(unstated.spec.producer.alias, "P");
+        assert_eq!(
+            unstated.producer_expanded.as_deref(),
+            Some("{ x: number; } | { y: string; }")
+        );
+        assert!(unstated.unstated_mode.is_some());
+
+        let plain = pair_with(ManifestTypeKind::Response, None, a.clone());
+        assert_eq!(plain.spec.producer.alias, "P");
+        assert_eq!(
+            plain.producer_unwidened.as_deref(),
+            Some("{ x: 1; } | { y: string; }")
+        );
+        assert_eq!(plain.unstated_mode, None);
+
+        let request = pair_with(ManifestTypeKind::Request, Some(modes), a);
+        assert_eq!(request.spec.producer.alias, "P");
+        assert_eq!(request.unstated_mode, None);
+    }
+
+    /// carrick#2054: a mismatch against a response whose case the call does
+    /// not state is published unverifiable with the pair's reason, before the
+    /// same-service hold-back reads it. Every other outcome is untouched.
+    #[test]
+    fn an_unstated_mode_mismatch_is_published_unverifiable_with_its_reason() {
+        let key = OperationKey::http("GET", "/items");
+        let mut producer = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            "P",
+            "src/routes.ts",
+            3,
+            ManifestTypeState::Implicit,
+        );
+        producer.response_modes = Some(moded_modes(&[(Some("a"), Some("{ x: number; }"))]));
+        let consumer = |alias: &str, line: u32| {
+            entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                alias,
+                "src/client.ts",
+                line,
+                ManifestTypeState::Unknown,
+            )
+        };
+        let pairs = build_check_pairs(&[
+            repo(
+                "app",
+                None,
+                vec![producer, consumer("C1", 8), consumer("C2", 9)],
+                Some(fake_artifact()),
+            ),
+            repo("web", None, vec![consumer("C3", 10)], Some(fake_artifact())),
+        ]);
+        assert_eq!(pairs.len(), 3);
+        let reason = pairs[0].unstated_mode.clone().expect("unstated");
+        let outcome = |pair: &BuiltPair, bucket: VerdictBucket| {
+            let mut outcome = outcome_for(
+                pair,
+                bucket,
+                None,
+                Some("Property 'x' does not exist".to_string()),
+                true,
+                None,
+                vec!["a note".to_string()],
+            );
+            outcome.consumer_reads = vec![14];
+            outcome
+        };
+        let mut outcomes = vec![
+            outcome(&pairs[0], VerdictBucket::Incompatible),
+            outcome(&pairs[1], VerdictBucket::Compatible),
+            outcome(&pairs[2], VerdictBucket::Incompatible),
+        ];
+        let compatible = format!("{:?}", outcomes[1]);
+        abstain_on_unstated_modes(&pairs, &mut outcomes);
+        hold_back_same_service_mismatches(&mut outcomes);
+
+        for held in [&outcomes[0], &outcomes[2]] {
+            assert_eq!(held.bucket, VerdictBucket::Unverifiable, "{held:?}");
+            assert_eq!(held.gate.as_deref(), Some("producer:mode"), "{held:?}");
+            assert_eq!(held.unresolved_reason.as_deref(), Some(reason.as_str()));
+            assert!(!held.resolved);
+            assert_eq!(
+                held.diagnostic.as_deref(),
+                Some("Property 'x' does not exist")
+            );
+            assert!(held.notes.is_empty() && held.consumer_reads.is_empty());
+        }
+        assert_eq!(
+            format!("{:?}", outcomes[1]),
+            compatible,
+            "a compatible pair is kept"
+        );
+        assert!(
+            unresolved_pair_line(&outcomes[2])
+                .unwrap()
+                .ends_with(&format!(
+                    "{reason}; what the check found: Property 'x' does not exist"
+                )),
+            "the run log says what the check found"
         );
     }
 
@@ -4417,6 +5193,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         };
 
         let infer = vec![
@@ -4548,6 +5325,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -5155,6 +5933,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         };
 
         let explicit = vec![
@@ -5685,6 +6464,142 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             paired(both),
             vec![("C_thing".to_string(), "P_thing".to_string())]
         );
+    }
+
+    /// One HTTP row at `site` (`file:line`), as the index states an endpoint
+    /// or a call, answering or sending `op = value` when given.
+    fn dispatch_row(
+        method: &str,
+        path: &str,
+        site: &str,
+        value: Option<&str>,
+    ) -> crate::analyzer::ApiEndpointDetails {
+        crate::analyzer::ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http(method, path),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(site),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: value.map(|value| crate::dispatch::Dispatch {
+                location: crate::dispatch::DispatchLocation::Body,
+                field: "op".to_string(),
+                value: value.to_string(),
+            }),
+            schema_binding: None,
+            handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+        }
+    }
+
+    /// The pairs the check builds for one service whose `POST` route answers
+    /// a different body for each value of `op` (carrick#2059). The case
+    /// `confirm` has a site of its own; `cancel` and `refund` share the
+    /// route's site, so one producer entry stands for both. Its calls send
+    /// `confirm`, `refund`, a value no case answers (`archive`), and nothing.
+    /// A plain `GET` beside it is called with a body that happens to carry
+    /// `op` too.
+    fn pairs_for_a_dispatching_route() -> Vec<BuiltPair> {
+        const ROUTE: &str = "/api/orders/:orderId";
+        const HANDLER: &str = "app/api/orders/[orderId]/route.ts";
+        const CLIENT: &str = "components/OrderActions.tsx";
+        let manifest_entry = |method: &str, role, alias: &str, file: &str, line| {
+            entry(
+                OperationKey::http(method, ROUTE),
+                role,
+                ManifestTypeKind::Response,
+                alias,
+                file,
+                line,
+                ManifestTypeState::Explicit,
+            )
+        };
+        let site = |file: &str, line: u32| format!("{file}:{line}");
+        let mut app = repo(
+            "app",
+            None,
+            vec![
+                manifest_entry("POST", ManifestRole::Producer, "P_confirm", HANDLER, 17),
+                manifest_entry("POST", ManifestRole::Producer, "P_route", HANDLER, 9),
+                manifest_entry("GET", ManifestRole::Producer, "P_get", HANDLER, 4),
+                manifest_entry("POST", ManifestRole::Consumer, "C_confirm", CLIENT, 5),
+                manifest_entry("POST", ManifestRole::Consumer, "C_refund", CLIENT, 6),
+                manifest_entry("POST", ManifestRole::Consumer, "C_archive", CLIENT, 7),
+                manifest_entry("POST", ManifestRole::Consumer, "C_none", CLIENT, 8),
+                manifest_entry("GET", ManifestRole::Consumer, "C_get", CLIENT, 9),
+            ],
+            Some(fake_artifact()),
+        );
+        app.endpoints = vec![
+            dispatch_row("POST", ROUTE, &site(HANDLER, 17), Some("confirm")),
+            dispatch_row("POST", ROUTE, &site(HANDLER, 9), Some("cancel")),
+            dispatch_row("POST", ROUTE, &site(HANDLER, 9), Some("refund")),
+            dispatch_row("GET", ROUTE, &site(HANDLER, 4), None),
+        ];
+        app.calls = vec![
+            dispatch_row("POST", ROUTE, &site(CLIENT, 5), Some("confirm")),
+            dispatch_row("POST", ROUTE, &site(CLIENT, 6), Some("refund")),
+            dispatch_row("POST", ROUTE, &site(CLIENT, 7), Some("archive")),
+            dispatch_row("POST", ROUTE, &site(CLIENT, 8), None),
+            dispatch_row("GET", ROUTE, &site(CLIENT, 9), Some("confirm")),
+        ];
+        build_check_pairs(&[app])
+    }
+
+    /// The check pairs a call to a dispatching route with what the analyzer's
+    /// matcher pairs it with (`carrick_match::dispatch_outcome`), so every
+    /// half it judges is a half the index stores (carrick#2059): the case the
+    /// call sends, found through a producer entry that stands for two cases;
+    /// nothing for a value no case answers; and a route that does not
+    /// dispatch, whatever the call's body carries.
+    #[test]
+    fn a_call_to_a_dispatching_route_is_paired_as_the_matcher_pairs_it() {
+        let mut paired: Vec<(String, String)> = pairs_for_a_dispatching_route()
+            .into_iter()
+            .filter(|pair| pair.pre_verdict.is_none())
+            .map(|pair| (pair.consumer_alias, pair.producer_alias))
+            .collect();
+        paired.sort();
+        assert_eq!(
+            paired,
+            vec![
+                ("C_confirm".to_string(), "P_confirm".to_string()),
+                ("C_get".to_string(), "P_get".to_string()),
+                ("C_refund".to_string(), "P_route".to_string()),
+            ]
+        );
+    }
+
+    /// A call that states no case keeps its edge to the route with the case
+    /// unknown, so it has one half per kind, not one per case. Nothing is
+    /// probed: the half is stored unverifiable and says why, and it is never
+    /// sent to the retype check, which would judge it against one case's type.
+    #[test]
+    fn a_call_that_states_no_case_has_one_unverifiable_half_and_no_probe() {
+        let unknown: Vec<BuiltPair> = pairs_for_a_dispatching_route()
+            .into_iter()
+            .filter(|pair| pair.consumer_alias == "C_none")
+            .collect();
+        assert_eq!(unknown.len(), 1, "one half for the route, not one per case");
+        assert_eq!(
+            unknown[0].pre_verdict,
+            Some((
+                VerdictBucket::Unverifiable,
+                "Not compared: this route returns a different response depending on `op` in \
+                 the request, and Carrick cannot tell which one this call receives."
+                    .to_string()
+            ))
+        );
+        assert_eq!(unknown[0].pre_verdict_side, None);
     }
 
     /// Only HTTP pairs a service with itself. The exact-key matcher drops a
@@ -6850,7 +7765,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "export async function loadCheckout(): Promise<number> {\n  \
              const res = await fetch(\"/checkout\");\n  \
              const body = await res.json();\n  \
-             return body.x;\n\
+             console.log(body.x);\n\
              }\n",
         )
         .unwrap();
@@ -7174,6 +8089,353 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         unmarked[0].raw_text_read = false;
         let control = only(run_check(&sidecar, &[api, web(&unmarked)], &local));
         assert_eq!(control.bucket, VerdictBucket::Incompatible, "{control:#?}");
+    }
+
+    /// carrick#2054, end to end against the real sidecar ($0, no model): a
+    /// route whose handler answers a different body for each value of a
+    /// request field is judged, at each call, against the body the call's
+    /// stated value selects. The producer's inference reads the modes, the
+    /// capture publishes each case, the definitions pass writes the case
+    /// texts onto the manifest, and the check probes (or the retype states)
+    /// the case. A call that states no value reads unverifiable with the
+    /// reason, never incompatible. A union no request read decides is judged
+    /// as before.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_moded_response_is_judged_against_the_case_each_call_states() {
+        use crate::services::type_sidecar::MessageSource;
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let tsconfig = r#"{"compilerOptions":{"strict":true,"target":"es2022","module":"esnext","moduleResolution":"bundler","lib":["es2022","dom"],"skipLibCheck":true},"include":["src"]}"#;
+        let api_dir = tempfile::tempdir().unwrap();
+        let api_root = api_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(api_root.join("src")).unwrap();
+        std::fs::write(api_root.join("tsconfig.json"), tsconfig).unwrap();
+        // Line numbers are read off these texts; keep the two in step.
+        std::fs::write(
+            api_root.join("src/routes.ts"),
+            "declare const flags: { beta: boolean };\n\
+             export async function getItems(req: Request) {\n  \
+             const mode = new URL(req.url).searchParams.get('mode');\n  \
+             if (mode === 'a') return Response.json({ x: 1 });\n  \
+             return Response.json({ y: 'z' });\n\
+             }\n\
+             export async function postItems(req: Request) {\n  \
+             const { kind } = await req.json();\n  \
+             switch (kind) {\n    \
+             case 'p':\n    \
+             case 'q':\n      \
+             return Response.json({ p: true });\n    \
+             case 'r':\n      \
+             return Response.json({ r: 1 });\n    \
+             default:\n      \
+             return Response.json({ n: 0 });\n  \
+             }\n\
+             }\n\
+             export async function getState() {\n  \
+             if (flags.beta) return Response.json({ x: 1 });\n  \
+             return Response.json({ y: 'z' });\n\
+             }\n",
+        )
+        .unwrap();
+        let web_dir = tempfile::tempdir().unwrap();
+        let web_root = web_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(web_root.join("src")).unwrap();
+        std::fs::write(web_root.join("tsconfig.json"), tsconfig).unwrap();
+        std::fs::write(
+            web_root.join("src/client.ts"),
+            "export async function typedOnA() {\n  \
+             const res = await fetch(\"/api/items?mode=a\");\n  \
+             return (await res.json()) as { x: number };\n\
+             }\n\
+             export async function readsYOnA() {\n  \
+             const res = await fetch(\"/api/items?mode=a\");\n  \
+             const body = await res.json();\n  \
+             console.log(body.y);\n\
+             }\n\
+             export async function readsYOnB() {\n  \
+             const res = await fetch(\"/api/items?mode=b\");\n  \
+             const body = await res.json();\n  \
+             console.log(body.y);\n\
+             }\n\
+             export async function readsXUnstated() {\n  \
+             const res = await fetch(\"/api/items\");\n  \
+             const body = await res.json();\n  \
+             console.log(body.x);\n\
+             }\n\
+             export async function postsR() {\n  \
+             const res = await fetch(\"/api/items\", { method: \"POST\", body: JSON.stringify({ kind: \"r\" }) });\n  \
+             const body = await res.json();\n  \
+             console.log(body.r);\n\
+             }\n\
+             export async function readsXOnState() {\n  \
+             const res = await fetch(\"/api/state\");\n  \
+             const body = await res.json();\n  \
+             console.log(body.x);\n\
+             }\n",
+        )
+        .unwrap();
+
+        // ---- the producer: inferred, captured, its definitions resolved ----
+        let api_sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        api_sidecar.start_init(&api_root, None);
+        api_sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("api init");
+        let items = OperationKey::http("GET", "/api/items");
+        let post_items = OperationKey::http("POST", "/api/items");
+        let state = OperationKey::http("GET", "/api/state");
+        let routes = [(&items, 2u32), (&post_items, 7), (&state, 20)];
+        let producer_alias = |key: &OperationKey| {
+            build_manifest_type_alias(key, ManifestRole::Producer, ManifestTypeKind::Response)
+        };
+        let routes_file = api_root
+            .join("src/routes.ts")
+            .to_string_lossy()
+            .into_owned();
+        let api_infer: Vec<InferRequestItem> = routes
+            .iter()
+            .map(|(key, line)| InferRequestItem {
+                file_path: routes_file.clone(),
+                line_number: *line,
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                infer_kind: InferKind::ResponseBody,
+                alias: Some(producer_alias(key)),
+                param_name: None,
+            })
+            .collect();
+        let api_inferred = api_sidecar
+            .infer_types(&api_infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        let modes_of = |key: &OperationKey| {
+            api_inferred
+                .iter()
+                .find(|inf| inf.alias == producer_alias(key))
+                .and_then(|inf| inf.response_modes.clone())
+        };
+        assert!(modes_of(&items).is_some(), "{api_inferred:#?}");
+        assert!(modes_of(&post_items).is_some(), "{api_inferred:#?}");
+        assert_eq!(
+            modes_of(&state),
+            None,
+            "a server-state branch reads no mode"
+        );
+
+        let mut api_manifest: Vec<TypeManifestEntry> = routes
+            .iter()
+            .map(|(key, line)| {
+                entry(
+                    (*key).clone(),
+                    ManifestRole::Producer,
+                    ManifestTypeKind::Response,
+                    &producer_alias(key),
+                    "src/routes.ts",
+                    *line,
+                    ManifestTypeState::Unknown,
+                )
+            })
+            .collect();
+        let api_aliases: Vec<String> = api_manifest.iter().map(|e| e.type_alias.clone()).collect();
+        let anchors = derive_capture_anchors(
+            &[],
+            &api_infer,
+            &[],
+            &api_inferred,
+            &api_aliases,
+            api_root.to_str().unwrap(),
+        );
+        crate::engine::stamp_response_modes(&mut api_manifest, &api_inferred);
+        let (api_stub, api_artifact) = run_capture(
+            &api_sidecar,
+            api_root.to_str().unwrap(),
+            "api",
+            &anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("api capture");
+        let records = crate::engine::read_capture_records(&api_stub);
+        let aliases = crate::engine::aliases_to_resolve(&api_manifest, &records);
+        let resolved = api_sidecar
+            .resolve_definitions(api_stub.to_str().unwrap(), &aliases)
+            .expect("definitions");
+        crate::engine::apply_resolved_definitions(&mut api_manifest, resolved, &records);
+        let _ = std::fs::remove_dir_all(&api_stub);
+        let items_modes = api_manifest[0].response_modes.clone().expect("modes");
+        assert!(
+            items_modes.cases.iter().all(|case| case.expanded.is_some()),
+            "every case is published: {items_modes:#?}"
+        );
+        assert_eq!(api_manifest[2].response_modes, None);
+        drop(api_sidecar);
+
+        // ---- the consumer: one call per row of the ticket's table ----
+        let web_sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        web_sidecar.start_init(&web_root, None);
+        web_sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("web init");
+        // (operation, line, call expression, body literals)
+        type Call<'a> = (&'a OperationKey, u32, &'a str, &'a [(&'a str, &'a str)]);
+        let calls: [Call; 6] = [
+            (&items, 2, "fetch(\"/api/items?mode=a\")", &[]),
+            (&items, 6, "fetch(\"/api/items?mode=a\")", &[]),
+            (&items, 11, "fetch(\"/api/items?mode=b\")", &[]),
+            (&items, 16, "fetch(\"/api/items\")", &[]),
+            (
+                &post_items,
+                21,
+                "fetch(\"/api/items\", { method: \"POST\", body: JSON.stringify({ kind: \"r\" }) })",
+                &[("kind", "r")],
+            ),
+            (&state, 26, "fetch(\"/api/state\")", &[]),
+        ];
+        let client_file = web_root
+            .join("src/client.ts")
+            .to_string_lossy()
+            .into_owned();
+        let consumer_alias = |key: &OperationKey, line: u32| {
+            let site = crate::type_manifest::build_site_id(
+                "src/client.ts",
+                line,
+                key,
+                web_root.to_str().unwrap(),
+            );
+            build_manifest_type_alias_with_site_id(
+                key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                Some(&site),
+            )
+        };
+        let web_infer: Vec<InferRequestItem> = calls
+            .iter()
+            .map(|(key, line, text, _)| InferRequestItem {
+                file_path: client_file.clone(),
+                line_number: *line,
+                span_start: None,
+                span_end: None,
+                expression_text: Some((*text).to_string()),
+                expression_line: Some(*line),
+                infer_kind: InferKind::CallResult,
+                alias: Some(consumer_alias(key, *line)),
+                param_name: None,
+            })
+            .collect();
+        let web_inferred = web_sidecar
+            .infer_types(&web_infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        let web_aliases: Vec<String> = web_infer.iter().filter_map(|i| i.alias.clone()).collect();
+        let web_anchors = derive_capture_anchors(
+            &[],
+            &web_infer,
+            &[],
+            &web_inferred,
+            &web_aliases,
+            web_root.to_str().unwrap(),
+        );
+        let (web_stub, web_artifact) = run_capture(
+            &web_sidecar,
+            web_root.to_str().unwrap(),
+            "web",
+            &web_anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("web capture");
+        let _ = std::fs::remove_dir_all(&web_stub);
+        let web_manifest: Vec<TypeManifestEntry> = calls
+            .iter()
+            .map(|(key, line, text, body)| {
+                let mut consumer = entry(
+                    (*key).clone(),
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                    &consumer_alias(key, *line),
+                    "src/client.ts",
+                    *line,
+                    ManifestTypeState::Implicit,
+                );
+                let target = text
+                    .trim_start_matches("fetch(\"")
+                    .split('"')
+                    .next()
+                    .unwrap_or_default();
+                let query = crate::engine::stated_query(target);
+                if !query.is_empty() {
+                    consumer.stated_values.insert(MessageSource::Query, query);
+                }
+                if !body.is_empty() {
+                    consumer.stated_values.insert(
+                        MessageSource::Body,
+                        body.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    );
+                }
+                consumer
+            })
+            .collect();
+        let local = LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: web_root.clone(),
+                tsconfig: None,
+                calls: consumer_call_locators(&web_infer),
+            },
+        )]);
+        let repos = [
+            repo("api", None, api_manifest, Some(api_artifact)),
+            repo("web", None, web_manifest, Some(web_artifact)),
+        ];
+        let outcomes = run_check(&web_sidecar, &repos, &local);
+        let at = |line: u32| -> &PairCheckOutcome {
+            outcomes
+                .iter()
+                .find(|o| o.consumer_line == line)
+                .unwrap_or_else(|| panic!("no outcome at line {line}: {outcomes:#?}"))
+        };
+        let verdicts: Vec<(u32, VerdictBucket, Option<&str>)> = calls
+            .iter()
+            .map(|(_, line, _, _)| (*line, at(*line).bucket, at(*line).gate.as_deref()))
+            .collect();
+        eprintln!("{verdicts:#?}");
+
+        // `?mode=a`, typed `{ x: number }`: the check probes the case.
+        assert_eq!(at(2).bucket, VerdictBucket::Compatible, "{:#?}", at(2));
+        // `?mode=a`, reads `y`: a real break on a stated case is kept.
+        assert_eq!(at(6).bucket, VerdictBucket::Incompatible, "{:#?}", at(6));
+        // `?mode=b`, reads `y`: the case for any other value.
+        assert_eq!(at(11).bucket, VerdictBucket::Compatible, "{:#?}", at(11));
+        // No `mode`, reads `x`: not compared, with the reason.
+        let unstated = at(16);
+        assert_eq!(
+            unstated.bucket,
+            VerdictBucket::Unverifiable,
+            "{unstated:#?}"
+        );
+        assert_eq!(unstated.gate.as_deref(), Some("producer:mode"));
+        assert_eq!(
+            unstated.unresolved_reason.as_deref(),
+            Some(
+                "Not compared: this route returns a different response for each value of `mode` in the request (`a`), and this call does not set `mode` to one of them."
+            )
+        );
+        // Body `kind: 'r'`, reads `r`: the body field's case.
+        assert_eq!(at(21).bucket, VerdictBucket::Compatible, "{:#?}", at(21));
+        // Control: a union no request read decides reads as it did.
+        assert_eq!(at(26).bucket, VerdictBucket::Incompatible, "{:#?}", at(26));
     }
 
     /// carrick#1980: a subscriber the inference left unanswered is captured
