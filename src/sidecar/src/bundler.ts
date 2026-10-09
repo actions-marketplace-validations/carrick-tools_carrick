@@ -23,6 +23,7 @@ import {
   type ExpandOrigin,
 } from './type-structural-expander.js';
 import { externalImportsOf } from './origin.js';
+import { statusTableBody } from './capture/index.js';
 
 /**
  * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
@@ -377,6 +378,14 @@ export class TypeBundler {
   private extractTypeDefinition(
     symbol: SymbolRequest
   ): { definition: string; typeString: string } | null {
+    const tableBody = symbol.consumer_response ? this.statusTableBodyText(symbol) : undefined;
+    if (tableBody !== undefined) {
+      // The success row IS the body, list or not. A depth on this request was
+      // read off the body (carrick#1967) and is already in the row, so it is
+      // not applied again; the capture's symbol anchor reads the same rule.
+      const alias = symbol.alias || symbol.symbol_name;
+      return { definition: `export type ${alias} = ${tableBody};`, typeString: tableBody };
+    }
     const base = this.extractTypeDefinitionBase(symbol);
     if (!base) return null;
 
@@ -410,6 +419,34 @@ export class TypeBundler {
       : base.typeString;
     const typeString = `${element}${'[]'.repeat(depth)}`;
     return { definition: `export type ${alias} = ${typeString};`, typeString };
+  }
+
+  /**
+   * carrick#1841: what a consumer receives when the symbol the model named for
+   * its response is a response table keyed by status code (`{ 200: Item;
+   * 404: Problem }`): the table's 2xx values, expanded like any other body.
+   * `unknown` where the table states no success body (no 2xx row, or only
+   * rows such as `204: void`). `undefined` when the symbol is not a table, so
+   * the caller bundles it as written. The capture's symbol anchor reads the
+   * same rule (`capture/anchors.ts`), so both answers agree.
+   */
+  private statusTableBodyText(symbol: SymbolRequest): string | undefined {
+    const site = this.siteOf(symbol);
+    if (!site) return undefined;
+    const declaration =
+      site.sourceFile.getTypeAlias(site.name) ?? site.sourceFile.getInterface(site.name);
+    if (!declaration) return undefined;
+    const table = declaration.getType();
+    const checker = this.project.getTypeChecker().compilerObject;
+    const read = statusTableBody(checker, table.compilerType, declaration.compilerNode);
+    if (!read) return undefined;
+    if (read.kind === 'no_body') return 'unknown';
+    const bodies = read.entries.map((entry) => {
+      const value = table.getProperty(entry.key)?.getTypeAtLocation(declaration);
+      return value ? expandTypeStructural(value, this.expandOrigin()) : 'unknown';
+    });
+    const distinct = [...new Set(bodies)];
+    return distinct.length === 1 ? distinct[0] : distinct.map((body) => `(${body})`).join(' | ');
   }
 
   /// Whether the element type must be parenthesised before an `[]` suffix.

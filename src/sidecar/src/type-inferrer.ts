@@ -60,6 +60,15 @@ import { functionAtLine } from './function-line-index.js';
 import { endLineOf, startLineOf } from './line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
+  classifyStatusCodes,
+  constituents,
+  httpStatus,
+  statesNoBody,
+  statusKeyCode,
+  statusTableOf,
+  successEntries,
+} from './capture/index.js';
+import {
   addedDiagnostics,
   applyInsertions,
   fileDiagnostics,
@@ -266,13 +275,6 @@ function distinctByText<T>(items: T[], text: (item: T) => string): T[] {
   });
 }
 
-/** `value` when it is an integer in the HTTP status range, else `undefined`. */
-function httpStatus(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
-    ? value
-    : undefined;
-}
-
 /**
  * The status codes a TYPE fixes: a numeric literal, or a union made only of
  * them, every one in the HTTP range. `undefined` for anything else, including
@@ -288,16 +290,6 @@ function statusCodesOfType(type: Type): number[] | undefined {
     codes.push(code);
   }
   return codes.length > 0 ? codes : undefined;
-}
-
-/** One verdict for a set of status codes, or `mixed` when they disagree. */
-function classifyStatusCodes(
-  codes: number[]
-): 'success' | 'error' | 'redirect' | 'mixed' {
-  if (codes.every((code) => code >= 400)) return 'error';
-  if (codes.every((code) => code >= 300 && code < 400)) return 'redirect';
-  if (codes.every((code) => code < 300)) return 'success';
-  return 'mixed';
 }
 
 /**
@@ -1504,9 +1496,12 @@ export class TypeInferrer {
       // argument is the route path, not a payload. The span locator falls
       // back to exactly this shape when no payload expression was reported,
       // so drilling here would put the path literal's type in the manifest.
-      const registersCallback = args.some(
-        (arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)
-      );
+      // A call handed a function whose result is plain data is not a
+      // registration but the payload: `rows.map((r) => ({ ... }))` sends the
+      // list, not the callback's return (carrick#2055).
+      const registersCallback =
+        args.some((arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)) &&
+        !this.callResultIsPlainData(node);
       if (registersCallback) {
         // A registration that DECLARES its response contract in a schema needs
         // no indirection: the declaration is the contract the framework
@@ -1574,9 +1569,11 @@ export class TypeInferrer {
       // `typeText` keeps the bare name `Payment`, which dangles in the
       // source-less cross-repo bundle → `any` → unverifiable. Expand the
       // resolved object structurally so the real members land in the bundle.
+      // The name it falls back to is the awaited one: a located call under
+      // `await` sends what it resolves to, never the promise (carrick#2055).
       typeString = this.expandResolvedTypeStructural(
         resolved,
-        typeString,
+        typeText(resolved, payloadNode),
         this.wireFormatFor(request)
       );
     }
@@ -1784,6 +1781,7 @@ export class TypeInferrer {
    * returns the repo's own type (`toInstance(View, plain)`) is the payload.
    */
   private callResultIsPayload(call: CallExpression): boolean {
+    if (this.callResultIsPlainData(call)) return true;
     const { element } = this.unwrapArrayLevels(this.unwrapPromiseType(call.getType()));
     if (this.symbolIsLibOrExternalOrigin(element.getSymbol() ?? element.getAliasSymbol())) {
       return false;
@@ -1792,6 +1790,53 @@ export class TypeInferrer {
     // serialises to a string is still what the route sends, and drilling into
     // the call that built it would publish what it was built from.
     return this.nodeCarriesPayloadContract(call, false, false);
+  }
+
+  /**
+   * True when a located call evaluates to plain data, so it is the payload
+   * whatever its arguments and wherever its type is declared (carrick#2055).
+   *
+   * `rows.map(toDto)`, `rows.filter(cb)` and `listItems(ownerId)` produce the
+   * list a route sends. Read as a send, the first produced the mapper's
+   * function type, the second a callback's return, and the third `string`.
+   * What a send or a registration hands back is never plain data: a reply
+   * builder or a router carries methods, a bare send returns `void`, and a
+   * serialiser returns a primitive. So the result alone tells them apart.
+   *
+   * Plain data, once promise levels are taken off: an object with at least
+   * one member, no call or construct signature, and no member that is itself
+   * callable; an array of one; or a union whose members other than `null` and
+   * `undefined` all are. Tuples and empty objects are left to the callers'
+   * own reading.
+   */
+  private callResultIsPlainData(call: CallExpression): boolean {
+    const isPlainData = (type: Type, depth: number): boolean => {
+      if (depth > 3) return false;
+      if (type.isAny() || type.isUnknown() || type.isNever()) return false;
+      if (type.isUnion()) {
+        const members = type
+          .getUnionTypes()
+          .filter((member) => !member.isNull() && !member.isUndefined());
+        return members.length > 0 && members.every((member) => isPlainData(member, depth + 1));
+      }
+      if (type.isIntersection()) {
+        return type.getIntersectionTypes().every((member) => isPlainData(member, depth + 1));
+      }
+      const element = type.getArrayElementType();
+      if (element) return isPlainData(element, depth + 1);
+      if (!type.isObject() || type.isTuple() || this.isCallableType(type)) return false;
+      if (this.typeIsOrContainsResponseMachinery(type)) return false;
+      const members = type.getProperties();
+      const indexed = type.getStringIndexType() ?? type.getNumberIndexType();
+      if (members.length === 0 && !indexed) return false;
+      const callable = (held: Type): boolean =>
+        held.isUnion()
+          ? held.getUnionTypes().some((member) => this.isCallableType(member))
+          : this.isCallableType(held);
+      if (indexed && callable(indexed)) return false;
+      return members.every((member) => !callable(member.getTypeAtLocation(call)));
+    };
+    return isPlainData(this.unwrapPromiseType(call.getType()), 0);
   }
 
   /**
@@ -2069,8 +2114,10 @@ export class TypeInferrer {
     // carrier read gives its own. A result that is no carrier keeps the
     // answer it had.
     const where = `${request.file_path}:${request.line_number}`;
+    const callArgs = this.callResultArguments(callExpr);
     const resultIsCarrier =
-      !explicitType && this.resultCarrierArguments(returnType, terminalNode) !== undefined;
+      !explicitType &&
+      this.resultCarrierArguments(returnType, terminalNode, callArgs) !== undefined;
 
     // carrick#1877: the terminal holds a thenable the names do not peel, a
     // subclass of `Promise` or a class with a `then` of its own. What a
@@ -2125,13 +2172,23 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped &&
       resultIsCarrier &&
       !!afterRules &&
-      this.resultCarrierArguments(afterRules, terminalNode) === undefined;
-    const carrierCandidate =
+      this.resultCarrierArguments(afterRules, terminalNode, callArgs) === undefined;
+    const carrierRead =
       explicitType || !afterRules
         ? undefined
         : readThroughCarrier
-          ? afterRules
-          : this.resultCarrierPayload(afterRules, terminalNode, use.projections, where);
+          ? { payload: afterRules }
+          : this.resultCarrierPayload(afterRules, terminalNode, use.projections, where, callArgs);
+    // carrick#1841: a carrier built from a response table whose success side
+    // states no body (a `204` row), or whose side cannot be told, states no
+    // response contract. The abstain is decided for the same reason as the
+    // transport abstain above: left undecided, the capture's own locator
+    // re-reads the raw call and publishes the carrier.
+    if (carrierRead && 'abstain' in carrierRead) {
+      this.log(`Call result at ${where}: ${carrierRead.abstain}`);
+      return this.transportAbstain(request, callExpr, carrierRead.abstain);
+    }
+    const carrierCandidate = carrierRead?.payload;
     // carrick#1841: what the carrier holds goes through the service's wrapper
     // rules before it is published, as the call's own result did. The carrier
     // is found by its shape, so what it holds can still be a library's
@@ -2283,7 +2340,7 @@ export class TypeInferrer {
     const leftCarrier =
       (callUnwrap.wasUnwrapped || readByProtocol) &&
       !!callAfterRules &&
-      this.resultCarrierArguments(callAfterRules, callExpr) !== undefined;
+      this.resultCarrierArguments(callAfterRules, callExpr, callArgs) !== undefined;
     const anchorSource = carrierPayload ?? (leftCarrier ? undefined : callAfterRules);
     let anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
@@ -2910,8 +2967,8 @@ export class TypeInferrer {
           kind: 'unknown',
           reason: 'no_request_body',
           detail:
-            `the located argument is the call's request config, and it sets no '${inCall.member}' ` +
-            'member, which is where the call takes its body, so the call sends no request body',
+            `the call's request config sets no '${inCall.member}' member, which is where the call ` +
+            'takes its body, so the call sends no request body',
         },
       ];
       return abstain;
@@ -3315,18 +3372,66 @@ export class TypeInferrer {
    * Where neither decides, the carrier keeps its own answer and the limit is
    * logged: a coin flip published as a contract is worse than an envelope a
    * reader can see is an envelope.
+   *
+   * carrick#1841: an argument that is a RESPONSE TABLE (`{ 200: Item }`, every
+   * key a status code) says which side it is by its keys, and that decides
+   * first: the one table whose keys are all 2xx is the success side, and what
+   * a caller receives is the table's body, the member the branch holds, never
+   * the table. A success table whose rows state no body (`{ 204: void }`)
+   * states no response contract. A carrier built from tables, or found
+   * through the call's arguments, that nothing decides states none either:
+   * the union is the client's bookkeeping, not a body, so it is not published
+   * as written.
    */
   private resultCarrierPayload(
     type: Type,
     at: Node,
     projections: Node[],
-    where: string
-  ): Type | undefined {
-    const shape = this.resultCarrierArguments(type, at);
+    where: string,
+    callArgs: Type[]
+  ): { payload: Type } | { abstain: string } | undefined {
+    const shape = this.resultCarrierArguments(type, at, callArgs);
     if (!shape) {
       return undefined;
     }
-    const { carrier, carried } = shape;
+    const { carrier, carried, bodies, readOffCall } = shape;
+
+    const checker = this.project.getTypeChecker().compilerObject;
+    const tables = carried.map((arg) => {
+      const entries = statusTableOf(checker, arg.compilerType);
+      return {
+        arg,
+        entries,
+        side: entries ? classifyStatusCodes(entries.map((entry) => entry.code)) : undefined,
+      };
+    });
+    const successTables = tables.filter((table) => table.side === 'success');
+    if (successTables.length === 1) {
+      const { arg, entries } = successTables[0];
+      const body = bodies.get(arg) ?? this.singleSuccessValue(arg, entries ?? [], at);
+      if (body && statesNoBody(body.compilerType)) {
+        return {
+          abstain:
+            `the call answers a carrier whose success side is the response table ` +
+            `'${typeText(arg, at)}', and its success rows state no body, so this site ` +
+            'states no response contract',
+        };
+      }
+      if (body) {
+        return { payload: body };
+      }
+    }
+    const builtFromTables = tables.some((table) => table.side !== undefined);
+    const undecided = (detail: string): { abstain: string } | undefined => {
+      this.log(`Call result at ${where} answers a carrier (${typeText(carrier, at)}): ${detail}`);
+      return builtFromTables || readOffCall
+        ? {
+            abstain:
+              `the call answers a carrier (${typeText(carrier, at)}) whose success side ` +
+              'cannot be told from its failure side, so this site states no response contract',
+          }
+        : undefined;
+    };
 
     const argTexts = new Map(carried.map((arg) => [arg.getText(), arg]));
     const read = new Set<string>();
@@ -3349,25 +3454,70 @@ export class TypeInferrer {
     // argument out than the shape test picked, the two disagree about which
     // side is which and nothing here knows better than the source does.
     if (byShape && byRead && byShape !== byRead) {
-      this.log(
-        `Call result at ${where} answers a carrier (${typeText(carrier, at)}) whose error ` +
-          `shape names '${typeText(byShape, at)}' as the payload while the source reads ` +
-          `'${typeText(byRead, at)}' out of it. Publishing the carrier as written rather ` +
-          'than picking one'
+      return undecided(
+        `its error shape names '${typeText(byShape, at)}' as the payload while the source ` +
+          `reads '${typeText(byRead, at)}' out of it. Not picking one`
       );
-      return undefined;
     }
-    if (byShape ?? byRead) {
-      return byShape ?? byRead;
+    const decided = byShape ?? byRead;
+    if (decided) {
+      return { payload: bodies.get(decided) ?? decided };
     }
 
-    this.log(
-      `Call result at ${where} answers a carrier (${typeText(carrier, at)}) whose success ` +
-        'side cannot be told from its failure side: no single argument is the only ' +
-        'non-error one and the source reads none of them out. Publishing the carrier as ' +
-        'written rather than guessing which argument is the payload'
+    return undecided(
+      'its success side cannot be told from its failure side: no single argument is the ' +
+        'only non-error one and the source reads none of them out. Not guessing which ' +
+        'argument is the payload'
     );
-    return undefined;
+  }
+
+  /**
+   * The value of a response table's one success row, for a table a carrier
+   * holds as itself rather than through its body. `undefined` where the table
+   * has more than one success row: their union has no single type here.
+   */
+  private singleSuccessValue(
+    table: Type,
+    entries: ReturnType<typeof statusTableOf> & object,
+    at: Node
+  ): Type | undefined {
+    const success = successEntries(entries);
+    if (success.length !== 1) return undefined;
+    return table.getProperty(success[0].key)?.getTypeAtLocation(at);
+  }
+
+  /**
+   * carrick#1841: the type arguments a call's result was built from, for a
+   * result that no longer carries them. A client whose result type is a
+   * conditional alias (`Result<TData, TError, ThrowOnError>`) resolves to its
+   * branch at the call, and the branch is an anonymous union with no
+   * arguments of its own. The arguments are still stated in two places the
+   * compiler keeps:
+   *
+   *  - the call's own explicit type arguments (`client.get<Table, Errors>(…)`);
+   *  - the alias the callee's declared return type was written with, where
+   *    the callee is a function wrapping such a call
+   *    (`getItem<ThrowOnError>(…)` returning `Result<Table, Errors, ThrowOnError>`).
+   *
+   * An argument read here names a payload only where a branch of the result
+   * holds it (`resultCarrierArguments`), so a type parameter of the callee or
+   * a style flag carries nothing.
+   */
+  private callResultArguments(callExpr: CallExpression): Type[] {
+    const explicit = callExpr.getTypeArguments().map((node) => node.getType());
+    if (explicit.length > 0) return explicit;
+    try {
+      const declaration = this.project
+        .getTypeChecker()
+        .getResolvedSignature(callExpr)
+        ?.getDeclaration();
+      if (declaration && Node.isReturnTyped(declaration)) {
+        return declaration.getReturnType().getAliasTypeArguments();
+      }
+    } catch {
+      // A signature the checker cannot resolve states no arguments.
+    }
+    return [];
   }
 
   /**
@@ -3377,8 +3527,11 @@ export class TypeInferrer {
    */
   private resultCarrierArguments(
     type: Type,
-    at: Node
-  ): { carrier: Type; carried: Type[] } | undefined {
+    at: Node,
+    callArgs: Type[] = []
+  ):
+    | { carrier: Type; carried: Type[]; bodies: Map<Type, Type>; readOffCall: boolean }
+    | undefined {
     const carrier = this.unwrapThenableType(this.unwrapPromiseType(type));
     if (!carrier.isUnion()) {
       return undefined;
@@ -3387,29 +3540,88 @@ export class TypeInferrer {
     if (branches.length < 2 || !branches.every((branch) => this.isObjectShape(branch))) {
       return undefined;
     }
-    const args = [
-      ...carrier.getAliasTypeArguments(),
-      ...carrier.getTypeArguments(),
-    ];
+    const own = [...carrier.getAliasTypeArguments(), ...carrier.getTypeArguments()];
+    // carrick#1841: a carrier with no arguments of its own is read through the
+    // arguments its call was built from (`callResultArguments`).
+    const readOffCall = own.length === 0;
+    const args = readOffCall ? callArgs : own;
     if (args.length < 2) {
       return undefined;
     }
+    // carrick#1841: on a carrier read off the call, a member every branch
+    // holds with one type (the request and response objects a client hands
+    // back beside the result) is the transport's, not a side of the result.
+    const transport = readOffCall ? this.membersCommonToEveryBranch(branches, at) : new Set();
+    const checker = this.project.getTypeChecker().compilerObject;
+    // What a branch member holding a response table's body looks like: the
+    // table indexed by its own keys (`Table[keyof Table]`), which the compiler
+    // resolves to the union of the table's values.
+    const tableValues = new Map<Type, Set<ts.Type>>();
+    for (const arg of args) {
+      const entries = statusTableOf(checker, arg.compilerType);
+      if (entries) {
+        tableValues.set(
+          arg,
+          new Set(
+            entries.flatMap((entry) =>
+              constituents(checker.getTypeOfSymbolAtLocation(entry.symbol, at.compilerNode))
+            )
+          )
+        );
+      }
+    }
+    const bodies = new Map<Type, Type>();
     // A type argument only names a payload when a branch actually holds it:
     // a generic that parameterises a status code or a key carries nothing.
     const carried = args.filter((arg) =>
       branches.some((branch) =>
-        branch
-          .getProperties()
-          .some((property) => {
-            try {
-              return property.getTypeAtLocation(at).getText() === arg.getText();
-            } catch {
-              return false;
+        branch.getProperties().some((property) => {
+          if (transport.has(property.getName())) return false;
+          try {
+            const held = property.getTypeAtLocation(at);
+            if (held.getText() === arg.getText()) return true;
+            const values = tableValues.get(arg);
+            const heldTypes = constituents(held.compilerType);
+            if (
+              values &&
+              heldTypes.length === values.size &&
+              heldTypes.every((member) => values.has(member))
+            ) {
+              bodies.set(arg, held);
+              return true;
             }
-          })
+            return false;
+          } catch {
+            return false;
+          }
+        })
       )
     );
-    return carried.length === 0 ? undefined : { carrier, carried };
+    return carried.length === 0 ? undefined : { carrier, carried, bodies, readOffCall };
+  }
+
+  /** The member names every branch holds, each with one and the same type. */
+  private membersCommonToEveryBranch(branches: Type[], at: Node): Set<string> {
+    const [first, ...rest] = branches;
+    const common = new Set<string>();
+    for (const property of first.getProperties()) {
+      const name = property.getName();
+      let held: Type;
+      try {
+        held = property.getTypeAtLocation(at);
+      } catch {
+        continue;
+      }
+      const same = rest.every((branch) => {
+        try {
+          return branch.getProperty(name)?.getTypeAtLocation(at).compilerType === held.compilerType;
+        } catch {
+          return false;
+        }
+      });
+      if (same) common.add(name);
+    }
+    return common;
   }
 
   /**
@@ -3420,7 +3632,13 @@ export class TypeInferrer {
    * re-reading the raw call (`inference_decided_no_contract`,
    * engine/type_compat_v2.rs).
    */
-  private transportAbstain(request: InferRequestItem, callExpr: CallExpression): InferredType {
+  private transportAbstain(
+    request: InferRequestItem,
+    callExpr: CallExpression,
+    detail: string = "what this call's result carries is transport that the service's wrapper " +
+      'rules verify and read no payload out of (a library response object around the body), ' +
+      'so this site states no response contract'
+  ): InferredType {
     const abstain = this.createInferredType(
       request,
       'unknown',
@@ -3432,10 +3650,7 @@ export class TypeInferrer {
         path: '',
         kind: 'unknown',
         reason: 'machinery_envelope',
-        detail:
-          "what this call's result carries is transport that the service's wrapper rules " +
-          'verify and read no payload out of (a library response object around the body), ' +
-          'so this site states no response contract',
+        detail,
       },
     ];
     return abstain;
@@ -6617,14 +6832,9 @@ export class TypeInferrer {
     | { kind: 'no_body'; member: string } {
     if (Node.isCallExpression(node)) {
       const args = node.getArguments();
+      if (args.length === 1) return this.requestObjectBody(args[0]);
       if (args.length < 2) return { kind: 'none' };
-      const first = args[0].getType();
-      const stringLike =
-        first.isString() ||
-        first.isStringLiteral() ||
-        first.isTemplateLiteral() ||
-        (first.isUnion() && first.getUnionTypes().every((t) => t.isString() || t.isStringLiteral()));
-      if (!stringLike) return { kind: 'none' };
+      if (!this.isStringLikeType(args[0].getType())) return { kind: 'none' };
       const slots = this.requestBodySlots(node);
       for (let i = 1; i < args.length; i++) {
         const slot = slots[i];
@@ -6655,6 +6865,98 @@ export class TypeInferrer {
     }
 
     return { kind: 'none' };
+  }
+
+  /** A string, a string literal, a template literal, or a union of strings. */
+  private isStringLikeType(type: Type): boolean {
+    return (
+      type.isString() ||
+      type.isStringLiteral() ||
+      type.isTemplateLiteral() ||
+      (type.isUnion() && type.getUnionTypes().every((t) => t.isString() || t.isStringLiteral()))
+    );
+  }
+
+  /**
+   * carrick#1841, request half: a request call that states its URL on its one
+   * object argument (`client.post({ url: '/items', ...options })`, the way a
+   * generated client issues every operation). The method's own parameter
+   * types the body `unknown`, so the object is the only statement of it: its
+   * `body` member, the member `RequestInit` defines, written on the object or
+   * carried in by a spread whose type says what it is.
+   *
+   * - A `body` written after the object's last spread is the body.
+   * - Otherwise the object's own type has the answer. No `body` member, or
+   *   one typed `undefined` or `never`, means the call sends no body.
+   * - A member typed `any`, `unknown` or a type parameter, or one only the
+   *   compiler's default library declares (a spread `RequestInit` carries the
+   *   serialised `BodyInit`, not a payload), states no payload: abstain. So
+   *   does an object that carries another body-named member and no `body`.
+   *
+   * An object with no string-typed `url` member is not a request object.
+   */
+  private requestObjectBody(
+    arg: Node
+  ):
+    | { kind: 'none' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body'; node: Node; from: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string }
+    | { kind: 'no_body'; member: string } {
+    const literal = this.unwrapExpressionNode(arg);
+    if (!Node.isObjectLiteralExpression(literal)) return { kind: 'none' };
+    const objectType = literal.getType();
+    const url = objectType.getProperty('url');
+    if (!url || !this.isStringLikeType(url.getTypeAtLocation(literal).getNonNullableType())) {
+      return { kind: 'none' };
+    }
+    const from = "the request call's request object";
+    const member = 'body';
+
+    const properties = literal.getProperties();
+    const written = properties.findIndex(
+      (p) =>
+        (Node.isPropertyAssignment(p) || Node.isShorthandPropertyAssignment(p)) &&
+        p.getName() === member
+    );
+    const spreadAfter = properties.some((p, i) => i > written && Node.isSpreadAssignment(p));
+    if (written >= 0 && !spreadAfter) {
+      const value = this.objectLiteralMemberValue(literal, member);
+      if (value) return { kind: 'body', node: value, from };
+    }
+
+    const property = objectType.getProperty(member);
+    if (!property) {
+      const otherBodyMember = [...BODY_MEMBER_NAMES].some(
+        (name) => name !== member && objectType.getProperty(name)
+      );
+      return otherBodyMember
+        ? { kind: 'abstain', why: `the request object carries no '${member}' member but another body-named one` }
+        : { kind: 'no_body', member };
+    }
+    const type = property.getTypeAtLocation(literal);
+    if (type.isAny() || type.isUnknown() || type.isTypeParameter()) {
+      return { kind: 'abstain', why: `the request object's '${member}' member is not typed` };
+    }
+    const bare = type.getNonNullableType();
+    if (bare.isNever() || bare.isUndefined() || bare.isVoid()) {
+      return { kind: 'no_body', member };
+    }
+    if (bare.isAny() || bare.isUnknown() || bare.isTypeParameter()) {
+      return { kind: 'abstain', why: `the request object's '${member}' member is not typed` };
+    }
+    const program = this.project.getProgram().compilerObject;
+    const declarations = property.getDeclarations();
+    if (
+      declarations.length > 0 &&
+      declarations.every((d) => program.isSourceFileDefaultLibrary(d.getSourceFile().compilerNode))
+    ) {
+      return {
+        kind: 'abstain',
+        why: `the request object's '${member}' member is the platform's serialised body, not a payload`,
+      };
+    }
+    return { kind: 'body_type', type: bare, at: literal, from };
   }
 
   /**
@@ -7239,14 +7541,9 @@ export class TypeInferrer {
       if (!Node.isPropertyAssignment(prop)) {
         continue;
       }
-      const name = prop.getName().replace(/['"`]/g, '').toLowerCase();
-      // `2xx` is a status RANGE key; treat it as the bottom of its range.
-      const code = /^\d{3}$/.test(name)
-        ? Number(name)
-        : /^\dxx$/.test(name)
-          ? Number(name[0]) * 100
-          : NaN;
-      if (!Number.isFinite(code) || code < 200 || code > 299) {
+      // `2xx` is a status RANGE key; it reads as the bottom of its range.
+      const code = statusKeyCode(prop.getName());
+      if (code === undefined || code < 200 || code > 299) {
         continue;
       }
       const initializer = prop.getInitializer();
@@ -8139,12 +8436,11 @@ export class TypeInferrer {
       infer_kind: request.infer_kind,
       payload_type_string: payloadTypeString,
       primary_type_symbol: primaryTypeSymbol,
-      // Only meaningful relative to the anchor symbol: without an element
-      // symbol there is nothing for the explicit-bundle correction to match.
-      array_depth:
-        primaryTypeSymbol !== undefined && arrayDepth !== undefined && arrayDepth > 0
-          ? arrayDepth
-          : undefined,
+      // Reported whether or not the element has a symbol (carrick#1967): an
+      // array whose element prints structurally is still a list. The Rust
+      // depth join copies it onto the model's symbol when the symbols agree,
+      // or, at a handler's send, when the element has no symbol to disagree.
+      array_depth: arrayDepth !== undefined && arrayDepth > 0 ? arrayDepth : undefined,
       // Same gate: a declaration source without an anchor symbol is useless.
       primary_type_symbol_source:
         primaryTypeSymbol !== undefined ? primaryTypeSymbolSource : undefined,

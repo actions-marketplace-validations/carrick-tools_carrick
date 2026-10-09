@@ -572,6 +572,12 @@ export interface SymbolRequest {
    * symbol as-is (the HTTP/socket/consumer default).
    */
   array_depth?: number;
+  /**
+   * carrick#1841: the symbol names what a consumer receives. A symbol that is
+   * a response table keyed by status code (`{ 200: Item }`) then bundles as
+   * its 2xx body, never as the table.
+   */
+  consumer_response?: boolean;
 }
 
 /**
@@ -1006,7 +1012,10 @@ export interface InferredType {
    * `array_depth: 1`. Lets `resolve_all_types` copy the use-site's array-ness
    * onto an explicit `SymbolRequest` for the same alias, which would otherwise
    * bundle the bare element and erase the array (array-vs-scalar scored
-   * compatible, #306). Omitted when 0 or when there is no anchor symbol.
+   * compatible, #306). Omitted when 0. Reported without an anchor symbol
+   * too (carrick#1967): a list whose element prints structurally is still a
+   * list, and at a handler's send the join copies its depth onto the model's
+   * symbol.
    */
   array_depth?: number;
   /**

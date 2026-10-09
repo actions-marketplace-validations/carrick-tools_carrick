@@ -432,6 +432,12 @@ pub struct FileCentricAnalysisResult {
     pub mount_graph: MountGraph,
     /// Processing statistics
     pub stats: ProcessingStats,
+    /// Inline-plugin registrations whose prefix the source does not state as
+    /// a literal (carrick#2092), one per scope. The mount graph reads each
+    /// one's candidates and may corroborate it there
+    /// (`stats.mount_prefixes_corroborated`), so a record here is an input to
+    /// the graph, not a verdict that the prefix stayed unread.
+    pub unread_mount_prefixes: Vec<crate::registration_scope::UnreadPrefix>,
     /// Bundled type definitions (if sidecar was used)
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
@@ -516,6 +522,14 @@ pub struct ProcessingStats {
     /// anchors themselves are computed for every gated file; only the ones the
     /// LLM missed are counted here.
     pub pubsub_anchor_backfills: usize,
+    /// Inline-plugin registrations whose prefix the source does not state as
+    /// a literal (carrick#2092). Each is logged with its site; the scope's
+    /// routes are served without a prefix rather than under a guessed one.
+    pub mount_prefixes_unread: usize,
+    /// Of those, the ones whose prefix was read after all: the registration's
+    /// other arguments read to one route path, and the service's own route
+    /// descriptors state the scope's routes under it (carrick#2092).
+    pub mount_prefixes_corroborated: usize,
     /// LLM-emitted pub/sub operations dropped because their topic has no
     /// literal witness (string literal or template-literal shape) in the
     /// analyzed file's source (carrick#311). The analyzer occasionally invents
@@ -681,6 +695,9 @@ struct FileSymbols {
     /// Which import each local binding's value traces back to (carrick#666).
     /// Constrains the package-surface member join below.
     receiver_origins: ReceiverOrigins,
+    /// Calls that hand an inline function the instance it registers routes
+    /// on (carrick#2092), read after the join.
+    registration_sites: Vec<crate::registration_scope::RegistrationSite>,
 }
 
 /// Where one request member is declared (carrick#656).
@@ -1669,6 +1686,7 @@ impl FileOrchestrator {
         // read as "the model said nothing about it" and freeze the skip for as
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        let mut unread_prefixes: Vec<crate::registration_scope::UnreadPrefix> = Vec::new();
         let mut stats = ProcessingStats::default();
         // Every path that reaches a prompt is reduced against this (see
         // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
@@ -1830,6 +1848,9 @@ impl FileOrchestrator {
             /// Call sites whose callee provably sends nothing (carrick#1555),
             /// by span start: a model row at one is withdrawn after the join.
             silent_sites: BTreeSet<u32>,
+            /// Calls in this file that hand an inline function the instance
+            /// it registers routes on (carrick#2092).
+            registration_sites: Vec<crate::registration_scope::RegistrationSite>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1885,6 +1906,7 @@ impl FileOrchestrator {
             member_deficits: &mut HashMap<String, u32>,
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
             dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
+            unread_prefixes: &mut Vec<crate::registration_scope::UnreadPrefix>,
         ) {
             // A model row at a site whose callee provably sends nothing is
             // the model reading a request into a name (carrick#1555).
@@ -1948,6 +1970,18 @@ impl FileOrchestrator {
             // router's structural entries instead of both surviving and flipping
             // form between non-deterministic scans.
             FileOrchestrator::canonicalize_endpoint_paths(adjusted);
+
+            // Give each inline plugin's instance a node of its own and state
+            // its prefix where the source does (carrick#2092). After the
+            // paths are canonical, and over the joined rows on both arms, so
+            // a cached answer gets it without a model call.
+            let unread = crate::registration_scope::apply_registration_scopes(
+                adjusted,
+                &pf.registration_sites,
+                &pf.prompt_path,
+            );
+            stats.mount_prefixes_unread += unread.len();
+            unread_prefixes.extend(unread);
 
             // Drop LLM-emitted pub/sub ops whose topic has no literal
             // witness in the file's source (carrick#311): the analyzer
@@ -2466,6 +2500,7 @@ impl FileOrchestrator {
                 request_members: symbols.request_members,
                 dispatch_members: symbols.dispatch_members,
                 receiver_origins: symbols.receiver_origins,
+                registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
                 dispatch_sites: HashMap::new(),
@@ -2934,6 +2969,7 @@ impl FileOrchestrator {
                 request_members: RequestMemberIndex::default(),
                 dispatch_members: DispatchMemberIndex::default(),
                 receiver_origins: ReceiverOrigins::default(),
+                registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
                 dispatch_sites: HashMap::new(),
@@ -3195,6 +3231,7 @@ impl FileOrchestrator {
                 raw_model_results: HashMap::new(),
                 mount_graph: MountGraph::new(),
                 stats,
+                unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
             });
@@ -3433,6 +3470,7 @@ impl FileOrchestrator {
                         &mut member_deficits,
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
+                        &mut unread_prefixes,
                     );
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -3513,6 +3551,7 @@ impl FileOrchestrator {
                         &mut member_deficits,
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
+                        &mut unread_prefixes,
                     );
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
@@ -3793,14 +3832,25 @@ impl FileOrchestrator {
         }
 
         // STEP 5: Build aggregated mount graph from all file results
-        let mount_graph =
-            self.build_mount_graph(&file_results, normalizer, service_root, Path::new(""));
+        let (mount_graph, corroborated) = self.build_mount_graph_reading_scopes(
+            &file_results,
+            normalizer,
+            service_root,
+            Path::new(""),
+            &unread_prefixes,
+        );
+        // A scope whose prefix the service's descriptors corroborated is no
+        // longer unread (carrick#2092). The records stay in the result: the
+        // engine's rebuild of the graph reads them the same way.
+        stats.mount_prefixes_corroborated = corroborated.len();
+        stats.mount_prefixes_unread -= corroborated.len();
 
         Ok(FileCentricAnalysisResult {
             file_results,
             raw_model_results,
             mount_graph,
             stats,
+            unread_mount_prefixes: unread_prefixes,
             bundled_types: None,
             type_resolution: None,
         })
@@ -3854,24 +3904,30 @@ impl FileOrchestrator {
                 "POST" | "PUT" | "PATCH" | "DELETE" | "ALL" | "UNKNOWN"
             )
         };
-        let mut push_explicit =
-            |symbol_name: String, source_file: String, alias: Option<String>| {
-                let key = format!(
-                    "{}|{}|{}",
-                    source_file,
+        // `consumer_response` marks a symbol named for what a consumer call
+        // receives (carrick#1841): the sidecar reads a response table keyed
+        // by status code as its 2xx body there.
+        let mut push_explicit = |symbol_name: String,
+                                 source_file: String,
+                                 alias: Option<String>,
+                                 consumer_response: bool| {
+            let key = format!(
+                "{}|{}|{}",
+                source_file,
+                symbol_name,
+                alias.as_deref().unwrap_or("")
+            );
+            if explicit_seen.insert(key) {
+                explicit_requests.push(SymbolRequest {
                     symbol_name,
-                    alias.as_deref().unwrap_or("")
-                );
-                if explicit_seen.insert(key) {
-                    explicit_requests.push(SymbolRequest {
-                        symbol_name,
-                        source_file,
-                        alias,
-                        array_depth: None,
-                        payload_borrow_witness: false,
-                    });
-                }
-            };
+                    source_file,
+                    alias,
+                    array_depth: None,
+                    payload_borrow_witness: false,
+                    consumer_response,
+                });
+            }
+        };
         // Source text of each file a span locator addresses, read once and kept
         // for the rest of the collection. Converting a span into the sidecar's
         // numbering needs the bytes between the file's start and the site, and
@@ -4038,6 +4094,10 @@ impl FileOrchestrator {
         for (file_path, result) in files {
             // Convert file_path to absolute path relative to repo root
             let file_path_absolute = Self::to_absolute_path(file_path, &repo_root_absolute);
+            // The descriptors of this file whose handler the type layer can
+            // follow, by span start, read once and only when the file holds
+            // a descriptor row (carrick#2094).
+            let mut followable_descriptors: Option<HashSet<u32>> = None;
 
             // Process endpoints
             for endpoint in &result.endpoints {
@@ -4112,6 +4172,7 @@ impl FileOrchestrator {
                             symbol.clone(),
                             Self::resolve_import_path(&file_path_absolute, import_source, modules),
                             Some(response_alias.clone()),
+                            false,
                         );
                     } else if endpoint.primary_type_symbol.is_some()
                         && endpoint.type_import_source.is_none()
@@ -4122,6 +4183,7 @@ impl FileOrchestrator {
                                 symbol.clone(),
                                 file_path_absolute.clone(),
                                 Some(response_alias.clone()),
+                                false,
                             );
                         }
                     } else if endpoint.type_import_source.is_some()
@@ -4276,6 +4338,41 @@ impl FileOrchestrator {
                         );
                     }
                     continue;
+                }
+
+                // A route declared as data (carrick#2094). Its span is the
+                // descriptor object itself, and the type layer answers a span
+                // request there with the handler the object names when that
+                // is an inline function or an identifier. With no such
+                // handler (a documentation entry, a handler read off a
+                // member) nothing on the object sends a body, and the answer
+                // would be the descriptor literal published as the route's
+                // contract. A `$ref` schema needs a name lookup and a schema
+                // library's type needs library knowledge, so that row asks
+                // for nothing and its manifest entry stays `unknown`. A file
+                // that cannot be read again asks for nothing either.
+                if endpoint.pattern_matched == ROUTE_DESCRIPTOR_PATTERN {
+                    let followable = followable_descriptors.get_or_insert_with(|| {
+                        std::fs::read_to_string(&file_path_absolute)
+                            .map(|content| {
+                                self.swc_scanner
+                                    .route_descriptor_endpoints(
+                                        Path::new(&file_path_absolute),
+                                        &content,
+                                    )
+                                    .into_iter()
+                                    .filter(|descriptor| descriptor.handler_followable)
+                                    .map(|descriptor| descriptor.span_start)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    });
+                    if !endpoint
+                        .call_expression_span_start
+                        .is_some_and(|start| followable.contains(&start))
+                    {
+                        continue;
+                    }
                 }
 
                 // Route response inference by the model's emission_style
@@ -4445,6 +4542,7 @@ impl FileOrchestrator {
                             symbol.clone(),
                             Self::resolve_import_path(&file_path_absolute, import_source, modules),
                             Some(response_alias.clone()),
+                            true,
                         );
                     } else if data_call.primary_type_symbol.is_some()
                         && data_call.type_import_source.is_none()
@@ -4455,6 +4553,7 @@ impl FileOrchestrator {
                                 symbol.clone(),
                                 file_path_absolute.clone(),
                                 Some(response_alias.clone()),
+                                true,
                             );
                         }
                     } else if data_call.type_import_source.is_some()
@@ -4500,6 +4599,25 @@ impl FileOrchestrator {
                 // line states it.
                 if should_infer_request_body(&method) {
                     match &data_call.call_body {
+                        // A request spec states its URL on the call's one
+                        // object argument, and the body rides on that object
+                        // too, written there or spread in (carrick#1841). The
+                        // sidecar reads it at the call; the model's payload
+                        // there names the options parameter, not the body.
+                        None if data_call.resolution_source
+                            == Some(ResolutionSource::RequestSpec) =>
+                        {
+                            push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::RequestBody,
+                                request_alias.clone(),
+                                InferLocator::Span {
+                                    span_start: data_call.call_expression_span_start,
+                                    span_end: data_call.call_expression_span_end,
+                                },
+                            );
+                        }
                         None => {
                             push_infer(
                                 &file_path_absolute,
@@ -4594,6 +4712,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     array_depth: None,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 });
             }
         };
@@ -4770,6 +4889,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         array_depth: None,
                         payload_borrow_witness,
+                        consumer_response: false,
                     });
                 }
             }
@@ -5059,6 +5179,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     array_depth: None,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 });
             }
         }
@@ -5103,6 +5224,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     array_depth,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 });
             }
         }
@@ -5867,6 +5989,9 @@ impl FileOrchestrator {
         // Same parse again: the origins are read off the declarators the
         // extractors above already walked.
         let receiver_origins = collect_receiver_origins(&module);
+        // Same parse again (carrick#2092): the resolver's scopes are what
+        // read a prefix binding by its declaration rather than its name.
+        let registration_sites = crate::registration_scope::collect_registration_sites(&module, cm);
 
         FileSymbols {
             table: SymbolTable {
@@ -5880,6 +6005,7 @@ impl FileOrchestrator {
             request_members,
             dispatch_members,
             receiver_origins,
+            registration_sites,
         }
     }
 
@@ -9837,6 +9963,21 @@ impl FileOrchestrator {
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
         normalizer: &UrlNormalizer,
+        scan_root: &Path,
+        file_root: &Path,
+    ) -> MountGraph {
+        self.build_mount_graph_reading_scopes(file_results, normalizer, scan_root, file_root, &[])
+            .0
+    }
+
+    /// [`Self::build_mount_graph`], reading the prefix of each registration
+    /// scope the source did not state as a literal (carrick#2092 slice 1b).
+    /// Returns the graph and the scope ids whose prefix the service's own
+    /// route descriptors corroborated.
+    pub fn build_mount_graph_reading_scopes(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        normalizer: &UrlNormalizer,
         // Root the `file_results` keys are resolved against when classifying
         // endpoint provenance (real route vs mock/test handler): the service
         // scan root when keys are as-scanned paths, or `Path::new("")` when
@@ -9849,7 +9990,8 @@ impl FileOrchestrator {
         // (absolute, or relative to the working directory); the repo root
         // when the engine has normalized them to repo-relative paths.
         file_root: &Path,
-    ) -> MountGraph {
+        unread_scopes: &[crate::registration_scope::UnreadPrefix],
+    ) -> (MountGraph, Vec<String>) {
         let mut graph = MountGraph::new();
 
         // Every pass reads the files in path order, so the graph's rows come
@@ -10033,13 +10175,22 @@ impl FileOrchestrator {
                     continue;
                 }
 
-                // Try to resolve the owner using import information
-                let resolved_owner = Self::resolve_endpoint_owner(
-                    &owner_bindings,
-                    &import_map,
-                    &endpoint.owner_node,
-                    file_path,
-                );
+                // Try to resolve the owner using import information. A
+                // registration scope (carrick#2092) is already the node its
+                // routes hang from: the file-first identity would hand them
+                // to the plugin binding the file is mounted under and drop
+                // the scope's own prefix.
+                let resolved_owner = if crate::registration_scope::is_scope_id(&endpoint.owner_node)
+                {
+                    endpoint.owner_node.clone()
+                } else {
+                    Self::resolve_endpoint_owner(
+                        &owner_bindings,
+                        &import_map,
+                        &endpoint.owner_node,
+                        file_path,
+                    )
+                };
 
                 graph.endpoints.push(ResolvedEndpoint {
                     method,
@@ -10246,8 +10397,21 @@ impl FileOrchestrator {
             graph.data_calls.push(call);
         }
 
+        // A registration scope whose prefix the source did not state as a
+        // literal takes the one route path its arguments read to, where the
+        // service's own route descriptors state its routes under it
+        // (carrick#2092). Before the paths are composed, so it composes like
+        // any other prefix.
+        let corroborated = Self::corroborate_scope_prefixes(&mut graph, unread_scopes);
+
         // Sixth pass: resolve full paths for endpoints
         self.resolve_endpoint_paths(&mut graph, &registration_literals);
+
+        // One row per operation (carrick#2094): a route the service documents
+        // as data and also registers is one operation. Once every full path
+        // is final, so the documented path and the handler's composed path
+        // can agree.
+        Self::fold_documented_operations(&mut graph);
 
         // Evidence classification (#379): an "endpoint" whose exact source
         // site was ALSO extracted as a data call is a client call expression
@@ -10321,7 +10485,181 @@ impl FileOrchestrator {
             call.own_route = own_route;
         }
 
-        graph
+        (graph, corroborated)
+    }
+
+    /// Read the prefix of each registration scope the source did not state
+    /// as a literal, where the service's own route descriptors corroborate it
+    /// (carrick#2092 slice 1b). Returns the scope ids whose prefix was set.
+    ///
+    /// Two signals, both required, neither naming an option, a library or a
+    /// framework:
+    ///
+    /// * the registration's other arguments read to exactly one route path
+    ///   `P` ([`crate::registration_scope::UnreadPrefix::candidates`]);
+    /// * among the routes under the scope, at least one is documented by a
+    ///   route descriptor of this service (`{ method, path, … }` data) at the
+    ///   same method and `P` + its path, and none at its own unprefixed path.
+    ///
+    /// Anything else leaves the prefix unread. Runs before the paths are
+    /// composed, while each endpoint's `path` is still router-relative and a
+    /// descriptor row's `path` is its absolute path.
+    fn corroborate_scope_prefixes(
+        graph: &mut MountGraph,
+        unread_scopes: &[crate::registration_scope::UnreadPrefix],
+    ) -> Vec<String> {
+        let mut corroborated = Vec::new();
+        if unread_scopes.is_empty() {
+            return corroborated;
+        }
+        let documented: Vec<(&str, &str)> = graph
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
+            })
+            .map(|endpoint| (endpoint.method.as_str(), endpoint.path.as_str()))
+            .collect();
+        if documented.is_empty() {
+            return corroborated;
+        }
+        for scope in unread_scopes {
+            let [prefix] = scope.candidates.as_slice() else {
+                continue; // none, or several the source does not tell apart
+            };
+            let Some(edge) = graph
+                .mounts
+                .iter()
+                .position(|mount| mount.child == scope.scope_id && mount.path_prefix.is_empty())
+            else {
+                continue;
+            };
+            let before = Self::mount_prefix_chains(&graph.mounts);
+            let mut with_prefix = graph.mounts.clone();
+            with_prefix[edge].path_prefix = prefix.clone();
+            let after = Self::mount_prefix_chains(&with_prefix);
+
+            let mut agreeing = 0usize;
+            let mut unprefixed = 0usize;
+            for endpoint in &graph.endpoints {
+                if endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute) {
+                    continue;
+                }
+                let (Some(without), Some(with)) =
+                    (before.get(&endpoint.owner), after.get(&endpoint.owner))
+                else {
+                    continue;
+                };
+                if without == with {
+                    continue; // not under this scope
+                }
+                let documents = |chains: &Vec<String>| {
+                    chains.iter().any(|chain| {
+                        let full_path = Self::join_paths(chain, &endpoint.path);
+                        documented.iter().any(|(method, path)| {
+                            *method == endpoint.method
+                                && MountGraph::paths_equal_modulo_param_names(path, &full_path)
+                        })
+                    })
+                };
+                if documents(without) {
+                    unprefixed += 1;
+                }
+                if documents(with) {
+                    agreeing += 1;
+                }
+            }
+            if agreeing > 0 && unprefixed == 0 {
+                debug!(
+                    "Mount prefix corroborated at {}: '{}' read from '{}'; this service's route \
+                     descriptors state {} of the scope's routes under it",
+                    scope.site, prefix, scope.expression, agreeing
+                );
+                graph.mounts[edge].path_prefix = prefix.clone();
+                corroborated.push(scope.scope_id.clone());
+            } else {
+                debug!(
+                    "Mount prefix left unread at {}: '{}' is documented for {} of the scope's \
+                     routes, and {} are documented without it",
+                    scope.site, prefix, agreeing, unprefixed
+                );
+            }
+        }
+        corroborated
+    }
+
+    /// Fold each documentation row into the handler row that serves the same
+    /// operation (carrick#2094). Returns how many rows were folded.
+    ///
+    /// A route descriptor that names no handler (`{ method, path, summary,
+    /// responses }` documentation data) states an operation's method and
+    /// absolute path as a fact, and nothing to type it by. The handler row the
+    /// registration states carries the type anchors. Two rows for one
+    /// operation make every consumer pair twice, once with the untyped one, so
+    /// the descriptor folds into its partner: the single other row of this
+    /// service with the same method, the same full path (placeholders written
+    /// either way) and the same dispatch case. The partner keeps its own site,
+    /// which is what its types are read at, and takes the descriptor's
+    /// `descriptor_route` label: the method and path are the descriptor's fact.
+    ///
+    /// With no partner the descriptor stays, as the only row of its
+    /// operation. With several, every row stays: which one the documentation
+    /// describes is not something the paths can say.
+    fn fold_documented_operations(graph: &mut MountGraph) -> usize {
+        let documentation = |endpoint: &ResolvedEndpoint| {
+            endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
+                && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
+        };
+        let mut folded_into = vec![false; graph.endpoints.len()];
+        let mut drop = vec![false; graph.endpoints.len()];
+        for (index, descriptor) in graph.endpoints.iter().enumerate() {
+            if !documentation(descriptor) {
+                continue;
+            }
+            let partners: Vec<usize> = graph
+                .endpoints
+                .iter()
+                .enumerate()
+                .filter(|(other, endpoint)| {
+                    *other != index
+                        && endpoint.resolution_source != Some(ResolutionSource::DescriptorRoute)
+                        && endpoint.method == descriptor.method
+                        && MountGraph::paths_equal_modulo_param_names(
+                            &endpoint.full_path,
+                            &descriptor.full_path,
+                        )
+                        && endpoint.dispatch == descriptor.dispatch
+                })
+                .map(|(other, _)| other)
+                .collect();
+            match partners.as_slice() {
+                [] => {}
+                [partner] if !folded_into[*partner] => {
+                    folded_into[*partner] = true;
+                    drop[index] = true;
+                }
+                _ => debug!(
+                    "Documented operation {} {} at {} not folded: {} rows of this service \
+                     serve it",
+                    descriptor.method,
+                    descriptor.full_path,
+                    descriptor.file_location,
+                    partners.len()
+                ),
+            }
+        }
+        for (endpoint, folded) in graph.endpoints.iter_mut().zip(&folded_into) {
+            if *folded {
+                endpoint.resolution_source = Some(ResolutionSource::DescriptorRoute);
+            }
+        }
+        let folded = drop.iter().filter(|dropped| **dropped).count();
+        if folded > 0 {
+            debug!("Documented operations folded into the handler row serving them: {folded}");
+        }
+        let mut keep = drop.iter().map(|dropped| !dropped);
+        graph.endpoints.retain(|_| keep.next().unwrap_or(true));
+        folded
     }
 
     fn normalize_import_source(source: &str) -> String {
@@ -14282,6 +14620,113 @@ export * from "./aFetch.js";"#,
         let body_alias = at_declaration.alias.clone().expect("body alias");
         assert!(body_alias.contains("_Request_"), "{body_alias}");
         assert_eq!(call_id(&body_alias), call_id(&result_at_30));
+    }
+
+    /// carrick#1841, request half: a request spec states its URL on the
+    /// call's one object argument (`client.post({ url: "/items", ...options
+    /// })`), and the body rides on that object, written there or spread in.
+    /// The row asks for its request body at the call, by the call's span, so
+    /// the sidecar reads the object's `body` member. The payload a model row
+    /// folded onto the site names the options parameter, which is not the
+    /// body. A model row keeps its own payload.
+    #[test]
+    fn a_spread_request_spec_states_its_body() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let source = "export const createItem = (options: Options<CreateItemData>) =>\n  client.post<CreateItemResponses>({ url: \"/items\", ...options });\nexport const legacy = (options: LegacyOptions) =>\n  send(\"/items\", options);\n";
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("src/sdk.ts");
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("source dir");
+        std::fs::write(&file, source).expect("source");
+        let offset =
+            |needle: &str| u32::try_from(source.find(needle).expect("needle")).expect("offset");
+        let (spec_start, spec_end) = (
+            offset("client.post"),
+            offset(" }") + u32::try_from(" })".len()).expect("len"),
+        );
+        let (model_start, model_end) = (offset("send("), offset("options);") + 8);
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let row = |line: i32, start: u32, end: u32, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{}-{}", start + base, end + base),
+            line_number: line,
+            target: "/items".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: "client".to_string(),
+            call_expression_span_start: Some(start + base),
+            call_expression_span_end: Some(end + base),
+            call_expression_text: None,
+            call_expression_line: Some(line),
+            // Where the model points a generated operation's payload: the
+            // options parameter on the declaration line.
+            payload_expression_text: Some("options".to_string()),
+            payload_expression_line: Some(line - 1),
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/sdk.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    row(2, spec_start, spec_end, ResolutionSource::RequestSpec),
+                    row(4, model_start, model_end, ResolutionSource::Model),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &Config::default(),
+            &repo_modules(repo.path()),
+        );
+
+        let body_at = |line: u32| {
+            infer
+                .iter()
+                .find(|item| item.infer_kind == InferKind::RequestBody && item.line_number == line)
+                .unwrap_or_else(|| panic!("a request body is asked for at line {line}: {infer:?}"))
+        };
+        let spec = body_at(2);
+        // The span goes out in the sidecar's numbering: from zero.
+        assert_eq!(
+            (
+                spec.span_start,
+                spec.span_end,
+                spec.expression_text.as_deref()
+            ),
+            (Some(spec_start), Some(spec_end), None),
+            "the request spec asks at its call"
+        );
+        let model = body_at(4);
+        assert_eq!(
+            (model.span_start, model.expression_text.as_deref()),
+            (None, Some("options")),
+            "a model row keeps its own payload"
+        );
     }
 
     /// carrick#1601: the mark a summary row carries reaches the call row the
