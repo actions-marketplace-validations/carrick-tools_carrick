@@ -28,7 +28,34 @@ struct CliArgs {
     /// config mapping pointing at a directory that is not there — instead of
     /// refusing it (carrick#1254).
     allow_unprepared: bool,
+    /// `--repo <owner/name>`: the repository this checkout is, whatever its
+    /// folder and its remote say (carrick#2207). Held as written; validated by
+    /// [`declared_repo`] in `main`. Empty when the flag was the last argument.
+    repo: Option<String>,
+    /// `--upload` (`true`) or `--no-upload` (`false`); `None` decides from
+    /// the GitHub context as before (carrick#2207).
+    upload: Option<bool>,
+    /// `--changed-only`: analyse only the services whose inputs changed
+    /// since their stored index, and carry the rest (carrick#2227).
+    changed_only: bool,
+    /// `--pr`, `--pr-head`, `--pr-base`: the pull request this checkout is,
+    /// outside GitHub Actions (carrick#2229). Held as written; validated by
+    /// `pr_context::declare_from_flags` in `main`.
+    pr: carrick::pr_context::PrFlags,
 }
+
+/// The runner's flags (carrick#2207), left out of `carrick --help`: only a
+/// scan run by something other than a person passes them. Their contract is
+/// `docs/reference/runner.md`.
+const REPO_FLAG: &str = "--repo";
+const UPLOAD_FLAG: &str = "--upload";
+const NO_UPLOAD_FLAG: &str = "--no-upload";
+const CHANGED_ONLY_FLAG: &str = "--changed-only";
+const PR_FLAG: &str = "--pr";
+const PR_HEAD_FLAG: &str = "--pr-head";
+const PR_BASE_FLAG: &str = "--pr-base";
+/// Flags that take the next argument as their value.
+const VALUE_FLAGS: [&str; 4] = [REPO_FLAG, PR_FLAG, PR_HEAD_FLAG, PR_BASE_FLAG];
 
 impl CliArgs {
     fn parse() -> Self {
@@ -41,6 +68,10 @@ impl CliArgs {
         let mut verbose = false;
         let mut no_cache = false;
         let mut allow_unprepared = false;
+        let mut repo = None;
+        let mut upload = None;
+        let mut changed_only = false;
+        let mut pr = carrick::pr_context::PrFlags::default();
 
         let mut i = 0;
         while i < args.len() {
@@ -68,6 +99,23 @@ impl CliArgs {
                 // builds alike, the way `--verbose` is. Named here so the
                 // parser accepts it (carrick#1889).
                 keep_awake::OFF_FLAG => {}
+                REPO_FLAG => {
+                    i += 1;
+                    repo = Some(args.get(i).cloned().unwrap_or_default());
+                }
+                UPLOAD_FLAG => upload = Some(true),
+                NO_UPLOAD_FLAG => upload = Some(false),
+                CHANGED_ONLY_FLAG => changed_only = true,
+                PR_FLAG | PR_HEAD_FLAG | PR_BASE_FLAG => {
+                    let flag = args[i].as_str();
+                    i += 1;
+                    let value = Some(args.get(i).cloned().unwrap_or_default());
+                    match flag {
+                        PR_FLAG => pr.number = value,
+                        PR_HEAD_FLAG => pr.head = value,
+                        _ => pr.base = value,
+                    }
+                }
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
                 }
@@ -85,6 +133,10 @@ impl CliArgs {
             verbose,
             no_cache,
             allow_unprepared,
+            repo,
+            upload,
+            changed_only,
+            pr,
         }
     }
 
@@ -103,6 +155,10 @@ async fn main() {
     // process, whichever command it is, so the flag is read here and both
     // parsers only accept it (carrick#1889).
     keep_awake::turn_off(argv.iter().any(|arg| arg == keep_awake::OFF_FLAG));
+    // Internal: the install script's question in untrusted mode (carrick#2246).
+    if argv.first().map(String::as_str) == Some(carrick::untrusted_yarn::COMMAND) {
+        std::process::exit(carrick::untrusted_yarn::run(&argv[1..]));
+    }
     if let Some(parsed) = local_mode::cli::parse(&argv) {
         match parsed {
             Ok(command) => {
@@ -135,10 +191,25 @@ async fn main() {
     }
 
     let args = CliArgs::parse();
+    // Before anything reads a repository name or decides to upload, so every
+    // reader sees one answer for the whole run (carrick#2207). A usage error,
+    // exit 2: `docs/reference/runner.md`.
+    if let Err(message) = apply_runner_flags(&args) {
+        errln!("carrick: {message}");
+        std::process::exit(2);
+    }
     // The scan uploads its log, so its lines go to a file of its own rather
     // than the day's shared one (carrick#1133).
     logging::init(args.verbose, logging::LogSink::Run);
     let repo_path = args.repo_path.clone();
+    if let Some(declared) = carrick::utils::declared_repository()
+        && let Some(line) = remote_disagrees(
+            declared,
+            carrick::git_state::remote_name(Path::new(&repo_path)).as_deref(),
+        )
+    {
+        info!("{line}");
+    }
 
     // A panic used to be the one death that said nothing: exit 101, a log that
     // stops mid-sentence, and a slot the cloud holds until its TTL. Installed
@@ -243,8 +314,66 @@ async fn main() {
         // After the line, not before it: the user reads why the run stopped
         // without waiting on a request about it.
         report_failure_before_scan(&repo_path, e.as_ref()).await;
-        std::process::exit(1);
+        std::process::exit(failure_exit_code());
     }
+}
+
+/// The code a failed run exits with: [`shutdown::TYPES_OUT_OF_MEMORY_EXIT`]
+/// when it stopped at a type-checker memory death it was told to stop on
+/// (carrick#2208), otherwise 1. Read from the run's record rather than the
+/// error, which reaches here as text.
+fn failure_exit_code() -> i32 {
+    match scan_health::type_memory_stop() {
+        Err(_) => shutdown::TYPES_OUT_OF_MEMORY_EXIT,
+        Ok(()) => 1,
+    }
+}
+
+/// Record `--repo`, `--upload` / `--no-upload` and `--changed-only` for the
+/// run, or the usage error one meets (carrick#2207, carrick#2227).
+fn apply_runner_flags(args: &CliArgs) -> Result<(), String> {
+    if let Some(value) = &args.repo {
+        carrick::utils::declare_repository(declared_repo(value)?);
+    }
+    if let Some(upload) = args.upload {
+        engine::set_upload_switch(upload);
+    }
+    carrick::pr_context::declare_from_flags(&args.pr, &args.repo_path)?;
+    if args.changed_only {
+        if args.no_cache {
+            return Err(carrick::change_scope::NO_CACHE_CONFLICT.to_string());
+        }
+        carrick::change_scope::request();
+    }
+    carrick::agent_service::init_prompt_runner_from_env()?;
+    engine::upload_decision_from_env()
+        .map(|_| ())
+        .map_err(str::to_string)
+}
+
+/// `--repo`'s value when it is an `owner/name`, else what the run is told.
+fn declared_repo(value: &str) -> Result<&str, String> {
+    if carrick::git_state::valid_repo_name(value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{REPO_FLAG} takes owner/name (for example acme/api), not '{value}'."
+        ))
+    }
+}
+
+/// What the log says when `--repo` and the checkout's origin remote name
+/// different repositories: the flag wins, and the run says so. Casing is not a
+/// difference, because the cloud compares names case-insensitively.
+fn remote_disagrees(declared: &str, remote: Option<&str>) -> Option<String> {
+    let remote = remote?;
+    if remote.eq_ignore_ascii_case(declared) {
+        return None;
+    }
+    Some(format!(
+        "This checkout's origin remote names {remote}; scanning it as {declared}, \
+         from {REPO_FLAG}."
+    ))
 }
 
 /// `index` and `refresh`, raced against a signal.
@@ -429,8 +558,13 @@ fn verbose(argv: &[String]) -> bool {
 }
 
 fn unknown_command(argv: &[String]) -> Option<String> {
+    // `--repo`'s value is the flag's, never a command: `carrick --repo api .`
+    // is answered by the flag's own usage error, not as a mistyped `api`.
     let word = argv
         .iter()
+        .enumerate()
+        .filter(|(index, _)| *index == 0 || !VALUE_FLAGS.contains(&argv[index - 1].as_str()))
+        .map(|(_, arg)| arg)
         .find(|arg| !arg.starts_with('-'))
         .filter(|arg| !arg.is_empty())?;
     let written_as_a_path = word.starts_with('.')
@@ -809,6 +943,110 @@ mod tests {
     fn the_scan_accepts_the_flag_that_lets_the_machine_sleep() {
         let cli = CliArgs::parse_from(&args(&[keep_awake::OFF_FLAG, "/my/repo"]));
         assert_eq!(cli.repo_path, "/my/repo");
+    }
+
+    /// The runner's flags (carrick#2207): `--repo` takes the next argument as
+    /// its value, never as the path, and neither flag is set by default.
+    #[test]
+    fn the_scan_reads_the_runner_flags() {
+        let cli = CliArgs::parse_from(&args(&["--repo", "acme/api", "/work/checkout", "--upload"]));
+        assert_eq!(cli.repo.as_deref(), Some("acme/api"));
+        assert_eq!(cli.repo_path, "/work/checkout");
+        assert_eq!(cli.upload, Some(true));
+
+        let cli = CliArgs::parse_from(&args(&["/work/checkout", "--no-upload"]));
+        assert_eq!(cli.upload, Some(false));
+        assert_eq!(cli.repo, None);
+
+        let cli = CliArgs::parse_from(&args(&["/work/checkout", "--repo"]));
+        assert_eq!(cli.repo.as_deref(), Some(""));
+
+        let cli = CliArgs::parse_from(&args(&["/work/checkout"]));
+        assert_eq!((cli.repo, cli.upload), (None, None));
+        assert!(!cli.changed_only);
+
+        let cli = CliArgs::parse_from(&args(&["/work/checkout", "--changed-only"]));
+        assert!(cli.changed_only);
+        assert_eq!(cli.repo_path, "/work/checkout");
+    }
+
+    /// `--changed-only` beside `--no-cache` is a usage error: one asks for
+    /// every service to be analysed again (carrick#2227).
+    #[test]
+    fn changed_only_refuses_no_cache() {
+        let cli = CliArgs::parse_from(&args(&["--changed-only", "--no-cache", "."]));
+        assert_eq!(
+            apply_runner_flags(&cli),
+            Err(
+                "--changed-only cannot be combined with --no-cache, which re-analyses every \
+                 service."
+                    .to_string()
+            )
+        );
+    }
+
+    /// `--repo` takes an `owner/name` and nothing else, and says so with the
+    /// value it was given.
+    #[test]
+    fn a_repo_flag_that_is_not_owner_and_name_is_a_usage_error() {
+        assert_eq!(declared_repo("acme/api"), Ok("acme/api"));
+        for value in ["api", "acme/api/extra", "../api", "acme/", ""] {
+            assert_eq!(
+                declared_repo(value),
+                Err(format!(
+                    "--repo takes owner/name (for example acme/api), not '{value}'."
+                )),
+                "{value}"
+            );
+        }
+    }
+
+    /// The run says when the flag overrides the origin remote, and only then.
+    #[test]
+    fn a_remote_naming_another_repository_is_said_once() {
+        assert_eq!(remote_disagrees("acme/api", Some("acme/api")), None);
+        assert_eq!(remote_disagrees("acme/api", Some("Acme/API")), None);
+        assert_eq!(remote_disagrees("acme/api", None), None);
+        let line = remote_disagrees("acme/api", Some("acme/api-fork")).expect("a line");
+        assert!(
+            line.contains("acme/api-fork") && line.contains("acme/api"),
+            "{line}"
+        );
+    }
+
+    /// The PR flags take the next argument as their value, and it is never
+    /// read as a mistyped command (carrick#2229).
+    #[test]
+    fn pr_flag_values_are_the_flags_own() {
+        let sha = "a".repeat(40);
+        let cli = CliArgs::parse_from(&args(&[
+            "/work/checkout",
+            "--pr",
+            "7",
+            "--pr-head",
+            &sha,
+            "--pr-base",
+            &sha,
+        ]));
+        assert_eq!(cli.pr.number.as_deref(), Some("7"));
+        assert_eq!(cli.pr.head.as_deref(), Some(sha.as_str()));
+        assert_eq!(cli.pr.base.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            CliArgs::parse_from(&args(&["/work/checkout"])).pr,
+            Default::default()
+        );
+        assert_eq!(unknown_command(&args(&["--pr", "7", "."])), None);
+        assert_eq!(unknown_command(&args(&["--pr-head", "abc", "."])), None);
+        assert_eq!(unknown_command(&args(&["--pr-base", "abc", "."])), None);
+    }
+
+    /// `--repo`'s value is never read as a mistyped command, wherever the
+    /// flag sits; a bare word elsewhere still is.
+    #[test]
+    fn a_repo_flag_value_is_not_a_command() {
+        assert_eq!(unknown_command(&args(&["--repo", "api", "."])), None);
+        assert_eq!(unknown_command(&args(&["--repo", "acme/api"])), None);
+        assert!(unknown_command(&args(&["--repo", "acme/api", "whoami"])).is_some());
     }
 
     /// Only a run that talks to the cloud reports a pre-scan failure

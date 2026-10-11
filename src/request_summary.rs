@@ -62,6 +62,28 @@
 //!   field table reads as set once to the global, to such a constructor
 //!   parameter, or to `options.fetch ?? fetch`, are the platform's `fetch`,
 //!   whatever a caller hands in instead.
+//! - **A declared method is every verb it names** (carrick#2049). A method
+//!   that is a parameter typed as a closed set of HTTP verbs (`method:
+//!   "POST" | "DELETE"`, or an alias the file declares:
+//!   [`crate::declared_verbs`]) is sent as one of them, so the request's own
+//!   line states a row per verb, even where its URL is written at the call.
+//!   Which verbs: those its calls write, when every call writes one; every
+//!   verb the declaration allows when a call hands it a value nothing here
+//!   reads, or nothing calls it. A caller that writes a verb states that one
+//!   at its own line as well. A parameter typed `string`, an optional one,
+//!   one the body assigns again, one typed by an import and one of a
+//!   function written inside another (whose callers are not resolved here)
+//!   states no verb.
+//! - **A conditional's branches are requests** (carrick#2050). A URL a test
+//!   chooses (`kind === "draft" ? `drafts/${id}` : `posts/${id}``, held in a
+//!   local or written in the URL) is one row per branch. A branch nothing
+//!   here read, beside one that writes a path, may span any number of
+//!   segments, so no placeholder stands for it ([`alternatives`]).
+//! - **One test is one choice** (carrick#2051). A method and a URL a test
+//!   chooses together (`fetch(existing ? `/notes/${id}` : "/notes", { method:
+//!   existing ? "PATCH" : "POST" })`, or the same through locals) pair branch
+//!   with branch: `PATCH /notes/:id` and `POST /notes`. Two different tests
+//!   pair nothing, and no row is stated.
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
@@ -153,6 +175,11 @@
 // sees it as unused.
 #[allow(dead_code)]
 mod library_sites;
+
+// What a conditional leaves a URL or a method able to read as (carrick#2050,
+// carrick#2051).
+mod alternatives;
+use alternatives::{Alternation, Alternatives};
 
 #[allow(unused_imports)]
 pub use library_sites::{
@@ -432,6 +459,37 @@ struct RequestShape {
     /// request only where something else the source states says so
     /// ([`Composer::request_of`]).
     init_only: bool,
+    /// The verbs the source declares the method parameter can be, when the
+    /// method is a parameter whose annotation is a closed set of them
+    /// (carrick#2049). Empty for every other request.
+    declared_methods: Vec<String>,
+    /// How a conditional in the URL or the method splits the request
+    /// (carrick#2050, carrick#2051).
+    alternation: Alternation,
+}
+
+impl RequestShape {
+    /// Whether the request is stated at its own line though its URL is
+    /// written at the call. The source says it is more than one request: the
+    /// method is a parameter declared as a closed set of verbs
+    /// (carrick#2049), or a conditional chooses the URL or the method (carrick#2050,
+    /// carrick#2051). That
+    /// is one row per request, a count the
+    /// single row of a model cannot hold. Only a URL that starts with its
+    /// path is stated here: one that leads with a base is read by the passes
+    /// that settle a base, and keeps their row.
+    fn fans_out_inline(&self) -> bool {
+        let path_first =
+            |url: &[Piece]| matches!(url.first(), Some(Piece::Lit(text)) if text.starts_with('/'));
+        match &self.alternation {
+            Alternation::Rows(rows) if rows.len() > 1 => {
+                rows.iter().all(|(_, url)| path_first(url))
+            }
+            Alternation::Rows(_) | Alternation::Single | Alternation::Nothing => {
+                !self.declared_methods.is_empty() && path_first(&self.url)
+            }
+        }
+    }
 }
 
 /// A client of a library package, as the source names it (carrick#1564): a
@@ -1047,6 +1105,7 @@ pub fn extract_file_ir(
         subclass_methods: subclass_members(&classes, |class| &class.methods),
         class_this: library_sites::class_this(module),
         declared_below: redeclared_names(module),
+        verb_aliases: crate::declared_verbs::TypeAliases::of(module),
     };
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
@@ -1409,6 +1468,9 @@ struct ModuleScope {
     /// Every declaration below module scope ([`redeclared_names`]): what a
     /// function, a block or a parameter binds.
     declared_below: Declarations,
+    /// The type aliases the file declares that name a closed set of HTTP
+    /// verbs (carrick#2049).
+    verb_aliases: crate::declared_verbs::TypeAliases,
 }
 
 impl ModuleScope {
@@ -3044,6 +3106,17 @@ struct Scope<'a> {
     /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
     /// assigns again: a call through one is a `fetch` (carrick#1562).
     fetches: HashSet<BindingKey>,
+    /// The HTTP verbs the function declares a plain parameter can be, by
+    /// position (carrick#2049): `method: "POST" | "DELETE"`, or an alias of
+    /// one the file declares. Never a parameter the body assigns again.
+    param_verbs: HashMap<usize, Vec<String>>,
+    /// What each local the body declares once can read as, one way per branch
+    /// of the conditionals it holds (carrick#2050): only a local whose
+    /// initialiser holds one is here.
+    alts: HashMap<BindingKey, Alternatives>,
+    /// The names the function assigns again, anywhere in it: a test that
+    /// reads one is not the same test twice (carrick#2051).
+    reassigned: HashSet<String>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -3061,6 +3134,9 @@ impl<'a> Scope<'a> {
             let_makers: HashMap::new(),
             bodies: HashMap::new(),
             fetches: HashSet::new(),
+            param_verbs: HashMap::new(),
+            alts: HashMap::new(),
+            reassigned: HashSet::new(),
             fields: None,
             module,
         }
@@ -3086,12 +3162,14 @@ impl<'a> Scope<'a> {
         params: impl IntoIterator<Item = &'p Pat>,
         function: &N,
         module: &ModuleScope,
+        type_params: &HashSet<String>,
     ) where
         N: VisitWith<Declarations> + VisitWith<Reassigned>,
     {
         let declared = Declarations::of(function);
         let mut reassigned = Reassigned::default();
         function.visit_with(&mut reassigned);
+        self.reassigned = reassigned.names.clone();
         let settled = |binding: &BindingKey| {
             declared.binding_count(binding) == 1 && !reassigned.names.contains(&binding.0)
         };
@@ -3103,12 +3181,24 @@ impl<'a> Scope<'a> {
             {
                 self.key_objects.insert(key.clone());
             }
-            self.params.push(key);
             // `{ url }: Options = {}`: the pattern is the left side.
             let pattern = match pat {
                 Pat::Assign(assign) => &*assign.left,
                 other => other,
             };
+            // `method: "POST" | "DELETE"`: every verb the request can send
+            // (carrick#2049). An optional parameter may arrive as nothing.
+            if let Pat::Ident(ident) = pattern
+                && !ident.id.optional
+                && let Some(annotation) = &ident.type_ann
+                && key.as_ref().is_some_and(settled)
+                && let Some(verbs) = module
+                    .verb_aliases
+                    .verbs_of(&annotation.type_ann, type_params)
+            {
+                self.param_verbs.insert(index, verbs);
+            }
+            self.params.push(key);
             if let Pat::Object(object) = pattern {
                 for (binding, key) in keyed_names(object) {
                     if settled(&binding) {
@@ -3484,6 +3574,9 @@ impl Reader<'_> {
             let_makers: HashMap::new(),
             bodies: HashMap::new(),
             fetches,
+            param_verbs: HashMap::new(),
+            alts: HashMap::new(),
+            reassigned: HashSet::new(),
             fields,
             module,
         };
@@ -3491,6 +3584,7 @@ impl Reader<'_> {
             function.params.iter().map(|param| &param.pat),
             function,
             module,
+            &type_param_names(function.type_params.as_deref()),
         );
         let mut ir = FnIr {
             params: ParamDecl::all(
@@ -3531,10 +3625,18 @@ impl Reader<'_> {
             let_makers: HashMap::new(),
             bodies: HashMap::new(),
             fetches,
+            param_verbs: HashMap::new(),
+            alts: HashMap::new(),
+            reassigned: HashSet::new(),
             fields,
             module,
         };
-        scope.read_params(&arrow.params, arrow, module);
+        scope.read_params(
+            &arrow.params,
+            arrow,
+            module,
+            &type_param_names(arrow.type_params.as_deref()),
+        );
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
@@ -3645,7 +3747,23 @@ impl Reader<'_> {
                         {
                             scope.texts.insert(key.clone(), pieces);
                         }
+                        // What a conditional in it leaves it able to read as
+                        // (carrick#2050): a request built from it states
+                        // one row per branch.
+                        let alts = if unsettled {
+                            None
+                        } else {
+                            self.alternatives(init, scope)
+                        };
                         scope.locals.insert(key.clone(), value);
+                        match alts {
+                            Some(alts) => {
+                                scope.alts.insert(key.clone(), alts);
+                            }
+                            None => {
+                                scope.alts.remove(&key);
+                            }
+                        }
                         // What a call or its parsed response leaves in it,
                         // for what a `return` of it hands back (carrick#1601).
                         match (!unsettled)
@@ -4250,6 +4368,22 @@ impl Reader<'_> {
             },
         };
 
+        let declared_methods = match &method {
+            MethodValue::Param(index) => scope.param_verbs.get(index).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
+        // A conditional that chooses the URL or the method is more than one
+        // request (carrick#2050, carrick#2051). The method is read only
+        // where the options say one last: a spread after it may replace it.
+        let method_expr = match (kind, options, call.args.get(1)) {
+            (RequestKind::Fetch, Some(obj), Some(arg)) if obj.fields.contains_key("method") => {
+                alternatives::method_expr(&arg.expr)
+            }
+            _ => None,
+        };
+        let alternation = self.alternation(url_expr, method_expr.as_ref(), &url, &method, scope);
+
         let body = match options {
             _ if options_param.is_some() => {
                 BodyValue::ParamKey(options_param.unwrap_or_default(), "body".to_string())
@@ -4286,6 +4420,8 @@ impl Reader<'_> {
             semantics: BTreeSet::new(),
             // Only the bag says this is a request: not `fetch`, and no verb.
             init_only: kind == RequestKind::Bag && verb.is_none() && init_only,
+            declared_methods,
+            alternation,
         })
     }
 
@@ -5235,30 +5371,66 @@ struct Effect {
 }
 
 impl Effect {
-    fn from_shape(shape: &RequestShape, file: &Path, line: u32) -> Self {
+    /// The requests a shape sends: one, or one per way a conditional in its
+    /// URL or method can go (carrick#2050, carrick#2051), or one that states
+    /// no row where the source does not say which goes out
+    /// ([`Alternation::Nothing`]).
+    fn from_shape(shape: &RequestShape, file: &Path, line: u32) -> Vec<Self> {
         let (body, body_param) = match &shape.body {
             BodyValue::Fields(obj) => (string_fields(obj), None),
             BodyValue::Param(index) => (BTreeMap::new(), Some((*index, None))),
             BodyValue::ParamKey(index, key) => (BTreeMap::new(), Some((*index, Some(key.clone())))),
             BodyValue::Unstated => (BTreeMap::new(), None),
         };
-        let mut effect = Effect {
-            site: RequestSite {
-                file: file.to_path_buf(),
-                line,
-            },
-            method: shape.method.clone(),
-            url: shape.url.clone(),
-            body,
-            body_param,
-            verb: shape.kind == RequestKind::Verb,
-            base: shape.base.clone(),
-            base_scope: shape.base_scope.clone(),
-            semantics: shape.semantics.clone(),
+        let readings = match &shape.alternation {
+            Alternation::Single => vec![(shape.method.clone(), shape.url.clone())],
+            Alternation::Rows(rows) => rows
+                .iter()
+                .map(|(method, url)| (method.clone(), url.clone()))
+                .collect(),
+            // The request goes out; which one is not stated. It is still a
+            // request the function sends, so a call of the function is not
+            // one that sends nothing.
+            Alternation::Nothing => vec![(MethodValue::Unknown, vec![Piece::Unknown])],
         };
-        effect.settle_keys();
-        effect.settle_outer();
-        effect
+        readings
+            .into_iter()
+            .map(|(method, url)| {
+                let mut effect = Effect {
+                    site: RequestSite {
+                        file: file.to_path_buf(),
+                        line,
+                    },
+                    method,
+                    url,
+                    body: body.clone(),
+                    body_param: body_param.clone(),
+                    verb: shape.kind == RequestKind::Verb,
+                    base: shape.base.clone(),
+                    base_scope: shape.base_scope.clone(),
+                    semantics: shape.semantics.clone(),
+                };
+                effect.settle_keys();
+                effect.settle_outer();
+                effect
+            })
+            .collect()
+    }
+
+    /// This effect once per verb its method parameter is declared with
+    /// (carrick#2049): the request line states every method the request can
+    /// send. An effect whose method is anything else is itself.
+    fn each_declared_method(&self, declared: &[String]) -> Vec<Effect> {
+        if declared.is_empty() || !matches!(self.method, MethodValue::Param(_)) {
+            return vec![self.clone()];
+        }
+        declared
+            .iter()
+            .map(|verb| Effect {
+                method: MethodValue::Lit(verb.clone()),
+                ..self.clone()
+            })
+            .collect()
     }
 
     /// A key of a parameter is a caller's to fill in only where the request
@@ -5845,6 +6017,33 @@ pub struct RequestSummaryIndex {
     passes_body: HashSet<(PathBuf, String)>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
+    /// What the requests whose method is a parameter declared as a set of
+    /// verbs wait on (carrick#2049).
+    methods: Box<DeclaredMethods>,
+}
+
+/// What the requests whose method is a parameter declared as a set of verbs
+/// wait on (carrick#2049).
+#[derive(Debug, Default)]
+struct DeclaredMethods {
+    /// The verbs the calls of each request whose method is a parameter write
+    /// for it, by the request's line.
+    supplied: HashMap<RequestSite, BTreeSet<String>>,
+    /// The requests whose method is a parameter that some call hands a value
+    /// this pass does not read as a verb.
+    unread: HashSet<RequestSite>,
+    /// The rows a request line states for a method declared as a set of
+    /// verbs, kept until every call of it has been read.
+    pending: Vec<DeclaredRows>,
+}
+
+/// One row per verb a request's method parameter is declared with.
+#[derive(Debug)]
+struct DeclaredRows {
+    file: PathBuf,
+    span_start: u32,
+    site: RequestSite,
+    rows: Vec<SummaryRow>,
 }
 
 impl RequestSummaryIndex {
@@ -6018,11 +6217,11 @@ impl Composer<'_> {
                 None if call.jsx => {}
                 None => {
                     if let Some(request) = self.request_of(file, call) {
-                        summary.effects.insert(ir.settle_forward(Effect::from_shape(
-                            &request,
-                            file,
-                            call.site.line,
-                        )));
+                        summary.effects.extend(
+                            Effect::from_shape(&request, file, call.site.line)
+                                .into_iter()
+                                .map(|effect| ir.settle_forward(effect)),
+                        );
                     } else if !call.inert {
                         summary.complete = false;
                     }
@@ -6133,7 +6332,7 @@ pub fn summarize(
         keys.sort();
         for key in keys {
             let ir = &files[*path].functions[key];
-            emit(&mut composer, path, ir, &mut index);
+            emit(&mut composer, path, ir, &mut index, true);
         }
     }
     // Every function, not only the ones a resolved call site composed: a
@@ -6155,6 +6354,31 @@ pub fn summarize(
             }
         }
     }
+    // A request whose method is a parameter declared as a set of verbs states
+    // the verbs its calls write when every call writes one (carrick#2049),
+    // and every verb the declaration allows otherwise: a call nothing here
+    // reads, or no call at all, may send any of them.
+    for pending in std::mem::take(&mut index.methods.pending) {
+        let written = index
+            .methods
+            .supplied
+            .get(&pending.site)
+            .filter(|verbs| !verbs.is_empty() && !index.methods.unread.contains(&pending.site));
+        let stated: Vec<SummaryRow> = pending
+            .rows
+            .into_iter()
+            .filter(|row| written.is_none_or(|verbs| verbs.contains(&row.method)))
+            .collect();
+        if !stated.is_empty() {
+            index
+                .rows
+                .entry(pending.file)
+                .or_default()
+                .entry(pending.span_start)
+                .or_default()
+                .extend(stated);
+        }
+    }
     for sites in index.rows.values_mut() {
         for rows in sites.values_mut() {
             rows.sort();
@@ -6164,7 +6388,13 @@ pub fn summarize(
     index
 }
 
-fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut RequestSummaryIndex) {
+fn emit(
+    composer: &mut Composer<'_>,
+    file: &Path,
+    ir: &FnIr,
+    index: &mut RequestSummaryIndex,
+    top_level: bool,
+) {
     let (files, sites) = (composer.files, composer.sites);
     for call in &ir.calls {
         if call.invokes_param.is_some() {
@@ -6185,6 +6415,23 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         continue;
                     }
                     let instantiated = effect.instantiate(&call.args);
+                    // What this call writes for a method that is a parameter
+                    // (carrick#2049).
+                    if matches!(effect.method, MethodValue::Param(_)) {
+                        match &instantiated.method {
+                            MethodValue::Lit(verb) => {
+                                index
+                                    .methods
+                                    .supplied
+                                    .entry(effect.site.clone())
+                                    .or_default()
+                                    .insert(verb.clone());
+                            }
+                            _ => {
+                                index.methods.unread.insert(effect.site.clone());
+                            }
+                        }
+                    }
                     if instantiated.has_params() {
                         // Still open: a caller further up fills it.
                         continue;
@@ -6263,19 +6510,47 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                 // row, and claims the site as a summary does anywhere else:
                 // the passes that read the site's own source cannot read the
                 // client's base, so their reading is not the one to keep.
-                if let Some(request) = composer.request_of(file, call) {
+                if let Some(mut request) = composer.request_of(file, call) {
+                    // A function written inside another has callers this pass
+                    // does not resolve, so what its declaration allows is not
+                    // what it sends (carrick#2049): its calls are the model's
+                    // to read.
+                    if !top_level && !request.declared_methods.is_empty() {
+                        request.to_mut().declared_methods.clear();
+                    }
                     let library = request.kind == RequestKind::Library;
-                    if library || (request.kind != RequestKind::Verb && !request.url_inline) {
-                        let effect = Effect::from_shape(&request, file, call.site.line);
-                        if !effect.has_params() {
-                            let at = if library {
-                                RowSite::Library
-                            } else {
-                                RowSite::Own
-                            };
-                            match row(&effect, file, composer.files, call, None, at, None) {
-                                Some(row) => rows.push(row),
-                                None => index.undetermined += 1,
+                    if library
+                        || (request.kind != RequestKind::Verb
+                            && (!request.url_inline || request.fans_out_inline()))
+                    {
+                        for effect in Effect::from_shape(&request, file, call.site.line) {
+                            let site = effect.site.clone();
+                            let declared = matches!(effect.method, MethodValue::Param(_))
+                                && !request.declared_methods.is_empty();
+                            let mut verbs: Vec<SummaryRow> = Vec::new();
+                            for effect in effect.each_declared_method(&request.declared_methods) {
+                                if !effect.has_params() {
+                                    let at = if library {
+                                        RowSite::Library
+                                    } else {
+                                        RowSite::Own
+                                    };
+                                    match row(&effect, file, composer.files, call, None, at, None) {
+                                        Some(row) if declared => verbs.push(row),
+                                        Some(row) => rows.push(row),
+                                        None => index.undetermined += 1,
+                                    }
+                                }
+                            }
+                            // Which of the declared verbs the line states waits
+                            // on every call of the request having been read.
+                            if declared && !verbs.is_empty() {
+                                index.methods.pending.push(DeclaredRows {
+                                    file: file.to_path_buf(),
+                                    span_start: call.site.span_start,
+                                    site,
+                                    rows: verbs,
+                                });
                             }
                         }
                     }
@@ -6293,7 +6568,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
         }
     }
     for nested in ir.nested.iter().chain(&ir.detached) {
-        emit(composer, file, nested, index);
+        emit(composer, file, nested, index, false);
     }
 }
 
@@ -6618,6 +6893,8 @@ fn library_shape(
         base_scope: None,
         semantics: used,
         init_only: false,
+        declared_methods: Vec::new(),
+        alternation: Alternation::Single,
     })
 }
 

@@ -52,7 +52,8 @@ impl Shutdown {
 
     /// 128 plus the signal number, the code a shell reports for a process a
     /// signal ended, so a caller reading the status sees the same thing it
-    /// would have without the handler.
+    /// would have without the handler. Every exit code a scan can end with is
+    /// listed in `docs/reference/runner.md`.
     pub fn exit_code(self) -> i32 {
         match self {
             Shutdown::Interrupt => 130,
@@ -80,6 +81,12 @@ impl Shutdown {
         }
     }
 }
+
+/// The exit code of a run that stopped because its type checker died of
+/// memory, with `CARRICK_FAIL_ON_TYPE_MEMORY` set (carrick#2208): a runner
+/// reads it as "run this again on a larger machine". Listed with every other
+/// exit code in `docs/reference/runner.md`.
+pub const TYPES_OUT_OF_MEMORY_EXIT: i32 = 3;
 
 /// The reason an interrupted run reports, on either failure event.
 pub const INTERRUPTED_REASON: &str = "interrupted";

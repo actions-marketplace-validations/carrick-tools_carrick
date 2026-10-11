@@ -126,20 +126,103 @@ struct FileDiscovery {
 
 type FileDiscoveryResult = Result<FileDiscovery, Box<dyn std::error::Error>>;
 
-/// Determine if we should upload data based on GitHub context
-/// Only upload on main/master branch, not on PRs
+/// `--upload` (`true`) or `--no-upload` (`false`), held for the whole process
+/// and set once in `main` (carrick#2207). `None` on every run that passed
+/// neither, which then decides as it always did.
+fn upload_switch_slot() -> &'static std::sync::OnceLock<bool> {
+    static SWITCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    &SWITCH
+}
+
+/// Record `--upload` / `--no-upload`. A second call is ignored.
+pub fn set_upload_switch(upload: bool) {
+    let _ = upload_switch_slot().set(upload);
+}
+
+fn upload_switch() -> Option<bool> {
+    upload_switch_slot().get().copied()
+}
+
+/// What `--upload` together with `CARRICK_OUTPUT_JSON` is told: a usage error
+/// rather than a flag that silently does nothing (the carrick#966 rule).
+pub const UPLOAD_WITH_OUTPUT_JSON: &str =
+    "--upload cannot be combined with CARRICK_OUTPUT_JSON, which never uploads. Unset one of them.";
+
+/// Everything the upload decision reads from the process environment.
+#[derive(Debug, Clone, Copy, Default)]
+struct UploadContext<'a> {
+    /// `CARRICK_OUTPUT_JSON` is set.
+    output_json: bool,
+    /// `CARRICK_LOCAL_STORAGE_DIR` is set.
+    local_dir: bool,
+    /// `GITHUB_EVENT_NAME`.
+    event_name: Option<&'a str>,
+    /// `GITHUB_REF`.
+    git_ref: Option<&'a str>,
+    /// `--pr` was passed: a pull request scan never writes the index
+    /// (carrick#2229).
+    pr_flag: bool,
+}
+
+/// Whether this run uploads, or the usage error `--upload` meets.
+///
+/// Read once, in `main` to refuse the conflict and in the engine to decide,
+/// so the two cannot disagree. See `docs/reference/runner.md`.
+pub fn upload_decision_from_env() -> Result<bool, &'static str> {
+    let event_name = env::var("GITHUB_EVENT_NAME").ok();
+    let git_ref = env::var("GITHUB_REF").ok();
+    upload_decision(
+        upload_switch(),
+        UploadContext {
+            output_json: env::var("CARRICK_OUTPUT_JSON").is_ok(),
+            local_dir: env::var(CACHE_DIR_ENV).is_ok(),
+            event_name: event_name.as_deref(),
+            git_ref: git_ref.as_deref(),
+            pr_flag: crate::pr_context::declared().is_some(),
+        },
+    )
+}
+
+/// Determine if we should upload data. With no switch, from the GitHub
+/// context: only upload on main/master branch, not on PRs. A scan outside
+/// GitHub Actions sets none of it, so a runner or another CI says what it
+/// wants with `--upload` / `--no-upload` (carrick#2207,
+/// `docs/reference/runner.md`).
 fn should_upload_data() -> bool {
+    // `main` has already refused the one combination that errs.
+    upload_decision_from_env().unwrap_or(false)
+}
+
+/// The decision itself, pure, so the table test reads no process environment.
+fn upload_decision(switch: Option<bool>, context: UploadContext<'_>) -> Result<bool, &'static str> {
     // Eval runs (`CARRICK_OUTPUT_JSON`) are read-only benchmarks against throwaway
     // fixtures. Never upload, or a dispatch on main would pollute the real cloud
     // index with fixture "services". This is the upstream half of eval mode's
     // no-side-effects guarantee; the JSON output branch skips the markdown
-    // report + PR comment downstream.
+    // report + PR comment downstream. It stays first, above the switch: asking
+    // for an upload here is a usage error, not an upload.
     //
     // This branch returning first is what leaves a named cache directory empty
     // without saying so; `suppressed_upload_warning` is where the run says it
     // (carrick#966).
-    if env::var("CARRICK_OUTPUT_JSON").is_ok() {
-        return false;
+    if context.output_json {
+        return match switch {
+            Some(true) => Err(UPLOAD_WITH_OUTPUT_JSON),
+            _ => Ok(false),
+        };
+    }
+
+    // A pull request scan outside Actions never writes the index, whatever the
+    // sink: its tree is the PR's, not main's (carrick#2229).
+    if context.pr_flag {
+        return match switch {
+            Some(true) => Err(crate::pr_context::UPLOAD_CONFLICT),
+            _ => Ok(false),
+        };
+    }
+
+    if let Some(upload) = switch {
+        return Ok(upload);
     }
 
     // LocalDirStorage (the offline cross-repo eval harness, Phase A) writes
@@ -147,33 +230,48 @@ fn should_upload_data() -> bool {
     // PR/branch anti-pollution guards below do not apply. Without this, a CI
     // run (GITHUB_EVENT_NAME=pull_request) skips the upload and Phase A
     // persists nothing. Phase B sets CARRICK_OUTPUT_JSON and returns above.
-    if env::var("CARRICK_LOCAL_STORAGE_DIR").is_ok() {
-        return true;
+    if context.local_dir {
+        return Ok(true);
     }
 
     // Check if we're in a pull request
-    if let Ok(event_name) = env::var("GITHUB_EVENT_NAME")
-        && event_name == "pull_request"
-    {
-        return false;
+    if context.event_name == Some("pull_request") {
+        return Ok(false);
     }
 
     // Check if we're on a feature branch (not main/master)
-    if let Ok(ref_name) = env::var("GITHUB_REF") {
+    if let Some(ref_name) = context.git_ref {
         // GITHUB_REF format: refs/heads/branch-name or refs/pull/123/merge
         if ref_name.starts_with("refs/pull/") {
-            return false;
+            return Ok(false);
         }
 
         if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
             // Only upload for main/master branches
-            return branch == "main" || branch == "master";
+            return Ok(branch == "main" || branch == "master");
         }
     }
 
     // If we can't determine the context, default to upload (for local testing)
-    // You might want to change this to false for stricter behavior
-    true
+    Ok(true)
+}
+
+/// The reason `close-scan` carries for a run that opened a scan and was told
+/// not to upload (carrick#2207).
+const NO_UPLOAD_REASON: &str = "no_upload";
+
+/// The `owner/name` the cloud is told this run is: `--repo` when it was
+/// passed, else the checkout's origin remote (carrick#2207).
+fn repo_full_name(repo_path: &str) -> Option<String> {
+    repo_full_name_from(crate::utils::declared_repository(), repo_path)
+}
+
+/// [`repo_full_name`] with the declared name passed in, so the test sets no
+/// process-global. The remote is read only when nothing was declared.
+fn repo_full_name_from(declared: Option<&str>, repo_path: &str) -> Option<String> {
+    declared
+        .map(str::to_string)
+        .or_else(|| crate::git_state::remote_name(std::path::Path::new(repo_path)))
 }
 
 /// What a run is told when it names a local cache directory and then
@@ -204,9 +302,24 @@ fn suppressed_upload_warning(output_json: bool, local_dir: Option<&str>) -> Opti
     ))
 }
 
-/// The PR number for a `pull_request` run, or None on push/dispatch/local
-/// runs. GitHub sets GITHUB_REF to `refs/pull/<n>/merge` (or `/head`) on PRs;
-/// returning None on any other ref is exactly the "only post on PR runs" gate.
+/// The pull request this run scans, or None on push/dispatch/local runs: the
+/// flags when `main` recorded them (carrick#2229), else the Actions
+/// environment, read at each call as it always was. Returning None is exactly
+/// the "only post on PR runs" gate.
+fn pr_context() -> Option<crate::pr_context::PrContext> {
+    crate::pr_context::resolve(crate::pr_context::declared(), env_pr())
+}
+
+fn env_pr() -> crate::pr_context::EnvPr {
+    crate::pr_context::EnvPr {
+        number: pr_number_from_env(),
+        head: head_sha_from_event(),
+        base: base_sha_from_event(),
+        run_id: run_id_from_env(),
+    }
+}
+
+/// GitHub sets GITHUB_REF to `refs/pull/<n>/merge` (or `/head`) on PRs.
 fn pr_number_from_env() -> Option<u64> {
     let ref_name = env::var("GITHUB_REF").ok()?;
     let rest = ref_name.strip_prefix("refs/pull/")?;
@@ -225,35 +338,35 @@ fn run_id_from_env() -> Option<String> {
 /// needs the head SHA to attach a check run; a merge-ref SHA from GITHUB_SHA
 /// would pin the check to a commit that isn't on the PR branch.
 fn head_sha_from_event() -> Option<String> {
-    let path = env::var("GITHUB_EVENT_PATH").ok()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    let event: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    event
-        .get("pull_request")?
-        .get("head")?
-        .get("sha")?
-        .as_str()
-        .map(str::to_string)
+    event_pull_request_sha("head")
 }
 
 /// `pull_request.base.sha` from the GITHUB_EVENT_PATH event payload, or None
 /// on any failure.
 fn base_sha_from_event() -> Option<String> {
+    event_pull_request_sha("base")
+}
+
+fn event_pull_request_sha(side: &str) -> Option<String> {
     let path = env::var("GITHUB_EVENT_PATH").ok()?;
     let contents = std::fs::read_to_string(path).ok()?;
     let event: serde_json::Value = serde_json::from_str(&contents).ok()?;
     event
         .get("pull_request")?
-        .get("base")?
+        .get(side)?
         .get("sha")?
         .as_str()
         .map(str::to_string)
 }
 
-/// The commit this PR run's tree is based on (carrick-cloud#1408): the first
-/// parent of the merge commit a `pull_request` run checks out, which is what
-/// is on disk, else the event's `pull_request.base.sha`.
+/// The commit this PR run's tree is based on (carrick-cloud#1408): for a
+/// `--pr` run, what `main` read off the checkout (carrick#2229); else the
+/// first parent of the merge commit a `pull_request` run checks out, which is
+/// what is on disk, else the event's `pull_request.base.sha`.
 fn pr_base_commit(repo_path: &str) -> Option<String> {
+    if let Some(declared) = crate::pr_context::declared() {
+        return declared.base.clone();
+    }
     let parents = crate::git_state::head_parents(repo_path).unwrap_or_default();
     if let [base, head] = parents.as_slice()
         && head_sha_from_event().is_none_or(|event_head| event_head == *head)
@@ -408,15 +521,20 @@ fn endpoint_delta(
 
 fn main_copy_against_base(
     repo_path: &str,
+    services: &[Config],
     main_self: &[CloudRepoData],
     as_uploaded: &[CloudRepoData],
 ) -> crate::pr_baseline::MainCopy {
     let base = pr_base_commit(repo_path);
     let mut reading = None;
+    // Each stored service by what it reads, so one stored at an older commit
+    // than its siblings is not stale for a change it never reads
+    // (carrick#2228).
+    let judge = crate::change_scope::CopyJudge::new(repo_path, services, main_self);
     let copy = crate::pr_baseline::main_copy(
         main_self,
         base.as_deref(),
-        |copy, base| crate::git_state::differs_under(repo_path, copy, base).ok(),
+        |copy, base| judge.differs(copy, base),
         || {
             let read = match base.as_deref() {
                 None => crate::pr_baseline::UntouchedReading::Unknown(
@@ -538,11 +656,48 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     // The marker first, then the log: the marker is four short fields and the
     // log is up to five megabytes, and a run that is already failing may not
     // get to finish both.
-    if let Err(error) = &result {
-        report_scan_failure(&storage, repo_path, error.as_ref()).await;
-    }
+    report_run_end(
+        &storage,
+        repo_path,
+        &result,
+        upload_switch(),
+        crate::pr_context::declared().is_some(),
+    )
+    .await;
     upload_run_logs(&storage, repo_path).await;
     result
+}
+
+/// The marker a finished run owes the scan it opened, if any.
+///
+/// A failure says so with `scan-failed`. A `--pr` run closes with
+/// `pull_request`, and a run told `--no-upload` sends no
+/// write and so no `scan_final`, and without `close-scan` the slot
+/// `start-scan` opened stays held for the quiet window (carrick#2207). Every
+/// other success closed its scan with its last write. Each marker is a no-op
+/// on a storage that opened no scan.
+async fn report_run_end<T: CloudStorage + Sync>(
+    storage: &T,
+    repo_path: &str,
+    result: &Result<(), Box<dyn std::error::Error>>,
+    upload_switch: Option<bool>,
+    pr_flag: bool,
+) {
+    match result {
+        Err(error) => report_scan_failure(storage, repo_path, error.as_ref()).await,
+        // A pull request scan outside Actions never writes, and says so
+        // whether or not `--changed-only` left anything to analyse
+        // (carrick#2229).
+        Ok(()) if pr_flag => {
+            storage
+                .report_scan_closed(crate::pr_context::CLOSE_REASON)
+                .await
+        }
+        Ok(()) if upload_switch == Some(false) => {
+            storage.report_scan_closed(NO_UPLOAD_REASON).await
+        }
+        Ok(()) => {}
+    }
 }
 
 /// Tell the cloud this run died before it could upload, and where
@@ -583,7 +738,7 @@ pub async fn report_preflight_failure<T: CloudStorage + Sync>(
     stage: crate::scan_stage::Stage,
     error: &dyn std::error::Error,
 ) {
-    let repo = crate::git_state::remote_name(std::path::Path::new(repo_path));
+    let repo = repo_full_name(repo_path);
     storage
         .report_preflight_failed(
             repo.as_deref(),
@@ -697,7 +852,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // cache (see `stamp_tree_state`).
     let unchanged_at_start = crate::git_state::unchanged_since(repo_path, &git_state.commit).ok();
     let run_context = crate::cloud_storage::RunContext {
-        repo_full_name: crate::git_state::remote_name(std::path::Path::new(repo_path)),
+        repo_full_name: repo_full_name(repo_path),
         commit: git_state.commit.clone(),
         dirty: git_state.dirty,
     };
@@ -818,11 +973,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // One workspace pass for the whole scan. Every service asks it the same
     // question about the same tree, and rebuilding it per service was the
     // largest fixed cost in the analysis phase (carrick#767).
-    let mut workspace_scan = crate::external_call_candidates::WorkspaceScan::new();
+    let workspace_scan = std::sync::Arc::new(crate::external_call_candidates::WorkspaceScan::new());
     // Every schema file the repository holds, marked served or external, read
     // once for the whole scan: a document in one service is attributed against
     // the schemas every service serves (carrick#1134).
-    let graphql_schemas = crate::graphql::SchemaCatalogue::build(
+    let graphql_schemas = std::sync::Arc::new(crate::graphql::SchemaCatalogue::build(
         Path::new(repo_path),
         &services
             .iter()
@@ -835,17 +990,49 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .files,
             })
             .collect::<Vec<_>>(),
-    );
+    ));
     // One intent memo for the whole scan, so a function several services hold
     // is described once (carrick#1080). The retry below reads it too.
     let run_intents = RunIntentMemo::default();
     // Where each service's previous generation is read from: the laptop's
     // hosted snapshot when the indexer handed one in, otherwise the download.
     let previous_generations = local_previous.as_ref().unwrap_or(&all_repo_data);
+    // Under `--changed-only`, which services are analysed and which carry
+    // their stored generation (carrick#2227). A carried service is in no
+    // part of the analysis: not asked ahead, not scanned, not retried.
+    let scopes: Vec<crate::change_scope::Scope> = if crate::change_scope::requested() {
+        crate::change_scope::plan(
+            repo_path,
+            &services,
+            |service| previous_generation(previous_generations, &repo_name, service),
+            crate::change_scope::ThisRun {
+                scanner_version: env!("CARGO_PKG_VERSION"),
+                cache_version: CACHE_VERSION,
+            },
+        )
+    } else {
+        Vec::new()
+    };
+    // Each service's place among the analysed ones, `None` when carried.
+    let mut analysed_count = 0;
+    let scan_index: Vec<Option<usize>> = (0..services.len())
+        .map(|index| {
+            (!scopes.get(index).is_some_and(|scope| scope.is_carried())).then(|| {
+                analysed_count += 1;
+                analysed_count - 1
+            })
+        })
+        .collect();
+    let analysed: Vec<Config> = services
+        .iter()
+        .zip(&scan_index)
+        .filter(|(_, at)| at.is_some())
+        .map(|(service, _)| service.clone())
+        .collect();
     // Every service's detection and guidance, asked for from here on beside
     // the loop below instead of one service at a time inside it
     // (carrick#1895). Dropped with this function, which ends every ask.
-    let setups = setup_ahead::SetupsAhead::start(repo_path, &services, |service| {
+    let setups = setup_ahead::SetupsAhead::start(repo_path, &analysed, |service| {
         if no_cache {
             return None;
         }
@@ -853,12 +1040,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .map(setup_ahead::StoredSetup::of)
     });
     let scan = ServiceScan {
-        repo_path,
+        repo_path: repo_path.to_string(),
+        services: analysed.into(),
         sidecar,
-        total: services.len(),
-        run_intents: &run_intents,
-        graphql_schemas: &graphql_schemas,
-        setups: &setups,
+        run_intents,
+        graphql_schemas,
+        setups: std::sync::Arc::new(setups),
+        workspace: workspace_scan,
     };
     let upload_blocked = multi_service && !storage.supports_multi_service();
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
@@ -870,14 +1058,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         } else {
             previous_generation(previous_generations, &repo_name, service).cloned()
         };
+        let Some(at) = scan_index[index] else {
+            // Carried, which only a service with a stored generation is, and
+            // `--no-cache` is refused beside `--changed-only`.
+            let stored = previous_data.expect("a carried service has a stored generation");
+            runs.push(ServiceRun::carried(service, stored));
+            continue;
+        };
         match scan
-            .analyze(
-                index,
-                service,
-                previous_data.as_ref(),
-                PreviousGeneration::Stored,
-                &mut workspace_scan,
-            )
+            .analyze(at, previous_data.as_ref(), PreviousGeneration::Stored)
             .await
         {
             Ok(run) => runs.push(run),
@@ -893,7 +1082,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 if should_upload && !upload_blocked {
                     let finished: Vec<&CloudRepoData> = runs
                         .iter()
-                        .filter(|run| run.owed.is_empty())
+                        // A carried service's data is its stored blob, which
+                        // has nothing new to land.
+                        .filter(|run| run.owed.is_empty() && !run.carried)
                         .map(|run| &run.data)
                         .collect();
                     if !finished.is_empty() {
@@ -1034,14 +1225,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             // Its own blob from a minute ago is the previous generation: every
             // answer it holds replays, and only what it lacks is asked for.
             let this_run = runs[index].data.clone();
+            // Only an analysed service owes work.
+            let Some(at) = scan_index[index] else {
+                continue;
+            };
             match scan
-                .analyze(
-                    index,
-                    service,
-                    Some(&this_run),
-                    PreviousGeneration::ThisRun,
-                    &mut workspace_scan,
-                )
+                .analyze(at, Some(&this_run), PreviousGeneration::ThisRun)
                 .await
             {
                 Ok(run) => runs[index] = run,
@@ -1170,6 +1359,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     let current_services_data: Vec<CloudRepoData> = runs
         .iter()
         .map(|run| {
+            if run.carried && should_upload {
+                // Kept beside a laptop run's local index like a held-back
+                // service's; a refreshed copy written below replaces it.
+                storage.keep_served_generation(&run.data);
+            }
             if !run.held_back {
                 return run.data.clone();
             }
@@ -1190,7 +1384,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // in hand, and printed with the report (carrick#1099). Index for index
     // with `services`, as `current_services_data` is.
     let mut graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
-    graphql_notices.hints.extend(graphql_schemas.notices());
+    graphql_notices.hints.extend(scan.graphql_schemas.notices());
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
     //    until after cross-repo analysis (step 6) so every payload can carry the
@@ -1216,7 +1410,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         } else {
             let landing: Vec<&CloudRepoData> = runs
                 .iter()
-                .filter(|run| !run.held_back)
+                .filter(|run| !run.held_back && !run.carried)
                 .map(|run| &run.data)
                 .collect();
             Some(upload_payloads_for(
@@ -1239,7 +1433,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // a baseline, rather than being conflated with a first-ever scan where
     // "new" is meaningless. On non-PR runs the capture is skipped entirely,
     // since the block is suppressed there anyway.
-    let is_pr_run = pr_number_from_env().is_some();
+    let is_pr_run = pr_context().is_some();
     let (had_prior_index, delta_baseline) = if is_pr_run {
         let stored = all_repo_data
             .iter()
@@ -1293,7 +1487,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 })
                 .collect();
             let surface_unchanged = crate::pr_baseline::same_surface(&as_uploaded, &main_self_data);
-            let copy = main_copy_against_base(repo_path, &main_self_data, &as_uploaded);
+            let copy = main_copy_against_base(repo_path, &services, &main_self_data, &as_uploaded);
             MainBaselineInput {
                 // The peers are only needed when there is something to run.
                 peers: if surface_unchanged {
@@ -1519,6 +1713,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .collect();
     let mut closed_by_final_write = false;
     if let Some(mut payloads) = upload_payloads {
+        // A carried service's verdicts, edges and boundary are attached like
+        // an analysed one's, so a consumer whose producer changed is not left
+        // stale (carrick#2227). Which of them are written is decided below.
+        let carried_from = payloads.len();
+        payloads.extend(
+            runs.iter()
+                .filter(|run| run.carried)
+                .map(|run| run.data.clone()),
+        );
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
             &results.cross_repo_matches,
@@ -1537,6 +1740,33 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .unwrap_or_else(|| payload.repo_name.clone());
             if let Some((_, boundary)) = boundaries.iter().find(|(known, _)| *known == id) {
                 payload.boundary = Some(boundary.clone());
+            }
+        }
+        // A carried service is written only when what this run's join says
+        // of it differs from its stored blob, stamped as this run's.
+        let carried = payloads.split_off(carried_from);
+        for (payload, run) in carried
+            .into_iter()
+            .zip(runs.iter().filter(|run| run.carried))
+        {
+            let id = run
+                .data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| run.data.repo_name.clone());
+            if let Some(refreshed) = crate::change_scope::refreshed_carried(
+                payload,
+                &run.data,
+                &sdk_join.unresolved_for(&id),
+                &git_state.commit,
+                git_state.dirty,
+            ) {
+                info!(
+                    "scope: {} carried and written at this commit: its verdicts, SDK edges or \
+                     boundary changed",
+                    run.label
+                );
+                payloads.push(refreshed);
             }
         }
         // The size guard already ran once inside strip_ast_nodes, but the
@@ -1563,8 +1793,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // the run stopped, which is as true of an interruption as of any
         // other failure.
         enter_stage(crate::scan_stage::Stage::Upload)?;
-        unconfirmed_uploads =
-            upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
+        if payloads.is_empty() && crate::change_scope::requested() {
+            // Nothing this run read changed what the index holds, so nothing
+            // is written, and the scan it opened is closed rather than left
+            // to its slot's expiry (carrick#2227).
+            info!("scope: nothing to write; closing the scan");
+            storage
+                .report_scan_closed(crate::change_scope::NO_CHANGE_REASON)
+                .await;
+        } else {
+            unconfirmed_uploads =
+                upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
+        }
     }
 
     // Which of this PR's findings main already had (carrick-cloud#1369). Run
@@ -1597,11 +1837,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // comment + check run via the GitHub App, gated on the project's
     // pr_comments_enabled toggle. Best-effort: a relay failure is logged,
     // never fatal. Assembled before `results` moves into the formatter.
-    let pr_result = pr_number_from_env().map(|pr_number| crate::findings::PrResultPayload {
+    let pr_result = pr_context().map(|pr| crate::findings::PrResultPayload {
         repo: repo_name.clone(),
-        pr_number,
-        head_sha: head_sha_from_event(),
-        run_id: run_id_from_env(),
+        pr_number: pr.number,
+        head_sha: pr.head,
+        run_id: pr.run_id,
         topology: topology.clone(),
         stats: crate::findings::ScanStats {
             endpoints: results.endpoints.len(),
@@ -1727,14 +1967,22 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
 /// Where one scan's services are analysed from: the pieces every service, and
 /// every retry of one, reads the same.
+///
+/// Owned or shared rather than borrowed from the loop's frame, so that a
+/// service's analysis can be handed to a thread of its own (carrick#1066).
 struct ServiceScan<'a> {
-    repo_path: &'a str,
+    repo_path: String,
+    /// Every service of the scan, in declared order: [`Self::analyze`] takes
+    /// an index into it.
+    services: std::sync::Arc<[Config]>,
     sidecar: Option<&'a TypeSidecar>,
-    total: usize,
-    run_intents: &'a RunIntentMemo,
-    graphql_schemas: &'a crate::graphql::SchemaCatalogue,
+    run_intents: RunIntentMemo,
+    graphql_schemas: std::sync::Arc<crate::graphql::SchemaCatalogue>,
     /// Each service's detection and guidance, asked for ahead of it.
-    setups: &'a setup_ahead::SetupsAhead,
+    setups: std::sync::Arc<setup_ahead::SetupsAhead>,
+    /// The repo-wide external-call pass, built by the first service to ask
+    /// and read by the rest.
+    workspace: std::sync::Arc<crate::external_call_candidates::WorkspaceScan>,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -1745,7 +1993,35 @@ struct ServiceRun {
     owed: durability::OwedWork,
     /// Decided once every service has been analysed (step 4c).
     held_back: bool,
+    /// Not analysed: `data` is its stored generation (`--changed-only`,
+    /// carrick#2227).
+    carried: bool,
 }
+
+impl ServiceRun {
+    /// A service `--changed-only` carries: its stored generation stands in
+    /// for it, and it owes nothing.
+    fn carried(service: &Config, stored: CloudRepoData) -> Self {
+        Self {
+            label: service
+                .service_name
+                .as_deref()
+                .unwrap_or("(root)")
+                .to_string(),
+            data: stored,
+            owed: durability::OwedWork::default(),
+            held_back: false,
+            carried: true,
+        }
+    }
+}
+
+// A service's result crosses to the thread that gathers it once services are
+// analysed on threads of their own (carrick#1066).
+const _: fn() = || {
+    fn sendable<T: Send>() {}
+    sendable::<ServiceRun>();
+};
 
 impl ServiceScan<'_> {
     /// Analyse one service and read back what it owes the model.
@@ -1756,11 +2032,39 @@ impl ServiceScan<'_> {
     async fn analyze(
         &self,
         index: usize,
+        previous_data: Option<&CloudRepoData>,
+        generation: PreviousGeneration,
+    ) -> Result<ServiceRun, Box<dyn std::error::Error + Send + Sync>> {
+        let service = &self.services[index];
+        // Every prompt-lambda call a service makes happens inside its
+        // analysis, and each one carries its name so the cloud's logs can say
+        // which tree of a monorepo spent the money (carrick#1221); every loss
+        // and request it records is its own. The scope is the future, not the
+        // process, so it ends with the analysis: the cross-repo phase, the
+        // upload and a service that failed mid-loop name nobody, and two
+        // services analysed side by side each name themselves (carrick#1066).
+        crate::current_service::scope(
+            service.service_name.clone(),
+            // Boxed: the analysis future is large, and a wrapper that holds
+            // it inline is another copy of it on a debug build's stack.
+            Box::pin(self.analyze_in_scope(index, service, previous_data, generation)),
+        )
+        .await
+        // The one place the error is flattened: what is not the model's to
+        // defer ends the run with its words, and nothing downstream reads its
+        // type.
+        .map_err(|error| error.to_string().into())
+    }
+
+    /// [`Self::analyze`] inside the service's [`crate::current_service`] scope.
+    async fn analyze_in_scope(
+        &self,
+        index: usize,
         service: &Config,
         previous_data: Option<&CloudRepoData>,
         generation: PreviousGeneration,
-        workspace: &mut crate::external_call_candidates::WorkspaceScan,
     ) -> Result<ServiceRun, Box<dyn std::error::Error>> {
+        let total = self.services.len();
         // One line per service, at info, before the work starts. A scan of a
         // large monorepo spends most of its wall clock inside this loop, and
         // without a mark per iteration a stall is a silence with nothing to
@@ -1768,45 +2072,46 @@ impl ServiceScan<'_> {
         // two unrelated log lines, and reading which service it was in took
         // the whole investigation (carrick#748).
         let label = service.service_name.as_deref().unwrap_or("(root)");
-        info!("Analyzing service {} ({}/{})", label, index + 1, self.total);
+        info!("Analyzing service {} ({}/{})", label, index + 1, total);
         // The same fact, for a parent process that is rendering a line rather
-        // than reading a log (carrick#955).
-        crate::progress::service_started(label, index + 1, self.total);
-        // Every loss from here on is this service's.
-        crate::scan_health::enter_service(service.service_name.as_deref());
-        // And so is every prompt-lambda call: they all happen inside this
-        // function, and each one carries this name so the cloud's logs can
-        // say which tree of a monorepo spent the money (carrick#1221). The
-        // guard is bound, not dropped on this line: the scope has to outlive
-        // the analysis below and end with it, so that the cross-repo phase,
-        // the upload and a service that failed mid-loop name nobody.
-        let _service_scope = crate::current_service::enter(service.service_name.as_deref());
+        // than reading a log (carrick#955). The guard is bound, not dropped on
+        // this line: the service is in flight until its analysis ends.
+        let _in_flight = crate::progress::service_started(
+            service.service_name.as_deref(),
+            label,
+            index + 1,
+            total,
+        );
         let service_started = Instant::now();
 
-        let packages = load_packages_for_service(self.repo_path, service)?;
+        let packages = load_packages_for_service(&self.repo_path, service)?;
         let packages_took = service_started.elapsed();
 
         // Scope the sidecar's type extraction to this service's directory/tsconfig.
         let sidecar_started = Instant::now();
-        scope_sidecar_to_service(self.sidecar, self.repo_path, service);
+        scope_sidecar_to_service(self.sidecar, &self.repo_path, service);
         let sidecar_took = sidecar_started.elapsed();
 
         let analysis_started = Instant::now();
-        let requests = crate::agent_service::ServiceRequests::open();
-        crate::phase_timing::start_service();
-        let analysis = analyze_current_repo_incremental(
-            self.repo_path,
-            service,
-            &packages,
-            self.sidecar,
-            previous_data,
-            generation,
-            self.setups.source(index, generation),
-            workspace,
-            self.run_intents,
-            self.graphql_schemas,
-        )
-        .await?;
+        let (analysis, totals) =
+            crate::phase_timing::record(Box::pin(analyze_current_repo_incremental(
+                &self.repo_path,
+                service,
+                &packages,
+                self.sidecar,
+                previous_data,
+                generation,
+                self.setups.source(index, generation),
+                &self.workspace,
+                &self.run_intents,
+                &self.graphql_schemas,
+            )))
+            .await;
+        let analysis = analysis?;
+        // A type checker that died of memory while this service was analysed
+        // ends the run here when the run was told to stop on one: this
+        // service does not land, the ones before it do (carrick#2208).
+        crate::scan_health::type_memory_stop()?;
 
         // `analysis` used to be the whole phase and nothing said what was in
         // it (carrick#767). The breakdown after the colon adds up to it, and
@@ -1814,22 +2119,16 @@ impl ServiceScan<'_> {
         // which is what distinguishes work that grew from waiting that grew.
         // The ones asked ahead of it are counted with it, and the ones asked
         // ahead for other services while it ran are not (carrick#1895).
-        let totals = crate::phase_timing::take();
         // The same marks, folded into the split the build states before and
         // after the wait (carrick#1452). The two stages that ask the model are
         // the wait on the model; everything else in this loop, including the
         // packages read and the sidecar scoped above it, is this machine's.
-        if let Some(totals) = &totals {
-            crate::scan_timing::service_analysed(
-                totals.local_secs() + packages_took.as_secs_f64() + sidecar_took.as_secs_f64(),
-                totals.model_secs(),
-            );
-        }
-        let phases = totals
-            .as_ref()
-            .map(crate::phase_timing::Totals::line)
-            .unwrap_or_else(|| "not recorded".to_string());
-        let requests = requests.close(service.service_name.as_deref());
+        crate::scan_timing::service_analysed(
+            totals.local_secs() + packages_took.as_secs_f64() + sidecar_took.as_secs_f64(),
+            totals.model_secs(),
+        );
+        let phases = totals.line();
+        let requests = crate::agent_service::requests_of_service(service.service_name.as_deref());
         info!(
             "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s: \
              {}; requests {})",
@@ -1865,6 +2164,7 @@ impl ServiceScan<'_> {
             data,
             owed,
             held_back: false,
+            carried: false,
         })
     }
 }
@@ -2875,7 +3175,7 @@ async fn analyze_current_repo_incremental(
     previous_data: Option<&CloudRepoData>,
     generation: PreviousGeneration,
     model_setup: setup_ahead::SetupSource,
-    workspace: &mut crate::external_call_candidates::WorkspaceScan,
+    workspace: &crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
@@ -2996,6 +3296,7 @@ async fn analyze_current_repo_incremental(
             // instead of ending the run (see `SetupSource::settle`). Whether
             // to ask is decided where the queue that asks ahead decides it
             // (`StoredSetup::decide`, carrick#1895).
+            let ask_turns = model_setup.turns();
             let mut setup = if crate::local_mode::no_model() {
                 if !pkg_changed {
                     ModelSetup::ready(
@@ -3020,15 +3321,29 @@ async fn analyze_current_repo_incremental(
                         extraction_config,
                     } => {
                         debug!("Reusing cached framework detection and guidance");
+                        // Both asks below are ones another service with the
+                        // same lists asks identically: each takes its turn.
+                        // The re-ask's wait for its turn is deliberately
+                        // inside its PENDING_REASK_TIMEOUT: it is best effort,
+                        // and a re-ask that times out queued keeps the cached
+                        // detection and is asked again next scan.
                         let det = reask_client_semantics(
                             &detection,
                             generation,
                             &service_scan_root(repo_path, config),
                             Path::new(repo_path),
-                            || async {
-                                FrameworkDetector::new(reask_agent())
-                                    .detect_frameworks_and_libraries(packages, &all_import_facts)
-                                    .await
+                            || {
+                                ask_turns.in_turn(
+                                    setup_ahead::detection_ask(packages, &all_import_facts),
+                                    async {
+                                        FrameworkDetector::new(reask_agent())
+                                            .detect_frameworks_and_libraries(
+                                                packages,
+                                                &all_import_facts,
+                                            )
+                                            .await
+                                    },
+                                )
                             },
                             say_schedule,
                         )
@@ -3038,12 +3353,16 @@ async fn analyze_current_repo_incremental(
                         let extraction = match extraction_config {
                             Some(config) => Some(config),
                             None => {
-                                generate_extraction_config(
-                                    &extraction_config_agent(),
-                                    &det,
-                                    packages,
-                                )
-                                .await
+                                ask_turns
+                                    .in_turn(
+                                        setup_ahead::extraction_ask(&det, packages),
+                                        generate_extraction_config(
+                                            &extraction_config_agent(),
+                                            &det,
+                                            packages,
+                                        ),
+                                    )
+                                    .await
                             }
                         };
                         ModelSetup::ready(det, guidance, extraction)
@@ -3075,6 +3394,7 @@ async fn analyze_current_repo_incremental(
                 semantics_schedule_applies(generation),
                 packages,
                 &all_import_facts,
+                &ask_turns,
                 &service_scan_root(repo_path, config),
                 Path::new(repo_path),
             );
@@ -3140,6 +3460,7 @@ async fn analyze_current_repo_incremental(
                 sidecar,
                 &semantics_root,
                 Path::new(repo_path),
+                ask_turns.clone(),
             );
             let (analysis, settled, library_answer) = tokio::join!(
                 file_orchestrator.analyze_files(
@@ -3208,7 +3529,8 @@ async fn analyze_current_repo_incremental(
                 service,
                 &files,
                 &merged_results,
-                &setup.detection.socket_clients,
+                &setup.detection,
+                &service_modules,
             );
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
@@ -3551,7 +3873,9 @@ async fn analyze_current_repo_incremental(
 /// through `notice` first, and made at most once a run, never when the
 /// cached detection is this run's own (a retry of owed work). A failure, or
 /// no answer in time, keeps the cached detection as it is and never defers
-/// the service.
+/// the service. When `ask` takes a turn on the run's `AskTurns`, the wait for
+/// it is inside that time limit on purpose: a re-ask that times out queued
+/// is asked again next scan.
 ///
 /// What `notice` returns is held until the ask has returned, failed or run
 /// out of time, and then dropped: [`say_schedule`]'s guard ends the notice
@@ -3860,7 +4184,8 @@ fn scan_protocol_extractions(
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    socket_clients: &[String],
+    detection: &DetectionResult,
+    service_modules: &crate::workspace_resolver::WorkspaceIndex,
 ) -> (
     ProtocolExtractions,
     crate::graphql_document_sites::DocumentSiteConsumers,
@@ -3888,8 +4213,17 @@ fn scan_protocol_extractions(
         crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
     // The detected socket clients gate the pass's unknown-direction half; its
     // Socket.IO rules are independent of them (carrick#1281).
-    let sockets = crate::socket_io::scan_files(files, socket_clients);
-    let event_bus = crate::event_emitter::scan_files(files, &sockets);
+    let sockets = crate::socket_io::scan_files(files, &detection.socket_clients);
+    // A listener is kept by where its receiver comes from (carrick#941):
+    // the service's own module index places an import, and a messaging or
+    // socket client detection lists is a transport.
+    let transports: Vec<String> = detection
+        .messaging_clients
+        .iter()
+        .chain(&detection.socket_clients)
+        .cloned()
+        .collect();
+    let event_bus = crate::event_emitter::scan_files(files, &sockets, service_modules, &transports);
     (
         ProtocolExtractions {
             graphql,
@@ -3907,6 +4241,9 @@ fn scan_protocol_extractions(
 struct LibraryAsk {
     sites: crate::request_summary::LibrarySites,
     asked: crate::library_store::Asked,
+    /// The run's turns: two services asking the store the same thing take
+    /// them (carrick#1066).
+    turns: setup_ahead::AskTurns,
 }
 
 impl LibraryAsk {
@@ -3919,6 +4256,7 @@ impl LibraryAsk {
         sidecar: Option<&TypeSidecar>,
         service_root: &Path,
         repo_root: &Path,
+        turns: setup_ahead::AskTurns,
     ) -> Option<Self> {
         if crate::local_mode::no_model() || sidecar.is_none() {
             return None;
@@ -3938,7 +4276,11 @@ impl LibraryAsk {
                 npm_registry_env: npm_registry_env.as_deref(),
             },
         )?;
-        Some(Self { sites, asked })
+        Some(Self {
+            sites,
+            asked,
+            turns,
+        })
     }
 }
 
@@ -3957,11 +4299,34 @@ async fn send_to_library_store(
         .await
 }
 
+/// The turn a library-claims ask takes before it is sent, keyed on its
+/// request body: two services with the same packages ask the store one after
+/// the other, and the second finds the first's answer kept
+/// ([`setup_ahead::AskTurns`]).
+fn library_turn(
+    turns: &setup_ahead::AskTurns,
+) -> impl FnOnce(
+    &crate::library_store::LibraryClaimsRequest,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<()>> + Send>,
+> {
+    let turns = turns.clone();
+    move |request| {
+        let ask = setup_ahead::library_ask(request);
+        Box::pin(async move { turns.take(ask).await })
+    }
+}
+
 /// The store's first answer for `ask`, asked beside the analysis.
 async fn first_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::LibraryAnswer {
     match ask {
         Some(ask) => {
-            crate::library_store::ask(ask.asked.request.clone(), send_to_library_store).await
+            crate::library_store::ask(
+                ask.asked.request.clone(),
+                library_turn(&ask.turns),
+                send_to_library_store,
+            )
+            .await
         }
         None => crate::library_store::LibraryAnswer::default(),
     }
@@ -3979,7 +4344,13 @@ async fn library_rows(
     let Some(ask) = ask else {
         return crate::library_claims::LibraryRows::default();
     };
-    let claims = crate::library_store::settle(&ask.asked, first, send_to_library_store).await;
+    let claims = crate::library_store::settle(
+        &ask.asked,
+        first,
+        library_turn(&ask.turns),
+        send_to_library_store,
+    )
+    .await;
     read_library_rows(&ask.sites, &claims, sidecar, from_dir)
 }
 
@@ -5880,7 +6251,7 @@ fn attach_external_call_candidates(
     repo_path: &str,
     files: &[PathBuf],
     config: &Config,
-    workspace: &mut crate::external_call_candidates::WorkspaceScan,
+    workspace: &crate::external_call_candidates::WorkspaceScan,
 ) {
     let repo_root = std::path::Path::new(repo_path);
     let started = Instant::now();
@@ -6476,7 +6847,7 @@ fn record_capture_failure(
             return;
         }
         CaptureFailure::TimedOut => format!("type capture timed out: {failure}; {CONSEQUENCE}"),
-        CaptureFailure::SidecarDied(_) => {
+        CaptureFailure::SidecarDied { .. } => {
             format!("type capture failed: {failure}; {CONSEQUENCE}")
         }
     };
@@ -7090,7 +7461,8 @@ impl SettlingSemantics {
 /// installed package is still `pending`: every such package is asked about
 /// again on [`crate::client_semantics::settle_pending`]'s schedule, one HTTP
 /// attempt per ask, each bounded by
-/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An answer gives its
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`], the wait for its turn on
+/// the run's `AskTurns` included ([`reask_semantics_in_turn`]). An answer gives its
 /// semantics whatever lists it names, and nothing else ([`semantics_from_reask`]);
 /// an ask that fails changes nothing, and the next scan asks again.
 fn start_semantics_schedule(
@@ -7098,6 +7470,7 @@ fn start_semantics_schedule(
     schedule: bool,
     packages: &Packages,
     import_facts: &crate::framework_detector::ImportSample,
+    turns: &setup_ahead::AskTurns,
     service_root: &Path,
     repo_root: &Path,
 ) -> SettlingSemantics {
@@ -7116,15 +7489,21 @@ fn start_semantics_schedule(
     }
     let packages = std::sync::Arc::new(packages.clone());
     let import_facts = std::sync::Arc::new(import_facts.clone());
+    let turns = turns.clone();
     spawn_schedule(
         asked,
         crate::client_semantics::installed_for(service_root, repo_root),
         crate::client_semantics::pending_reask_waits(),
         move || {
             let (packages, import_facts) = (packages.clone(), import_facts.clone());
+            let turns = turns.clone();
             async move {
+                // The same ask another service with these lists makes: one at
+                // a time, in turn.
                 let detector = FrameworkDetector::new(reask_agent());
-                semantics_from_reask(
+                reask_semantics_in_turn(
+                    &turns,
+                    setup_ahead::detection_ask(&packages, &import_facts),
                     detector.detect_frameworks_and_libraries(&packages, &import_facts),
                 )
                 .await
@@ -7132,6 +7511,18 @@ fn start_semantics_schedule(
         },
         say_schedule,
     )
+}
+
+/// One ask of the in-scan schedule: `detect` in its turn on `turns`, with the
+/// wait for the turn inside [`crate::client_semantics::PENDING_REASK_TIMEOUT`]
+/// ([`semantics_from_reask`] bounds the whole), so a schedule queued behind
+/// another service's ask gives up on time like one whose ask hangs.
+async fn reask_semantics_in_turn<E: std::fmt::Display>(
+    turns: &setup_ahead::AskTurns,
+    what: String,
+    detect: impl std::future::Future<Output = Result<DetectionResult, E>>,
+) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+    semantics_from_reask(turns.in_turn(what, detect)).await
 }
 
 /// Spawn [`crate::client_semantics::settle_pending`] over `asked`, so it runs
@@ -7154,7 +7545,9 @@ where
     Shown: Send + 'static,
 {
     let entries = asked.clone();
-    let task = tokio::spawn(crate::panic_report::quiet(async move {
+    // A task of the service that starts it, so its asks are billed to that
+    // service and no other (carrick#1066).
+    let task = crate::current_service::spawn(crate::panic_report::quiet(async move {
         crate::client_semantics::settle_pending(
             entries,
             installed,
@@ -8509,7 +8902,7 @@ async fn analyze_current_repo(
     previous_intents: PreviousIntents,
     settled: Option<SettledDetection>,
     model_setup: setup_ahead::SetupSource,
-    workspace: &mut crate::external_call_candidates::WorkspaceScan,
+    workspace: &crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
@@ -8550,6 +8943,7 @@ async fn analyze_current_repo(
 
     // 3b. Settle the model stages for this service: detection and guidance
     // (or a deferral), plus the extraction config. Local mode asks nothing.
+    let ask_turns = model_setup.turns();
     let mut setup = if crate::local_mode::no_model() {
         debug!("Local mode: skipping framework detection and guidance (no model)");
         ModelSetup::ready(
@@ -8570,6 +8964,7 @@ async fn analyze_current_repo(
         semantics_schedule_applies(PreviousGeneration::Stored),
         packages,
         &all_import_facts,
+        &ask_turns,
         &service_scan_root(repo_path, config),
         Path::new(repo_path),
     );
@@ -8613,6 +9008,7 @@ async fn analyze_current_repo(
         sidecar,
         &service_root,
         Path::new(repo_path),
+        ask_turns.clone(),
     );
     let (analysis_result, settled, library_answer) = tokio::join!(
         orchestrator.run_complete_analysis(
@@ -8667,7 +9063,8 @@ async fn analyze_current_repo(
         service,
         &files,
         &analysis_result.file_results,
-        &setup.detection.socket_clients,
+        &setup.detection,
+        &service_modules,
     );
     let mut analysis_result = analysis_result;
     settle_graphql_documents(
@@ -9099,6 +9496,9 @@ async fn build_cross_repo_analyzer(
         if let Some(outcomes) = outcomes {
             analyzer.set_pair_outcomes(outcomes);
         }
+        // A memory death in the check ends a run told to stop on one; the
+        // caller lands the services without verdicts (carrick#2208).
+        crate::scan_health::type_memory_stop()?;
         state
     } else {
         warn!(
@@ -9477,6 +9877,283 @@ mod tests {
     #[test]
     fn json_output_without_a_local_cache_directory_is_not_warned() {
         assert_eq!(suppressed_upload_warning(true, None), None);
+    }
+
+    /// Every context the upload decision reads, with the answer it gave
+    /// before the switch existed (carrick#2207).
+    fn upload_contexts() -> Vec<(&'static str, UploadContext<'static>, bool)> {
+        let base = UploadContext::default();
+        vec![
+            (
+                "CARRICK_OUTPUT_JSON",
+                UploadContext {
+                    output_json: true,
+                    ..base
+                },
+                false,
+            ),
+            (
+                "local cache dir",
+                UploadContext {
+                    local_dir: true,
+                    event_name: Some("pull_request"),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "pull_request",
+                UploadContext {
+                    event_name: Some("pull_request"),
+                    ..base
+                },
+                false,
+            ),
+            (
+                "refs/pull/*",
+                UploadContext {
+                    git_ref: Some("refs/pull/12/merge"),
+                    ..base
+                },
+                false,
+            ),
+            (
+                "refs/heads/main",
+                UploadContext {
+                    git_ref: Some("refs/heads/main"),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "refs/heads/master",
+                UploadContext {
+                    git_ref: Some("refs/heads/master"),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "refs/heads/feature",
+                UploadContext {
+                    git_ref: Some("refs/heads/feature"),
+                    ..base
+                },
+                false,
+            ),
+            ("nothing set", base, true),
+        ]
+    }
+
+    /// With no switch, every context decides exactly as it did before the
+    /// switch existed.
+    #[test]
+    fn without_the_switch_every_context_decides_as_before() {
+        for (name, context, before) in upload_contexts() {
+            assert_eq!(upload_decision(None, context), Ok(before), "{name}");
+        }
+    }
+
+    /// With the switch, the switch decides, after the one guard that stays
+    /// first: `CARRICK_OUTPUT_JSON` never uploads, and asking it to is a usage
+    /// error rather than a flag that does nothing.
+    #[test]
+    fn the_switch_decides_except_against_json_output() {
+        for (name, context, _) in upload_contexts() {
+            assert_eq!(
+                upload_decision(Some(false), context),
+                Ok(false),
+                "--no-upload, {name}"
+            );
+            let expected = if context.output_json {
+                Err(UPLOAD_WITH_OUTPUT_JSON)
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                upload_decision(Some(true), context),
+                expected,
+                "--upload, {name}"
+            );
+        }
+    }
+
+    /// `--pr` never uploads: it decides after the `CARRICK_OUTPUT_JSON` guard
+    /// and before every context, `--no-upload` agrees, and `--upload` against
+    /// it is a usage error (carrick#2229).
+    #[test]
+    fn a_pr_flag_never_uploads() {
+        for (name, context, _) in upload_contexts() {
+            let context = UploadContext {
+                pr_flag: true,
+                ..context
+            };
+            for switch in [None, Some(false)] {
+                assert_eq!(upload_decision(switch, context), Ok(false), "{name}");
+            }
+            let expected = if context.output_json {
+                Err(UPLOAD_WITH_OUTPUT_JSON)
+            } else {
+                Err(crate::pr_context::UPLOAD_CONFLICT)
+            };
+            assert_eq!(upload_decision(Some(true), context), expected, "{name}");
+        }
+    }
+
+    /// A `--pr` run on a Bearer scan sends one `close-scan` naming
+    /// `pull_request` and no write, whatever the upload switch says
+    /// (carrick#2229).
+    #[tokio::test]
+    async fn a_pr_run_closes_the_scan_it_opened_with_pull_request() {
+        for switch in [None, Some(false)] {
+            let (base, server) = crate::agent_service::tests::stub_server(vec![(
+                200,
+                serde_json::json!({ "ok": true }).to_string(),
+            )]);
+            let url = format!("{base}/types/check-or-upload");
+            let storage = crate::cloud_storage::AwsStorage::for_test(
+                &url,
+                crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+                false,
+            );
+            storage.adopt_scan_id("scan_01J");
+            report_run_end(&storage, "/repos/api", &Ok(()), switch, true).await;
+
+            // A run that sent no marker leaves the one answer to this probe;
+            // a run that did finds nobody listening.
+            let _ = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("a client")
+                .post(&url)
+                .json(&serde_json::json!({ "action": "carrick-2229-probe" }))
+                .send()
+                .await;
+            let seen = server.join().expect("the stub server thread");
+            assert_eq!(seen.len(), 1, "{switch:?}: {seen:#?}");
+            let body: serde_json::Value =
+                serde_json::from_str(seen[0].split("\r\n\r\n").nth(1).expect("a body"))
+                    .expect("the body is JSON");
+            assert_eq!(body["action"], "close-scan", "{switch:?}");
+            assert_eq!(body["reason"], "pull_request", "{switch:?}");
+        }
+    }
+
+    /// `start-scan` and the preflight marker name the declared repository,
+    /// not the origin remote; with nothing declared, the remote as before
+    /// (carrick#2207).
+    #[test]
+    fn the_cloud_is_told_the_declared_repository_over_the_remote() {
+        let checkout = tempfile::tempdir().expect("a checkout");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(checkout.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/api-fork.git",
+        ]);
+        let path = checkout.path().to_str().expect("a UTF-8 path");
+
+        assert_eq!(
+            repo_full_name_from(Some("acme/api"), path).as_deref(),
+            Some("acme/api")
+        );
+        assert_eq!(
+            repo_full_name_from(None, path).as_deref(),
+            Some("acme/api-fork")
+        );
+    }
+
+    /// A Bearer run told `--no-upload` sends no write, so nothing carries
+    /// `scan_final`: it ends its scan with one `close-scan` naming
+    /// `no_upload`, which hands the slot back (carrick#2207).
+    #[tokio::test]
+    async fn a_run_told_not_to_upload_closes_the_scan_it_opened() {
+        let (base, server) = crate::agent_service::tests::stub_server(vec![(
+            200,
+            serde_json::json!({ "ok": true }).to_string(),
+        )]);
+        let storage = crate::cloud_storage::AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        );
+        storage.adopt_scan_id("scan_01J");
+
+        report_run_end(&storage, "/repos/api", &Ok(()), Some(false), false).await;
+
+        // The stub has one answer. A run that sent no marker leaves it to
+        // this probe, which the stub then records in the marker's place; a
+        // run that did finds nobody listening, and the probe's failure is
+        // ignored.
+        let _ = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("a client")
+            .post(format!("{base}/types/check-or-upload"))
+            .json(&serde_json::json!({ "action": "carrick-2207-probe" }))
+            .send()
+            .await;
+        let seen = server.join().expect("the stub server thread");
+        assert_eq!(seen.len(), 1, "{seen:#?}");
+        let body: serde_json::Value = serde_json::from_str(
+            seen[0]
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("the request has a body"),
+        )
+        .expect("the body is JSON");
+        assert_eq!(body["action"], "close-scan");
+        assert_eq!(body["scan_id"], "scan_01J");
+        assert_eq!(body["reason"], "no_upload");
+    }
+
+    /// A run that uploaded, or decided as it always did, closed its scan with
+    /// its last write and sends no marker of its own.
+    #[tokio::test]
+    async fn a_run_that_was_not_told_not_to_upload_sends_no_close() {
+        for switch in [None, Some(true)] {
+            // The stub has one answer. A marker would take it, and the probe
+            // after it would find nobody listening.
+            let (base, server) = crate::agent_service::tests::stub_server(vec![(
+                200,
+                serde_json::json!({ "ok": true }).to_string(),
+            )]);
+            let url = format!("{base}/types/check-or-upload");
+            let storage = crate::cloud_storage::AwsStorage::for_test(
+                &url,
+                crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+                false,
+            );
+            storage.adopt_scan_id("scan_01J");
+            report_run_end(&storage, "/repos/api", &Ok(()), switch, false).await;
+
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("a client")
+                .post(&url)
+                .json(&serde_json::json!({ "action": "carrick-2207-probe" }))
+                .send()
+                .await
+                .expect("the stub still had its answer for this test's own probe");
+            let seen = server.join().expect("the stub server thread");
+            assert_eq!(seen.len(), 1, "{switch:?}: {seen:#?}");
+            assert!(seen[0].contains("carrick-2207-probe"), "{switch:?}");
+        }
     }
 
     /// The incremental upload path stamps the running release, same as the
@@ -13081,7 +13758,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &fixture_str,
             &files,
             &service,
-            &mut crate::external_call_candidates::WorkspaceScan::new(),
+            &crate::external_call_candidates::WorkspaceScan::new(),
         );
 
         let rows = data
@@ -13206,7 +13883,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &fixture_str,
             &files,
             &service,
-            &mut crate::external_call_candidates::WorkspaceScan::new(),
+            &crate::external_call_candidates::WorkspaceScan::new(),
         );
 
         let rows = data.external_call_candidates.expect("rows");
@@ -16366,8 +17043,118 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// carrick#1066. The schedule runs on a task of its own, started inside
+    /// the service's scope: each ask it sends names that service, and the
+    /// service beside it names its own.
+    #[tokio::test(start_paused = true)]
+    async fn the_schedule_asks_as_the_service_that_started_it() {
+        let schedule_for = |service: &'static str| {
+            let named = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+            let seen = named.clone();
+            let settling = crate::current_service::sync_scope(Some(service.to_string()), || {
+                spawn_schedule(
+                    sample_entries(),
+                    |_| true,
+                    crate::client_semantics::PENDING_REASK_WAITS.to_vec(),
+                    move || {
+                        seen.lock().unwrap().push(crate::current_service::name());
+                        async { None }
+                    },
+                    |_| (),
+                )
+            });
+            (named, settling)
+        };
+        let (left, left_settling) = schedule_for("schedule-left-1066");
+        let (right, right_settling) = schedule_for("schedule-right-1066");
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+
+        let named = |seen: &std::sync::Mutex<Vec<Option<String>>>| seen.lock().unwrap().clone();
+        assert!(!named(&left).is_empty(), "the schedule asked");
+        assert!(
+            named(&left)
+                .iter()
+                .all(|n| n.as_deref() == Some("schedule-left-1066")),
+            "{:?}",
+            named(&left)
+        );
+        assert!(
+            named(&right)
+                .iter()
+                .all(|n| n.as_deref() == Some("schedule-right-1066")),
+            "{:?}",
+            named(&right)
+        );
+        drop((left_settling, right_settling));
+    }
+
     fn broken_ask() -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
         panic!("the schedule broke")
+    }
+
+    /// carrick#1066. The schedule's ask waits for its turn inside its time
+    /// limit: queued behind another service's ask of the same thing, it gives
+    /// up when the limit passes, not when the turn comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_scheduled_reask_queued_for_its_turn_gives_up_on_time() {
+        let turns = setup_ahead::AskTurns::default();
+        let held = turns.take("a detection".to_string()).await;
+        let began = tokio::time::Instant::now();
+
+        let answered = tokio::time::timeout(
+            crate::client_semantics::PENDING_REASK_TIMEOUT * 3,
+            reask_semantics_in_turn(&turns, "a detection".to_string(), async {
+                Ok::<_, String>(DetectionResult::default())
+            }),
+        )
+        .await;
+
+        assert_eq!(answered, Ok(None), "it gave up while still queued");
+        assert_eq!(
+            began.elapsed(),
+            crate::client_semantics::PENDING_REASK_TIMEOUT
+        );
+        drop(held);
+    }
+
+    /// carrick#1066. Two services asking the library store for the same
+    /// packages take turns; a different request does not wait for them.
+    #[tokio::test]
+    async fn library_asks_for_one_request_body_take_turns() {
+        let turns = setup_ahead::AskTurns::default();
+        let request = |package: &str| crate::library_store::LibraryClaimsRequest {
+            roles: vec!["broker"],
+            packages: vec![crate::library_store::RegistryPackage {
+                package: package.to_string(),
+                version: "1.0.0".to_string(),
+                specifiers: Vec::new(),
+            }],
+        };
+        let first = library_turn(&turns)(&request("lib")).await;
+
+        let same = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            library_turn(&turns)(&request("lib")),
+        )
+        .await;
+        assert!(same.is_err(), "the same body waits for the first ask");
+        let other = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            library_turn(&turns)(&request("other")),
+        )
+        .await;
+        assert!(other.is_ok(), "another body is a different ask");
+
+        drop(first);
+        let after = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            library_turn(&turns)(&request("lib")),
+        )
+        .await;
+        assert!(
+            after.is_ok(),
+            "the next ask goes once the first is answered"
+        );
     }
 
     /// carrick#1564, third review: a panic inside the schedule is the
@@ -19811,7 +20598,6 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// the index. The stand-in answers every check the way the verifier does
     /// once its time limit has passed.
     #[test]
-    #[serial_test::serial(current_service)]
     fn library_checks_the_time_limit_did_not_reach_reach_the_boundary() {
         const SERVICE: &str = "library-2021";
         let dir = tempfile::tempdir().expect("tempdir");
@@ -19862,10 +20648,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(asked > 0, "the site asks something");
         crate::scan_health::forget_service_losses(Some(SERVICE));
 
-        let rows = {
-            let _scope = crate::current_service::enter(Some(SERVICE));
+        let rows = crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
             read_library_rows(&sites, &claims, Some(&sidecar), &root)
-        };
+        });
         assert!(
             rows.rows.is_empty(),
             "nothing was verified, nothing is stated"
@@ -19893,10 +20678,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// boundary the scan prints, not the one `status` and `check` print.
     ///
     /// The stand-in answers `init` and nothing else, under a short deadline.
-    /// The count is a range: another test's sidecar timing out while this
-    /// scope is open is counted against it too.
+    /// The count is a range, not one number.
     #[test]
-    #[serial_test::serial(current_service)]
     fn a_sidecar_deadline_is_written_to_the_index_and_run_log_and_stated_nowhere() {
         use crate::services::type_sidecar::{InferKind, InferRequestItem, SidecarError};
         const SERVICE: &str = "silent-2021";
@@ -19937,13 +20720,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
-        {
-            let _scope = crate::current_service::enter(Some(SERVICE));
+        crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
             assert!(matches!(
                 sidecar.infer_types(&items, None),
                 Err(SidecarError::Timeout)
             ));
-        }
+        });
 
         let mut data = service_data("monorepo", Some(SERVICE));
         data.boundary = Some(crate::boundary::ServiceBoundary::default());

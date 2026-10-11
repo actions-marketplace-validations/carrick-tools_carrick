@@ -607,7 +607,8 @@ pub struct ScannerBuild {
 
 impl ScannerBuild {
     /// The running binary's own build, compiled in by `build.rs`, or `None`
-    /// when it was built where no commit could be named.
+    /// for a debug build (carrick#2157) or one made where no commit could be
+    /// named.
     pub fn current() -> Option<Self> {
         let commit = env!("CARRICK_BUILD_COMMIT");
         (!commit.is_empty()).then(|| Self {
@@ -1576,6 +1577,15 @@ pub trait CloudStorage {
     /// reason: only the laptop credential has anyone to tell.
     async fn report_preflight_failed(&self, _repo: Option<&str>, _stage: &str, _reason: &str) {}
 
+    /// Say that this run ended without replacing the index, which hands the
+    /// scan slot back (carrick#1262, carrick#2207). `reason` is a
+    /// `[a-z_]{1,64}` token.
+    ///
+    /// Best-effort and a default no-op, for the reasons
+    /// [`CloudStorage::report_scan_failed`] gives: only the laptop credential
+    /// holds a slot.
+    async fn report_scan_closed(&self, _reason: &str) {}
+
     /// Relay a PR run's structured findings to the cloud, which renders and
     /// posts (and updates in place on later pushes) a single GitHub App
     /// comment + check run on the PR. Only called on `pull_request` runs —
@@ -2071,6 +2081,12 @@ mod tests {
     /// tree: tests in this crate write to tracked fixtures.
     #[test]
     fn scanner_build_names_the_commit_the_binary_was_built_from() {
+        // Debug builds are not stamped (carrick#2157), so there is no commit
+        // to compare; `cargo test --release` runs the check below.
+        if cfg!(debug_assertions) {
+            assert_eq!(ScannerBuild::current(), None);
+            return;
+        }
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let git = |args: &[&str]| {
             std::process::Command::new("git")

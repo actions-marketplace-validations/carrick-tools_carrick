@@ -82,18 +82,17 @@ fn retry_announcement_due(last: Option<Instant>, now: Instant) -> bool {
 /// stopped answering ([`NOT_ASKED_CODE`], carrick#1909), is no row at all.
 static REQUEST_COUNTS: OnceLock<Mutex<RequestCounts>> = OnceLock::new();
 
-/// Every request the scan has issued, by route, and which of them were asked
-/// for a service ahead of its analysis (carrick#1895).
+/// Every request the scan has issued, by route, and by the service each was
+/// made for.
 #[derive(Default)]
 struct RequestCounts {
     /// Every request, by route.
     issued: BTreeMap<String, usize>,
-    /// Those of `issued` that a service's detection and guidance were asked
-    /// with ahead of it ([`crate::current_service::asked_for`]), by route.
-    ahead: BTreeMap<String, usize>,
-    /// Those of `ahead` no service's line has counted yet, by the service
-    /// they were asked for.
-    ahead_unclaimed: BTreeMap<Option<String>, BTreeMap<String, usize>>,
+    /// Those of `issued` made for a service, by that service and route, until
+    /// [`requests_of_service`] reads the service's line. `None` is the
+    /// unnamed service of a single-service scan. A request made for no
+    /// service (the cross-repo phase, the upload) is in `issued` only.
+    by_service: BTreeMap<Option<String>, BTreeMap<String, usize>>,
 }
 
 fn request_counts_map() -> &'static Mutex<RequestCounts> {
@@ -102,13 +101,12 @@ fn request_counts_map() -> &'static Mutex<RequestCounts> {
 
 fn record_request(path: &str) {
     // Read before the lock: it is the running task's own.
-    let asked_ahead = crate::current_service::asked_ahead();
+    let service = crate::current_service::working_for();
     let mut counts = request_counts_map().lock().unwrap();
     *counts.issued.entry(path.to_string()).or_insert(0) += 1;
-    if let Some(service) = asked_ahead {
-        *counts.ahead.entry(path.to_string()).or_insert(0) += 1;
+    if let Some(service) = service {
         *counts
-            .ahead_unclaimed
+            .by_service
             .entry(service)
             .or_default()
             .entry(path.to_string())
@@ -121,50 +119,25 @@ pub fn request_counts() -> BTreeMap<String, usize> {
     request_counts_map().lock().unwrap().issued.clone()
 }
 
-/// The requests one service made, for its line in the run log.
+/// The requests one service made since its line was last read, for its line
+/// in the run log, as [`requests_between`] words them.
 ///
-/// A service's requests used to be the ones issued while its analysis ran,
-/// because nothing else was asking. Its detection and guidance are now asked
-/// ahead of it, while the scan analyses another service (carrick#1895), so
-/// the window alone would give the first service every other service's
-/// setup and the later ones none of their own. A service's requests are the
-/// ones issued in its window that were not asked ahead for anyone, and the
-/// ones asked ahead for it, whenever they were sent.
-pub struct ServiceRequests {
-    issued: BTreeMap<String, usize>,
-    ahead: BTreeMap<String, usize>,
-}
-
-impl ServiceRequests {
-    /// Open the window as the service's analysis starts.
-    pub fn open() -> Self {
-        let counts = request_counts_map().lock().unwrap();
-        Self {
-            issued: counts.issued.clone(),
-            ahead: counts.ahead.clone(),
-        }
-    }
-
-    /// Close the window and say what `service` requested, as
-    /// [`requests_between`] words it. What was asked ahead for it is counted
-    /// here once: a second pass over the service does not count it again.
-    pub fn close(self, service: Option<&str>) -> String {
-        let mut counts = request_counts_map().lock().unwrap();
-        let asked_ahead = counts
-            .ahead_unclaimed
-            .remove(&service.map(str::to_string))
-            .unwrap_or_default();
-        let mut own = self.issued.clone();
-        for (route, issued) in &counts.issued {
-            let before =
-                |snapshot: &BTreeMap<String, usize>| snapshot.get(route).copied().unwrap_or(0);
-            let in_window = issued - before(&self.issued);
-            let ahead_in_window = before(&counts.ahead) - before(&self.ahead);
-            *own.entry(route.clone()).or_insert(0) += in_window.saturating_sub(ahead_in_window)
-                + asked_ahead.get(route).copied().unwrap_or(0);
-        }
-        requests_between(&self.issued, &own)
-    }
+/// Each request is counted against the service it was made for when it is
+/// made ([`crate::current_service::working_for`]): the service the task
+/// belongs to, or the one a task asking ahead of its analysis was started for
+/// (carrick#1895). So the line holds what was asked ahead for the service as
+/// well as its own, whenever they were sent, and nothing another service
+/// asked while it ran (carrick#1066). Reading the line takes the count: a
+/// second pass over the service (the retry of owed work) states its own
+/// requests, and none again.
+pub fn requests_of_service(service: Option<&str>) -> String {
+    let own = request_counts_map()
+        .lock()
+        .unwrap()
+        .by_service
+        .remove(&service.map(str::to_string))
+        .unwrap_or_default();
+    requests_between(&BTreeMap::new(), &own)
 }
 
 /// The requests issued between two snapshots, as the per-service line prints
@@ -681,6 +654,82 @@ const COLLECT_HEADER: &str = "X-Carrick-Collect";
 /// The one route a collecting request is sent to. Its lambda is the one that
 /// holds a lease on a request in flight and keeps its answer, so it is the
 /// one with something a later request could collect.
+/// The per-request timeout of every route, and of the prompt routes unless
+/// the runner sets one.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The four routes a runner's loopback proxy serves. `/library-claims` is the
+/// fifth AgentService route and stays on the build-time endpoint, as does
+/// `/types/check-or-upload`. Documented in `docs/reference/runner.md`.
+const PROMPT_ROUTES: [&str; 4] = [
+    "/analyze-file",
+    "/generate-intent",
+    "/framework-detect",
+    "/framework-guidance",
+];
+
+/// Set once by `main` from the environment, before any service is built.
+static PROMPT_RUNNER: std::sync::OnceLock<PromptRunner> = std::sync::OnceLock::new();
+
+/// What the runner changed about the four prompt routes
+/// (`CARRICK_PROMPT_ENDPOINT`, `CARRICK_PROMPT_TIMEOUT_SECS`;
+/// `docs/reference/runner.md`). The default changes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptRunner {
+    endpoint: Option<String>,
+    timeout: Option<Duration>,
+}
+
+/// `http://127.0.0.1:<port>` or `http://[::1]:<port>`: a loopback address
+/// with a port, and no path, query or userinfo. A name is refused because it
+/// can resolve anywhere.
+fn parse_prompt_endpoint(value: &str) -> Result<String, String> {
+    let addr = value
+        .strip_prefix("http://")
+        .and_then(|rest| rest.parse::<std::net::SocketAddr>().ok())
+        .filter(|addr| addr.port() != 0)
+        .filter(|addr| {
+            addr.ip() == std::net::Ipv4Addr::LOCALHOST || addr.ip() == std::net::Ipv6Addr::LOCALHOST
+        });
+    match addr {
+        Some(_) => Ok(value.to_string()),
+        None => Err(format!(
+            "CARRICK_PROMPT_ENDPOINT must be http://127.0.0.1:<port> or http://[::1]:<port>, not '{value}'."
+        )),
+    }
+}
+
+/// Whole seconds, 1 to 900.
+fn parse_prompt_timeout(value: &str) -> Result<Duration, String> {
+    match value.parse::<u64>() {
+        Ok(secs) if (1..=900).contains(&secs) => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "CARRICK_PROMPT_TIMEOUT_SECS must be a whole number of seconds from 1 to 900, not '{value}'."
+        )),
+    }
+}
+
+impl PromptRunner {
+    fn from_values(endpoint: Option<&str>, timeout: Option<&str>) -> Result<Self, String> {
+        Ok(Self {
+            endpoint: endpoint.map(parse_prompt_endpoint).transpose()?,
+            timeout: timeout.map(parse_prompt_timeout).transpose()?,
+        })
+    }
+}
+
+/// Read both settings and keep them for every service built after this.
+/// An error is a usage error for `main` to print and exit 2 on.
+pub fn init_prompt_runner_from_env() -> Result<(), String> {
+    let read = |name: &str| env::var(name).ok();
+    let runner = PromptRunner::from_values(
+        read("CARRICK_PROMPT_ENDPOINT").as_deref(),
+        read("CARRICK_PROMPT_TIMEOUT_SECS").as_deref(),
+    )?;
+    let _ = PROMPT_RUNNER.set(runner);
+    Ok(())
+}
+
 const COLLECT_ROUTE: &str = "/analyze-file";
 
 /// A `Retry-After` value in delta-seconds, the only form the cloud sends. The
@@ -931,6 +980,9 @@ pub struct AgentService {
     refusals: Arc<RouteRefusals>,
     capabilities: Arc<CloudCapabilities>,
     retry: RetryPolicy,
+    /// Where the four prompt routes go and how long each waits, when the
+    /// runner set them ([`PromptRunner`]).
+    prompt_runner: PromptRunner,
     /// Whether a call this service sends is one of the run's requests
     /// ([`record_request`]). Every service a scan builds counts its calls. A
     /// test that drives the retry loop against a stub does not, so it neither
@@ -961,9 +1013,27 @@ impl AgentService {
             refusals: global_refusals(),
             capabilities: global_capabilities(),
             retry: RetryPolicy::STANDARD,
+            prompt_runner: PROMPT_RUNNER.get().cloned().unwrap_or_default(),
             counts_requests: true,
             #[cfg(test)]
             script: None,
+        }
+    }
+
+    /// The base URL a call to `path` is sent to: the runner's endpoint for
+    /// the four prompt routes when it set one, else `build_base`.
+    fn base_for<'a>(&'a self, path: &str, build_base: &'a str) -> &'a str {
+        match &self.prompt_runner.endpoint {
+            Some(endpoint) if PROMPT_ROUTES.contains(&path) => endpoint,
+            _ => build_base,
+        }
+    }
+
+    /// How long one request to `path` may take.
+    fn timeout_for(&self, path: &str) -> Duration {
+        match self.prompt_runner.timeout {
+            Some(timeout) if PROMPT_ROUTES.contains(&path) => timeout,
+            _ => REQUEST_TIMEOUT,
         }
     }
 
@@ -1060,8 +1130,8 @@ impl AgentService {
             ),
             crate::credentials::CloudAuth::Bearer(token) => RequestAuth::Bearer(token),
         };
-        self.post_with_retry(&auth, env!("CARRICK_API_ENDPOINT"), task_path, body)
-            .await
+        let base = self.base_for(task_path, env!("CARRICK_API_ENDPOINT"));
+        self.post_with_retry(&auth, base, task_path, body).await
     }
 
     /// Put one request on the wire.
@@ -1239,7 +1309,7 @@ impl AgentService {
             }
             asked = true;
 
-            let request_builder = self.request(&endpoint, body, auth, &token, lambda_attempt);
+            let request_builder = self.request(&endpoint, path, body, auth, &token, lambda_attempt);
             let asked_at = tokio::time::Instant::now();
             let sent = self.send(request_builder, path, lambda_attempt).await;
             // The request a refusal was waited out for has come back, so the
@@ -1756,6 +1826,7 @@ impl AgentService {
     fn request<B>(
         &self,
         endpoint: &str,
+        path: &str,
         body: &B,
         auth: &RequestAuth<'_>,
         token: &str,
@@ -1768,7 +1839,7 @@ impl AgentService {
             .client
             .post(endpoint)
             .json(body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(self.timeout_for(path))
             .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
             .header("X-Carrick-Run-Id", crate::logging::run_id())
             .header(ATTEMPT_HEADER, lambda_attempt.to_string());
@@ -1879,7 +1950,7 @@ impl AgentService {
                 return Err(ended);
             };
             let request = self
-                .request(endpoint, body, auth, &token, lambda_attempt)
+                .request(endpoint, path, body, auth, &token, lambda_attempt)
                 .header(COLLECT_HEADER, "1");
             let response = match self.send(request, path, lambda_attempt).await {
                 Ok(response) => response,
@@ -3703,6 +3774,7 @@ pub(crate) mod tests {
             refusals: Arc::new(RouteRefusals::new()),
             capabilities: Arc::new(CloudCapabilities::new()),
             retry: RetryPolicy::STANDARD,
+            prompt_runner: PromptRunner::default(),
             counts_requests: false,
             script: None,
         }
@@ -4505,6 +4577,140 @@ pub(crate) mod tests {
             header_of(&requests[1], "x-carrick-attempt").as_deref(),
             Some("2")
         );
+    }
+
+    fn runner_service(endpoint: Option<&str>, timeout: Option<&str>) -> AgentService {
+        let mut service = AgentService::new();
+        service.prompt_runner = PromptRunner::from_values(endpoint, timeout).unwrap();
+        service
+    }
+
+    #[test]
+    fn the_prompt_endpoint_must_be_a_loopback_address_with_a_port() {
+        for ok in ["http://127.0.0.1:8080", "http://[::1]:8080"] {
+            assert_eq!(parse_prompt_endpoint(ok).as_deref(), Ok(ok), "{ok}");
+        }
+        for bad in [
+            "https://api.carrick.tools",
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080/x",
+            "http://127.0.0.1:8080/",
+            "http://user@127.0.0.1:8080",
+            "http://10.0.0.1:8080",
+            "http://127.0.0.1:0",
+            "",
+        ] {
+            assert!(parse_prompt_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_timeout_is_whole_seconds_from_one_to_nine_hundred() {
+        assert_eq!(parse_prompt_timeout("130"), Ok(Duration::from_secs(130)));
+        assert_eq!(parse_prompt_timeout("1"), Ok(Duration::from_secs(1)));
+        assert_eq!(parse_prompt_timeout("900"), Ok(Duration::from_secs(900)));
+        for bad in ["0", "901", "abc", "", "1.5", "-1"] {
+            assert!(parse_prompt_timeout(bad).is_err(), "{bad}");
+        }
+        assert!(PromptRunner::from_values(None, Some("0")).is_err());
+        assert!(PromptRunner::from_values(Some("http://x:1"), None).is_err());
+    }
+
+    /// With the endpoint set, the four prompt routes reach it with the usual
+    /// headers and `/library-claims` does not; without it, none do.
+    #[tokio::test]
+    async fn only_the_four_prompt_routes_go_to_the_runner_endpoint() {
+        const BUILD: &str = "http://build.invalid";
+        let routes = [
+            "/analyze-file",
+            "/generate-intent",
+            "/framework-detect",
+            "/framework-guidance",
+        ];
+        let (stub, server) = stub_server(
+            routes
+                .iter()
+                .map(|_| (200, r#"{"success":true,"text":"ok"}"#.to_string()))
+                .collect(),
+        );
+        let service = runner_service(Some(&stub), None);
+        for route in routes {
+            let base = service.base_for(route, BUILD);
+            assert_eq!(base, stub, "{route}");
+            service
+                .post_with_retry(
+                    &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                    base,
+                    route,
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(service.base_for("/library-claims", BUILD), BUILD);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), routes.len());
+        for (request, route) in seen.iter().zip(routes) {
+            assert!(request.starts_with(&format!("POST {route} ")), "{request}");
+            assert_eq!(
+                header_of(request, "authorization").as_deref(),
+                Some("Bearer carrick_sk_live_test")
+            );
+            assert!(header_of(request, "x-carrick-scanner-version").is_some());
+            assert!(header_of(request, "x-carrick-attempt").is_some());
+        }
+
+        let plain = runner_service(None, None);
+        for route in routes.iter().chain(&["/library-claims"]) {
+            assert_eq!(plain.base_for(route, BUILD), BUILD, "{route}");
+            assert_eq!(plain.timeout_for(route), Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn the_prompt_timeout_applies_to_the_prompt_routes_only() {
+        let service = runner_service(None, Some("135"));
+        assert_eq!(
+            service.timeout_for("/analyze-file"),
+            Duration::from_secs(135)
+        );
+        assert_eq!(
+            service.timeout_for("/library-claims"),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A stub that answers after the setting has run out ends the request in
+    /// transport, which the loop retries like any other transport failure.
+    #[tokio::test]
+    async fn a_prompt_request_times_out_at_the_runner_setting() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let slow = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let service = runner_service(None, Some("1")).with_retry_policy(RetryPolicy::ONCE);
+        let started = std::time::Instant::now();
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(1900),
+            "waited {:?}",
+            started.elapsed()
+        );
+        slow.join().unwrap();
     }
 
     /// A call waiting out a retry holds no concurrency slot (carrick#1077).
@@ -7319,7 +7525,6 @@ pub(crate) mod tests {
     /// made outside the scan loop must not be billed to whichever service
     /// happened to run last.
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_call_outside_the_service_loop_sends_no_service_header() {
         let request = prompt_call_request().await;
         assert!(
@@ -7332,10 +7537,9 @@ pub(crate) mod tests {
     /// being analysed, which is what makes a monorepo's model spend
     /// attributable to one tree (carrick#1221).
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_call_inside_a_service_scope_names_that_service() {
-        let _scope = crate::current_service::enter(Some("api"));
-        let request = prompt_call_request().await;
+        let request =
+            crate::current_service::scope(Some("api".to_string()), prompt_call_request()).await;
         assert_eq!(
             header_of(&request, "x-carrick-service").as_deref(),
             Some("api")
@@ -7347,22 +7551,23 @@ pub(crate) mod tests {
     /// the service the loop is in; one made for an unnamed service names
     /// nobody.
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_call_asked_ahead_for_a_service_names_it_and_not_the_one_being_analysed() {
-        let _scope = crate::current_service::enter(Some("api"));
+        crate::current_service::scope(Some("api".to_string()), async {
+            let ahead =
+                crate::current_service::asked_for(Some("web".to_string()), prompt_call_request())
+                    .await;
+            assert_eq!(
+                header_of(&ahead, "x-carrick-service").as_deref(),
+                Some("web")
+            );
 
-        let ahead =
-            crate::current_service::asked_for(Some("web".to_string()), prompt_call_request()).await;
-        assert_eq!(
-            header_of(&ahead, "x-carrick-service").as_deref(),
-            Some("web")
-        );
-
-        let unnamed = crate::current_service::asked_for(None, prompt_call_request()).await;
-        assert!(
-            header_of(&unnamed, "x-carrick-service").is_none(),
-            "an unnamed service asked ahead names nobody, not the loop's service: {unnamed}"
-        );
+            let unnamed = crate::current_service::asked_for(None, prompt_call_request()).await;
+            assert!(
+                header_of(&unnamed, "x-carrick-service").is_none(),
+                "an unnamed service asked ahead names nobody, not the loop's service: {unnamed}"
+            );
+        })
+        .await;
     }
 
     /// The per-service line of the run log says what a service requested. Its
@@ -7384,42 +7589,75 @@ pub(crate) mod tests {
             })
         };
 
+        let in_service = |service: &'static str| {
+            crate::current_service::scope(Some(service.to_string()), async { record_request(FILE) })
+        };
+
         // Before any service is analysed, the second one's setup is asked.
         ask_ahead(SECOND).await;
 
         // The first is analysed. Its own setup is asked meanwhile, and one
         // more request of the second's; two files are its own.
-        let first = ServiceRequests::open();
         ask_ahead(FIRST).await;
         ask_ahead(SECOND).await;
-        record_request(FILE);
-        record_request(FILE);
-        let first = first.close(Some(FIRST));
+        in_service(FIRST).await;
+        in_service(FIRST).await;
+        let first = requests_of_service(Some(FIRST));
         assert!(first.contains("a-setup-asked-ahead 1"), "{first}");
         assert!(first.contains("a-file-of-its-own 2"), "{first}");
 
         // The second is analysed and asks for one file: what was asked ahead
         // for it, before and during the first's analysis, is counted here.
-        let second = ServiceRequests::open();
-        record_request(FILE);
-        let second = second.close(Some(SECOND));
+        in_service(SECOND).await;
+        let second = requests_of_service(Some(SECOND));
         assert!(second.contains("a-setup-asked-ahead 2"), "{second}");
         assert!(second.contains("a-file-of-its-own 1"), "{second}");
 
         // A second pass over it (the retry of owed work) counts none again.
-        let again = ServiceRequests::open().close(Some(SECOND));
+        let again = requests_of_service(Some(SECOND));
         assert!(!again.contains("a-setup-asked-ahead"), "{again}");
         assert!(!again.contains("a-file-of-its-own"), "{again}");
+    }
+
+    /// Two services analysed side by side, their awaits interleaving, are
+    /// each counted for their own requests and not each other's
+    /// (carrick#1066): a time window over the process would hand both the
+    /// sum.
+    #[tokio::test]
+    async fn requests_made_side_by_side_are_counted_against_their_own_service() {
+        const ROUTE: &str = "/a-route-counted-side-by-side";
+        const LEFT: &str = "the service on the left";
+        const RIGHT: &str = "the service on the right";
+        let analyse = |service: &'static str, requests: usize| {
+            crate::current_service::scope(Some(service.to_string()), async move {
+                for _ in 0..requests {
+                    tokio::task::yield_now().await;
+                    record_request(ROUTE);
+                }
+                // A task it starts through the helper counts for it too.
+                crate::current_service::spawn(async { record_request(ROUTE) })
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::join!(analyse(LEFT, 3), analyse(RIGHT, 1));
+
+        assert_eq!(
+            requests_of_service(Some(LEFT)),
+            "a-route-counted-side-by-side 4"
+        );
+        assert_eq!(
+            requests_of_service(Some(RIGHT)),
+            "a-route-counted-side-by-side 2"
+        );
     }
 
     /// A single unnamed service sends nothing rather than the `(root)` the
     /// log lines use: an absent header already says the same thing, and there
     /// is only one service in that case anyway.
     #[tokio::test]
-    #[serial(current_service)]
     async fn an_unnamed_service_sends_no_service_header() {
-        let _scope = crate::current_service::enter(None);
-        let request = prompt_call_request().await;
+        let request = crate::current_service::scope(None, prompt_call_request()).await;
         assert!(
             header_of(&request, "x-carrick-service").is_none(),
             "an unnamed service sends no name: {request}"
@@ -7431,10 +7669,10 @@ pub(crate) mod tests {
     /// nothing else — handing it to `.header()` would store a builder error
     /// and fail the send, stopping every prompt call of the scan over a name.
     #[tokio::test]
-    #[serial(current_service)]
     async fn a_service_name_that_is_not_a_legal_header_value_is_dropped() {
-        let _scope = crate::current_service::enter(Some("café\nservice"));
-        let request = prompt_call_request().await;
+        let request =
+            crate::current_service::scope(Some("café\nservice".to_string()), prompt_call_request())
+                .await;
         assert!(
             header_of(&request, "x-carrick-service").is_none(),
             "an illegal name is dropped, not sent: {request}"

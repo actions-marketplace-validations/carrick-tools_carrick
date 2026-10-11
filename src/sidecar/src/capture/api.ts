@@ -225,6 +225,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *  - `projected_value_only`: every read of a call's result takes a member out
  *    of it and none reads the value itself, so the site states a part of a
  *    payload rather than the payload a caller receives (carrick#1375).
+ *  - `serialised_body_unread`: a handler returns a status and a body string it
+ *    serialised itself, and at least one return builds that string in a way
+ *    the inferrer cannot trace to a typed value, so it publishes no part of
+ *    the contract (carrick#2200).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -238,6 +242,7 @@ export type TypeProvenanceReason =
   | 'no_success_payload'
   | 'no_request_body'
   | 'projected_value_only'
+  | 'serialised_body_unread'
   | 'not_recorded';
 
 /**
@@ -574,6 +579,24 @@ export interface CheckResult {
   verdicts: CheckVerdict[];
   degraded_services: DegradedService[];
   errors: string[];
+  /** How the compiler ended, present only when it ended abnormally (a
+   * signal, or a non-zero exit with no parseable diagnostics): every pair is then
+   * unverifiable, and this says whether it died of memory (carrick#2209). */
+  compiler_end?: CompilerEnd;
+}
+
+/** How the check's compiler process ended. */
+export interface CompilerEnd {
+  /** Its exit code, or null when a signal ended it. */
+  exit_code: number | null;
+  /** The signal that ended it (`SIGABRT` when V8 aborts on a full heap,
+   * `SIGKILL` from the OS), or null. */
+  signal: string | null;
+  /** Whether its stderr carried V8's heap-exhaustion line. */
+  heap_limit: boolean;
+  /** The heap cap it was started with, in MB, or null when it ran at V8's
+   * default. */
+  heap_cap_mb: number | null;
 }
 
 export interface CheckOptions {

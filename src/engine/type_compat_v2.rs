@@ -29,9 +29,9 @@ use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
-    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, OperationProgress,
-    ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome, RetypeVerdict,
-    SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
+    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, MemoryDeath,
+    OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome,
+    RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -447,11 +447,15 @@ fn path_names_a_member(path: &str) -> bool {
 /// (carrick#1166), or a request config that sets no body member
 /// (carrick-cloud#1366). `projected_value_only`: every read of the call's result
 /// takes a member out of it, so the site states a part of a payload and not a
-/// payload (carrick#1375).
+/// payload (carrick#1375). `serialised_body_unread`: a handler returns a status
+/// and a body string it serialised itself, and a return builds that string in a
+/// way the inferrer cannot read, so the envelope is never the contract
+/// (carrick#2200).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
+    "serialised_body_unread",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -764,10 +768,16 @@ pub(crate) enum CaptureFailure {
     TimedOut,
     /// The sidecar process ended before it answered, in the process the
     /// capture was first asked of and again in the fresh one it was retried
-    /// in; or no process could be started to ask. The text says which, and
-    /// for two deaths how each process ended and at which stage of the
-    /// capture (`two_deaths`).
-    SidecarDied(String),
+    /// in (or once, when the run stops on a memory death and the retry is
+    /// skipped); or no process could be started to ask. `detail` says which,
+    /// and for each death how the process ended and at which stage of the
+    /// capture (`two_deaths`, `one_memory_death`). `deaths` holds each death
+    /// in order, empty when no process could be started, so a caller can
+    /// tell a memory death without reading the text (carrick#2209).
+    SidecarDied {
+        detail: String,
+        deaths: Vec<CaptureDeath>,
+    },
     /// The sidecar answered, and the answer was not a stub: the capture's own
     /// error, or a stub package this side could not read.
     Failed(String),
@@ -781,7 +791,7 @@ impl std::fmt::Display for CaptureFailure {
                 "the type sidecar gave no answer and reported no progress inside the \
                  operation deadline"
             ),
-            CaptureFailure::SidecarDied(detail) | CaptureFailure::Failed(detail) => {
+            CaptureFailure::SidecarDied { detail, .. } | CaptureFailure::Failed(detail) => {
                 write!(f, "{detail}")
             }
         }
@@ -877,8 +887,15 @@ fn capture_once(
     anchors: &[CaptureAnchor],
     tsconfig_path: Option<&str>,
 ) -> Result<(PathBuf, CaptureStubArtifact, Vec<CaptureAliasRecord>), CaptureFailure> {
-    let result = capture_in_a_fresh_process(sidecar, repo_root, service_id, anchors, tsconfig_path)
-        .inspect_err(|failure| warn!("v2 capture failed for {}: {}", service_id, failure))?;
+    let result = capture_in_a_fresh_process(
+        sidecar,
+        repo_root,
+        service_id,
+        anchors,
+        tsconfig_path,
+        crate::scan_health::fail_on_type_memory_from_env(),
+    )
+    .inspect_err(|failure| warn!("v2 capture failed for {}: {}", service_id, failure))?;
 
     debug!(
         "v2 capture for {}: {} alias(es), usable_rate {:.3}, {} emitted file(s), bare_checkout={}",
@@ -937,14 +954,25 @@ fn capture_once(
 /// says how it ended. Both go into the failure (`two_deaths`): the index then
 /// says whether the heap ran out and on what, where it used to say only that
 /// the process was gone.
+///
+/// **No same-size retry when the run stops on a memory death.** With
+/// `fail_on_memory` (`CARRICK_FAIL_ON_TYPE_MEMORY`, the cloud runner), a first
+/// death that is a memory death (`retries_after`) is returned at once: the run
+/// is about to stop and be asked again on a larger machine, and a second
+/// process of the same size would die the same way after the same minutes
+/// (carrick#2209). Unset, the retry is exactly as above.
 fn capture_in_a_fresh_process(
     sidecar: &TypeSidecar,
     repo_root: &Path,
     service_id: &str,
     anchors: &[CaptureAnchor],
     tsconfig_path: Option<&str>,
+    fail_on_memory: bool,
 ) -> Result<CaptureV2Result, CaptureFailure> {
-    let not_started = |e: SidecarError| CaptureFailure::SidecarDied(e.to_string());
+    let not_started = |e: SidecarError| CaptureFailure::SidecarDied {
+        detail: e.to_string(),
+        deaths: Vec::new(),
+    };
     let mut died_before: Option<CaptureDeath> = None;
     loop {
         sidecar
@@ -983,11 +1011,32 @@ fn capture_in_a_fresh_process(
         }
         // Read before anything else is asked of the sidecar: the next wait
         // starts the progress empty, and the restart replaces the process.
+        let died = sidecar.how_the_process_died();
         let death = CaptureDeath {
             error: error.to_string(),
             progress: sidecar.last_progress(),
-            end: sidecar.how_the_process_ended(),
+            end: died.end,
+            heap_line: died.heap_line,
+            oom_kills_rose: died.oom_kills_rose,
         };
+        if died_before.is_none() && !retries_after(&death, fail_on_memory) {
+            warn!(
+                "The type sidecar died of memory during the capture for {} ({}): it {} {}; \
+                 not retried at the same size, as this run stops on a memory death",
+                service_id,
+                error,
+                death.ended(false),
+                death.stage()
+            );
+            // The rest of the run still asks the sidecar (the check phase,
+            // the failure path), so a live one is left in place.
+            let _ = sidecar.restart("the sidecar died of memory during a capture");
+            let detail = one_memory_death(&death, crate::services::type_sidecar::heap_cap_mb());
+            return Err(CaptureFailure::SidecarDied {
+                detail,
+                deaths: vec![death],
+            });
+        }
         let Some(first) = died_before.replace(death.clone()) else {
             warn!(
                 "The type sidecar died during the capture for {} ({}): it {} {}; retrying \
@@ -1003,26 +1052,78 @@ fn capture_in_a_fresh_process(
         // deaths; a failure to start is left in the sidecar's state for
         // whoever asks next.
         let _ = sidecar.restart("the sidecar died during a capture and during its retry");
-        return Err(CaptureFailure::SidecarDied(two_deaths(
-            &first,
-            &death,
-            crate::services::type_sidecar::heap_cap_mb(),
-        )));
+        let detail = two_deaths(&first, &death, crate::services::type_sidecar::heap_cap_mb());
+        return Err(CaptureFailure::SidecarDied {
+            detail,
+            deaths: vec![first, death],
+        });
+    }
+}
+
+/// Whether a capture whose process died once is asked again of a fresh
+/// process of the same size: always, unless the run stops on a memory death
+/// (`fail_on_memory`) and this death is one.
+fn retries_after(death: &CaptureDeath, fail_on_memory: bool) -> bool {
+    !(fail_on_memory && death.is_memory_death())
+}
+
+/// The failure of a capture whose process died of memory once and was not
+/// asked again, because the run stops on a memory death (carrick#2209): how
+/// the process ended and at which stage, then what did not fit the heap.
+fn one_memory_death(death: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
+    let (heap, under) = match heap_cap_mb {
+        Some(mb) => (
+            format!("the {mb} MB heap it was given"),
+            format!("under a heap cap of {mb} MB"),
+        ),
+        None => (
+            "V8's default heap".to_string(),
+            "under V8's default heap cap".to_string(),
+        ),
+    };
+    let lead = format!(
+        "the type sidecar process ended during the capture ({}) and was not retried at the \
+         same size, as this run stops on a memory death; it {} {}",
+        death.error,
+        death.ended(false),
+        death.stage()
+    );
+    // Only an abort is V8's heap running out; a kill is the machine's memory.
+    match death
+        .held()
+        .filter(|_| death.end.is_some_and(|end| end.is_abort()))
+    {
+        Some(held) => format!("{lead}: {held} did not fit {heap}"),
+        None => format!("{lead}, {under}"),
     }
 }
 
 /// What is known about a capture process that ended before it answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CaptureDeath {
+pub(crate) struct CaptureDeath {
     /// The client's own error for it.
     error: String,
     /// The last stage the capture reported, when it reported any.
     progress: Option<OperationProgress>,
     /// How the process ended, when the OS said.
     end: Option<ProcessEnd>,
+    /// Its stderr carried V8's heap-exhaustion line.
+    heap_line: bool,
+    /// The cgroup's OOM-kill counter rose while it ran.
+    oom_kills_rose: bool,
 }
 
 impl CaptureDeath {
+    /// Whether the process died of memory: it aborted with V8's
+    /// heap-exhaustion line on stderr, or it was killed and the cgroup
+    /// counted an OOM kill ([`MemoryDeath::classify`], carrick#2208).
+    ///
+    /// The one rule the capture retry reads, and the one the run's record
+    /// of the death was made by, so the two agree.
+    pub(crate) fn is_memory_death(&self) -> bool {
+        MemoryDeath::classify(self.end, self.heap_line, self.oom_kills_rose).is_some()
+    }
+
     /// How the process ended, as the verb of a sentence about one process or
     /// about `both`; plain "ended" when the OS did not say.
     fn ended(&self, both: bool) -> String {
@@ -2024,6 +2125,9 @@ pub(crate) fn run_check(
         let stubs = materialize_stubs(all_repo_data, &workspace_parent);
         let specs: Vec<CheckPairSpec> = probing.iter().map(|p| p.spec.clone()).collect();
 
+        // Read around the check: its compiler is a child of the sidecar, in
+        // this process's cgroup (carrick#2208).
+        let oom_kills_before = crate::services::type_sidecar::cgroup_oom_kills();
         let check_result = if stubs.is_empty() {
             Err(crate::services::type_sidecar::SidecarError::CheckFailed(
                 "no capture stubs available".to_string(),
@@ -2031,6 +2135,10 @@ pub(crate) fn run_check(
         } else {
             sidecar.check_v2(&stubs, &specs)
         };
+        let oom_kills_rose = crate::services::type_sidecar::oom_kills_rose(
+            oom_kills_before,
+            crate::services::type_sidecar::cgroup_oom_kills(),
+        );
 
         match check_result {
             Ok(result) => {
@@ -2039,6 +2147,17 @@ pub(crate) fn run_check(
                         "v2 check failed; each pair keeps the verdict the sidecar returned: {}",
                         result.errors.join("; ")
                     );
+                }
+                // The check's compiler died of memory: recorded for the run,
+                // as a sidecar process's death is (carrick#2208).
+                if let Some(end) = result.compiler_end.as_ref()
+                    && let Some(kind) = end.memory_death(oom_kills_rose)
+                {
+                    warn!(
+                        "the check's type checker died of memory ({:?}, heap-limit line on stderr)",
+                        end.signal
+                    );
+                    crate::scan_health::record_type_memory_death(kind, end.heap_cap_mb);
                 }
                 let by_key: BTreeMap<&str, &crate::services::type_sidecar::CheckVerdict> = result
                     .verdicts
@@ -4887,6 +5006,44 @@ mod tests {
         );
     }
 
+    /// carrick#2200: a handler that returns a status and a body string it
+    /// serialised, where a return builds that string in a way the inferrer
+    /// cannot read, is answered `unknown` with `serialised_body_unread`. That
+    /// is a decision: the capture's raw locator re-run would publish the
+    /// envelope, `{ statusCode: number; body: string }`, as the contract.
+    #[test]
+    fn derive_anchors_keeps_an_unread_serialised_body_decision() {
+        let unread = || crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "serialised_body_unread".to_string(),
+            detail: None,
+        };
+        let mut decided = inferred("Endpoint_archive_Response", "unknown", None, None);
+        decided.infer_kind = InferKind::FunctionReturn;
+        decided.any_provenance = vec![unread()];
+        assert!(
+            inference_decided_no_contract(&decided),
+            "an unread serialised body is a decided abstain"
+        );
+
+        let mut request = response_body_infer("Endpoint_archive_Response");
+        request.infer_kind = InferKind::FunctionReturn;
+
+        let anchors = derive_capture_anchors(&[], &[request], &[], &[decided], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_archive_Response");
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("an unread serialised body must stay a literal unknown, got {other:?}"),
+        }
+    }
+
     /// carrick#1841: a consumer call whose result carries a library's own
     /// response object is answered `unknown` with `machinery_envelope` at the
     /// root. That is a decision: the capture's raw locator re-run would resolve
@@ -5513,6 +5670,10 @@ mod tests {
                 message: message.to_string(),
             }),
             end,
+            // An abort below is V8's heap running out unless a test says
+            // otherwise: its line was on stderr.
+            heap_line: true,
+            oom_kills_rose: false,
         }
     }
 
@@ -5668,21 +5829,175 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             None => "under V8's default heap cap".to_string(),
         };
         // Unix says which signal; elsewhere the end is an exit code.
-        #[cfg(unix)]
-        assert_eq!(
-            failure,
-            CaptureFailure::SidecarDied(format!(
-                "{TWICE}; both were killed (SIGKILL) while emitting declarations, after every \
-                 anchor was resolved, {under}"
-            ))
-        );
-        let CaptureFailure::SidecarDied(detail) = failure else {
+        let CaptureFailure::SidecarDied { detail, deaths } = failure else {
             panic!("expected the two deaths, got {failure:?}");
         };
+        #[cfg(unix)]
+        assert_eq!(
+            detail,
+            format!(
+                "{TWICE}; both were killed (SIGKILL) while emitting declarations, after every \
+                 anchor was resolved, {under}"
+            )
+        );
+        assert_eq!(deaths.len(), 2, "both deaths ride the failure");
         assert!(
             detail.contains("while emitting declarations") && detail.ends_with(&under),
             "{detail}"
         );
+        assert!(
+            sidecar.is_ready(),
+            "a live sidecar is left for the rest of the scan"
+        );
+    }
+
+    /// The capture retry's one rule (carrick#2209): a first death is asked
+    /// again of a same-size process unless the run stops on a memory death
+    /// and this death is one. Unset, every death is retried, as before.
+    #[test]
+    fn a_memory_death_is_retried_unless_the_run_stops_on_one() {
+        let program = Some(("program", "building the program"));
+        let killed = Some(ProcessEnd::Signal(9));
+        // (end, heap line on stderr, OOM kills rose, fail_on_memory, retried)
+        let cases = [
+            (ABORTED, true, false, false, true),
+            (ABORTED, true, false, true, false),
+            // An abort without V8's line is not a memory death (carrick#2208).
+            (ABORTED, false, false, true, true),
+            (killed, false, false, true, true),
+            // A kill the cgroup counted as an OOM kill is one.
+            (killed, false, true, true, false),
+            (killed, false, true, false, true),
+            (Some(ProcessEnd::Code(1)), true, true, true, true),
+            (None, true, true, true, true),
+            (killed, false, false, false, true),
+        ];
+        for (end, heap_line, oom_kills_rose, fail_on_memory, retried) in cases {
+            let death = CaptureDeath {
+                heap_line,
+                oom_kills_rose,
+                ..death(program, end)
+            };
+            assert_eq!(
+                retries_after(&death, fail_on_memory),
+                retried,
+                "end {end:?}, heap line {heap_line}, OOM kills rose {oom_kills_rose}, \
+                 fail_on_memory {fail_on_memory}"
+            );
+        }
+    }
+
+    /// A memory death returned without its retry says so, with the stage,
+    /// what did not fit and the cap.
+    #[test]
+    fn one_memory_death_names_the_stage_and_what_did_not_fit() {
+        let building = death(Some(("program", "building the program")), ABORTED);
+        assert_eq!(
+            one_memory_death(&building, Some(8192)),
+            "the type sidecar process ended during the capture (Sidecar process died \
+             unexpectedly) and was not retried at the same size, as this run stops on a \
+             memory death; it was aborted (SIGABRT), as Node aborts when its heap is full, \
+             while building the service's program, before any anchor was resolved: the \
+             service's program did not fit the 8192 MB heap it was given"
+        );
+        let killed = death(
+            Some(("program", "building the program")),
+            Some(ProcessEnd::Signal(9)),
+        );
+        assert!(
+            one_memory_death(&killed, Some(8192))
+                .ends_with("before any anchor was resolved, under a heap cap of 8192 MB"),
+            "a kill is not V8's heap: {}",
+            one_memory_death(&killed, Some(8192))
+        );
+        let silent = death(None, ABORTED);
+        assert!(
+            one_memory_death(&silent, None)
+                .ends_with("before reporting any progress, under V8's default heap cap"),
+            "{}",
+            one_memory_death(&silent, None)
+        );
+    }
+
+    /// End to end through a stand-in sidecar that aborts on every capture, as
+    /// Node does when its heap is full: with the run stopping on a memory
+    /// death the capture is asked once and fails with that one death; without
+    /// it, it is asked twice, as before (carrick#2209). A live sidecar is left
+    /// either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_capture_that_dies_of_memory_is_asked_once_when_the_run_stops_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        let attempts = root.join("attempts");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  fs.appendFileSync({attempts:?}, 'capture\n');
+  write({{ request_id, status: 'progress', phase: 'program', message: 'building the program the anchors are read in' }});
+  fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
+  process.kill(process.pid, 'SIGABRT');
+}});
+"#
+            ),
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let anchors = [CaptureAnchor::Literal {
+            alias: "Only".to_string(),
+            type_text: "string".to_string(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            source_file: None,
+            printed_names: Vec::new(),
+            raw_text_read: false,
+        }];
+        let asked = || {
+            std::fs::read_to_string(&attempts)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+
+        let failure = capture_in_a_fresh_process(&sidecar, &root, "fixture", &anchors, None, true)
+            .expect_err("a capture whose process dies produces no stub");
+        let CaptureFailure::SidecarDied { detail, deaths } = failure else {
+            panic!("expected a death, got {failure:?}");
+        };
+        assert_eq!(asked(), 1, "no same-size retry after a memory death");
+        assert_eq!(deaths.len(), 1);
+        assert!(deaths[0].is_memory_death(), "{deaths:?}");
+        assert!(
+            detail.contains("was not retried at the same size")
+                && detail.contains("the service's program did not fit"),
+            "{detail}"
+        );
+        assert!(
+            sidecar.is_ready(),
+            "a live sidecar is left for the rest of the scan"
+        );
+
+        std::fs::remove_file(&attempts).unwrap();
+        let failure = capture_in_a_fresh_process(&sidecar, &root, "fixture", &anchors, None, false)
+            .expect_err("a capture whose process dies twice produces no stub");
+        let CaptureFailure::SidecarDied { detail, deaths } = failure else {
+            panic!("expected the two deaths, got {failure:?}");
+        };
+        assert_eq!(asked(), 2, "unset, the capture is retried once, as before");
+        assert_eq!(deaths.len(), 2);
+        assert!(detail.starts_with(TWICE), "{detail}");
         assert!(
             sidecar.is_ready(),
             "a live sidecar is left for the rest of the scan"

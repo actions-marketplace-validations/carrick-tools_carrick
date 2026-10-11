@@ -1,0 +1,1369 @@
+//! Which services a `--changed-only` scan analyses, and which it carries
+//! (carrick#2227). Contract: `docs/reference/runner.md`.
+//!
+//! A carried service is not analysed: its stored generation stands in for it
+//! in the run, exactly as a held-back service's does. A service is carried
+//! only when nothing it reads has changed since the commit its own stored
+//! blob names. What it reads (its [`ServiceInputs`]) is computed on the tree
+//! being scanned: its roots, the transitive closure of its imports as the
+//! scanner's own resolver reads them, the workspace packages that closure
+//! enters, its tsconfig's `extends` chain and the directories that config
+//! includes, its manifest and its declared GraphQL schemas. A service's inputs
+//! at its stored commit can differ from these only when one of its own files
+//! changed, which already counts as a change.
+//!
+//! When carrick.json names no `tsconfig` for a service, its tsconfig is the
+//! nearest `tsconfig.json` at or above its directory.
+//!
+//! [`decide`] is the rule, over a stored blob, this run's config, the paths
+//! changed since that blob's commit and the service's inputs. [`plan`] runs it
+//! for every service of a scan and logs each answer.
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use tracing::info;
+
+use crate::cloud_storage::CloudRepoData;
+use crate::config::Config;
+use crate::git_state::ChangedPath;
+
+/// What `--changed-only` together with `--no-cache` is told: a usage error.
+pub const NO_CACHE_CONFLICT: &str =
+    "--changed-only cannot be combined with --no-cache, which re-analyses every service.";
+
+/// The `close-scan` reason of a `--changed-only` run that writes nothing.
+pub const NO_CHANGE_REASON: &str = "no_change";
+
+fn requested_slot() -> &'static OnceLock<bool> {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    &REQUESTED
+}
+
+/// Record `--changed-only` for the run. A second call is ignored.
+pub fn request() {
+    let _ = requested_slot().set(true);
+}
+
+/// Whether this run was told `--changed-only`.
+pub fn requested() -> bool {
+    requested_slot().get().copied().unwrap_or(false)
+}
+
+/// Why a service is analysed rather than carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    NoStored,
+    OtherScanner,
+    StoredDirty,
+    StoredIncomplete,
+    ConfigChanged,
+    CommitMissing,
+    UnresolvedImport,
+    ExtendsUnfollowed,
+    RepoInputChanged,
+    InputsChanged,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::NoStored => "no_stored",
+            Reason::OtherScanner => "other_scanner",
+            Reason::StoredDirty => "stored_dirty",
+            Reason::StoredIncomplete => "stored_incomplete",
+            Reason::ConfigChanged => "config_changed",
+            Reason::CommitMissing => "commit_missing",
+            Reason::UnresolvedImport => "unresolved_import",
+            Reason::ExtendsUnfollowed => "extends_unfollowed",
+            Reason::RepoInputChanged => "repo_input_changed",
+            Reason::InputsChanged => "inputs_changed",
+        }
+    }
+}
+
+/// What a `--changed-only` scan does with one service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// Its stored generation, written at `commit`, stands in for it.
+    Carried { commit: String },
+    /// It is analysed as a full scan would, for `reason`.
+    Analysed { reason: Reason, detail: String },
+}
+
+impl Scope {
+    pub fn is_carried(&self) -> bool {
+        matches!(self, Scope::Carried { .. })
+    }
+
+    fn analysed(reason: Reason, detail: impl Into<String>) -> Self {
+        Scope::Analysed {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The scanner release and cache format this run writes.
+#[derive(Debug, Clone, Copy)]
+pub struct ThisRun<'a> {
+    pub scanner_version: &'a str,
+    pub cache_version: u32,
+}
+
+/// One root a service's walk reads: a directory relative to the repository's
+/// top level (`""` for all of it), minus the directories of services nested
+/// inside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Root {
+    pub dir: String,
+    pub left_out: Vec<String>,
+}
+
+/// What one service reads, every path relative to the repository's top level
+/// with `/` separators, so it compares with what `git diff` lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceInputs {
+    pub roots: Vec<Root>,
+    /// Files outside the roots that the service reads: its import closure,
+    /// its config chain, its manifest, its declared schemas.
+    pub files: BTreeSet<String>,
+    /// Directories read whole: a workspace package the closure enters, a
+    /// directory its tsconfig includes.
+    pub dirs: BTreeSet<String>,
+    /// Directories where a path appearing or disappearing can change what an
+    /// unchanged import resolves to: each holds a closure file, or is where a
+    /// relative specifier was looked up.
+    pub lookup_dirs: BTreeSet<String>,
+    /// The first import nothing accounts for, as `<file> imports <specifier>`.
+    pub unresolved: Option<String>,
+    /// `extends` values a config it reads could not follow.
+    pub unfollowed_extends: Vec<String>,
+}
+
+impl ServiceInputs {
+    /// The first path in `changed` this service reads.
+    pub fn first_change<'a>(&self, changed: &'a [ChangedPath]) -> Option<&'a ChangedPath> {
+        changed.iter().find(|change| self.reads(change))
+    }
+
+    /// Whether `change` touches an input of this service that is not under
+    /// one of its roots.
+    fn reads_outside_roots(&self, change: &ChangedPath) -> bool {
+        let in_root = self.roots.iter().any(|root| {
+            under(&change.path, &root.dir)
+                && !root.left_out.iter().any(|dir| under(&change.path, dir))
+        });
+        !in_root && self.reads(change)
+    }
+
+    fn reads(&self, change: &ChangedPath) -> bool {
+        let path = change.path.as_str();
+        let in_root = self.roots.iter().any(|root| {
+            under(path, &root.dir) && !root.left_out.iter().any(|dir| under(path, dir))
+        });
+        in_root
+            || self.files.contains(path)
+            || self.dirs.iter().any(|dir| under(path, dir))
+            || (change.adds_or_deletes() && self.lookup_dirs.contains(parent_of(path)))
+    }
+}
+
+/// Whether `path` is `dir` or under it. `""` is the whole repository.
+fn under(path: &str, dir: &str) -> bool {
+    dir.is_empty()
+        || path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// The file names that are an input of every service wherever they sit: the
+/// lockfiles, every manifest (internal package names are read across the
+/// whole repository), the workspace files, what the walk ignores, and the
+/// scan's own config.
+///
+/// The package-manager and git config files are named too, because they
+/// decide what the scan reads: `.npmrc`, `.yarnrc`, `.yarnrc.yml` and
+/// `bunfig.toml` shape the installs and so `node_modules`, `.gitmodules`
+/// decides which directories are separate checkouts, and `.gitattributes` is
+/// applied by git when it writes the checkout.
+///
+/// With [`REPO_INPUT_EXTENSIONS`], [`CONFIG_EXTENSIONS`],
+/// [`crate::file_finder::SOURCE_EXTENSIONS`] and a service's
+/// [`ServiceInputs`] (its tsconfig chain, its declared GraphQL schemas), this
+/// is the one definition of the files a scan reads (carrick#2227). It is
+/// published as `carrickInputs` in `npm/carrick/package.json` (carrick#2234,
+/// held equal by `npm_manifest_inputs_equal_the_constants`) so a filter that
+/// decides whether a push needs a scan reads it from there rather than
+/// restating it.
+pub const REPO_INPUT_NAMES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+    "package.json",
+    "pnpm-workspace.yaml",
+    "deno.json",
+    "deno.jsonc",
+    ".gitignore",
+    "carrick.json",
+    // Read by the npm and pnpm installs and the library store
+    // (`library_store.rs`, `scripts/install-scanned-deps.sh`).
+    ".npmrc",
+    // Read by the classic Yarn install.
+    ".yarnrc",
+    // Read by the Yarn installs (`library_store.rs`, `untrusted_yarn.rs`).
+    ".yarnrc.yml",
+    // Read by the bun install.
+    "bunfig.toml",
+    // `file_finder::declared_submodules` decides `is_separate_checkout`.
+    ".gitmodules",
+    // Git applies it (eol, filters) when it writes the checkout.
+    ".gitattributes",
+];
+
+/// The extensions whose files are an input of every service: the GraphQL
+/// schema catalogue covers the whole repository.
+pub const REPO_INPUT_EXTENSIONS: &[&str] = &["graphql", "gql", "graphqls"];
+
+/// The extensions of files a service reads by name: its tsconfig chain, a
+/// Deno import map, a JSON module it imports. These are per service
+/// (`service_inputs`), so the published rule reads every one. It is not a
+/// repo input: [`is_repo_input`] does not read it, and a JSON change
+/// re-analyses only the services whose inputs hold that file.
+pub const CONFIG_EXTENSIONS: &[&str] = &["json", "jsonc"];
+
+/// The version of the published input rule (`carrickInputs.rule`).
+///
+/// Rule 1, over repository-relative `/` paths: the basename is the text
+/// after the last `/`, compared lowercased on both sides. A path is read when
+/// its basename equals an entry of `repo_input_names` or `derive_names`, when
+/// its extension equals an entry of `source_extensions`,
+/// `repo_input_extensions` or `config_extensions`, or when its basename has no
+/// extension. The extension is the text after the basename's last `.` when
+/// that `.` is neither its first nor its last character. A push needs a scan
+/// when any path it adds, modifies, removes or renames from is read.
+///
+/// Bump it when the rule changes, not when a list does.
+pub const INPUT_RULE: u32 = 1;
+
+/// Whether a change to `path` re-analyses every service
+/// ([`REPO_INPUT_NAMES`], [`REPO_INPUT_EXTENSIONS`]).
+pub fn is_repo_input(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    REPO_INPUT_NAMES.contains(&name)
+        || name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| REPO_INPUT_EXTENSIONS.contains(&extension))
+}
+
+/// Whether `service` is carried or analysed.
+///
+/// `stored` is its stored generation, `config_json` this run's carrick.json
+/// entry for it serialized as a blob stores it, `changed` the paths changed
+/// since the stored commit (`Err` when git could not compare), and `inputs`
+/// computes what it reads, asked only when nothing cheaper decides.
+pub fn decide(
+    stored: Option<&CloudRepoData>,
+    this_run: ThisRun<'_>,
+    config_json: Option<&str>,
+    changed: Result<&[ChangedPath], &str>,
+    inputs: impl FnOnce() -> ServiceInputs,
+) -> Scope {
+    let Some(stored) = stored else {
+        return Scope::analysed(Reason::NoStored, "no stored index for this service");
+    };
+    if stored.scanner_version.as_deref() != Some(this_run.scanner_version)
+        || stored.cache_version != Some(this_run.cache_version)
+    {
+        return Scope::analysed(
+            Reason::OtherScanner,
+            format!(
+                "stored by Carrick {} with cache {}, this run is Carrick {} with cache {}",
+                stored
+                    .scanner_version
+                    .as_deref()
+                    .unwrap_or("of unknown version"),
+                stored
+                    .cache_version
+                    .map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+                this_run.scanner_version,
+                this_run.cache_version
+            ),
+        );
+    }
+    if stored.dirty == Some(true) {
+        return Scope::analysed(
+            Reason::StoredDirty,
+            "the stored index was read from uncommitted changes",
+        );
+    }
+    if let Some(owed) = owed_work(stored) {
+        return Scope::analysed(Reason::StoredIncomplete, owed);
+    }
+    if stored.config_json.as_deref() != config_json {
+        return Scope::analysed(
+            Reason::ConfigChanged,
+            "its carrick.json entry differs from the stored one",
+        );
+    }
+    let changed = match changed {
+        Ok(changed) => changed,
+        Err(reason) => {
+            return Scope::analysed(
+                Reason::CommitMissing,
+                format!(
+                    "git could not compare {}: {}",
+                    short(&stored.commit_hash),
+                    reason.trim()
+                ),
+            );
+        }
+    };
+    let inputs = inputs();
+    if let Some(unresolved) = inputs.unresolved {
+        return Scope::analysed(Reason::UnresolvedImport, unresolved);
+    }
+    if !inputs.unfollowed_extends.is_empty() {
+        return Scope::analysed(
+            Reason::ExtendsUnfollowed,
+            format!(
+                "tsconfig extends {} could not be followed",
+                inputs.unfollowed_extends.join(", ")
+            ),
+        );
+    }
+    if let Some(change) = changed.iter().find(|change| is_repo_input(&change.path)) {
+        return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
+    }
+    if let Some(change) = inputs.first_change(changed) {
+        return Scope::analysed(Reason::InputsChanged, change.path.clone());
+    }
+    Scope::Carried {
+        commit: stored.commit_hash.clone(),
+    }
+}
+
+/// What a stored blob says it still owed when it was written: degraded types,
+/// files the model never answered, candidates no model was asked about.
+fn owed_work(stored: &CloudRepoData) -> Option<String> {
+    if let Some(degraded) = &stored.types_degraded {
+        return Some(format!(
+            "the stored index lost its types ({})",
+            degraded.stage
+        ));
+    }
+    let boundary = stored.boundary.as_ref()?;
+    if boundary.files_lost.total > 0 {
+        return Some(format!(
+            "the stored index owes {} file(s) model analysis",
+            boundary.files_lost.total
+        ));
+    }
+    match boundary.candidates_awaiting_model {
+        Some(waiting) if waiting > 0 => Some(format!(
+            "the stored index has {waiting} candidate(s) no model was asked about"
+        )),
+        _ => None,
+    }
+}
+
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+/// Each service's scope, index for index with `services`, logged one line
+/// per service with a summary and the closure walk's wall time.
+pub fn plan<'a>(
+    repo_path: &str,
+    services: &[Config],
+    stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
+    this_run: ThisRun<'_>,
+) -> Vec<Scope> {
+    let top = crate::git_state::toplevel(repo_path).ok();
+    let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
+    let mut closure_took = std::time::Duration::ZERO;
+    let mut walked = 0usize;
+    let scopes: Vec<Scope> = services
+        .iter()
+        .map(|service| {
+            let stored = stored(service);
+            let config_json = serde_json::to_string(service).ok();
+            let changed = stored.map(|blob| {
+                changed_by_commit
+                    .entry(blob.commit_hash.clone())
+                    .or_insert_with(|| {
+                        crate::git_state::changed_paths(repo_path, &blob.commit_hash, None)
+                    })
+                    .clone()
+            });
+            let changed = match &changed {
+                Some(Ok(paths)) => Ok(paths.as_slice()),
+                Some(Err(reason)) => Err(reason.as_str()),
+                None => Ok(&[][..]),
+            };
+            let scope = decide(stored, this_run, config_json.as_deref(), changed, || {
+                let started = Instant::now();
+                walked += 1;
+                let inputs = match &top {
+                    Some(top) => service_inputs(repo_path, top, service),
+                    // No top level, no paths to compare: nothing vouches.
+                    None => ServiceInputs {
+                        unresolved: Some("git named no top level for this checkout".to_string()),
+                        ..ServiceInputs::default()
+                    },
+                };
+                closure_took += started.elapsed();
+                inputs
+            });
+            let label = service.service_name.as_deref().unwrap_or("(root)");
+            match &scope {
+                Scope::Carried { commit } => info!(
+                    "scope: {label} carried (inputs unchanged since {})",
+                    short(commit)
+                ),
+                Scope::Analysed { reason, detail } => {
+                    info!("scope: {label} analysed ({}: {detail})", reason.as_str())
+                }
+            }
+            scope
+        })
+        .collect();
+    let carried = scopes.iter().filter(|scope| scope.is_carried()).count();
+    info!(
+        "scope: {} analysed, {carried} carried, of {} service(s)",
+        scopes.len() - carried,
+        scopes.len()
+    );
+    info!(
+        "scope: the closure walk took {:.2}s over {walked} service(s)",
+        closure_took.as_secs_f64()
+    );
+    scopes
+}
+
+/// What `service` reads on the tree at `repo_path`, relative to the
+/// repository's top level `top`.
+pub fn service_inputs(repo_path: &str, top: &Path, service: &Config) -> ServiceInputs {
+    let root = Path::new(repo_path);
+    let top = top.canonicalize().unwrap_or_else(|_| top.to_path_buf());
+    let relative = |path: &Path| -> Option<String> { top_relative(&top, path) };
+    let mut roots: Vec<Root> = Vec::new();
+    let mut unresolved: Option<String> = None;
+
+    // Its roots, as the walk reads them.
+    let service_root = match &service.directory {
+        Some(dir) => root.join(dir),
+        None => root.to_path_buf(),
+    };
+    let own = crate::config::directory_segments(service.directory.as_deref());
+    let left_out: Vec<String> = service
+        .nested_directories
+        .iter()
+        .filter(|nested| {
+            let nested = crate::config::directory_segments(Some(nested));
+            nested.len() > own.len() && nested.starts_with(&own)
+        })
+        .filter_map(|nested| relative(&root.join(nested)))
+        .collect();
+    roots.extend(relative(&service_root).map(|dir| Root { dir, left_out }));
+    for include in &service.include {
+        roots.extend(relative(&root.join(include)).map(|dir| Root {
+            dir,
+            left_out: Vec::new(),
+        }));
+    }
+    let in_roots = |path: &str| {
+        roots
+            .iter()
+            .any(|root| under(path, &root.dir) && !root.left_out.iter().any(|dir| under(path, dir)))
+    };
+
+    // Its import closure: every walked file's imports, and the imports of
+    // every file they reach, resolved by the scanner's own resolver.
+    let walk =
+        crate::file_finder::walk_service(repo_path, service, &crate::packages::MANIFEST_SKIP_DIRS);
+    let service_tsconfig = service.alias_tsconfig();
+    let index = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
+        root,
+        service_tsconfig
+            .as_ref()
+            .map(|(directory, config)| (directory.as_path(), config.as_path())),
+    );
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut seen: BTreeSet<PathBuf> = walk.files.iter().map(|file| canonical(file)).collect();
+    let mut queue: Vec<PathBuf> = walk.files.clone();
+    let mut reader = crate::parser::ModuleReader::quiet();
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    let mut lookup_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    while let Some(importer) = queue.pop() {
+        for specifier in reader.loaded_specifiers(&importer) {
+            let relative_specifier = specifier.starts_with("./") || specifier.starts_with("../");
+            if relative_specifier && let Some(parent) = importer.parent() {
+                // Where the lookup happens: a file appearing beside the one
+                // it found can take its place.
+                let looked_up = crate::workspace_resolver::normalize(&parent.join(&specifier));
+                if let Some(dir) = looked_up.parent().and_then(relative) {
+                    lookup_dirs.insert(dir);
+                }
+            }
+            if let Some(package) = index.package_dir_of(&importer, &specifier)
+                && let Some(dir) = relative(&root.join(package))
+            {
+                // The resolver may pick another file than the compiler does
+                // (an `exports` map), so the whole package is the safe unit.
+                dirs.insert(dir);
+            }
+            let Some(target) = index.resolve_module_path(&importer, &specifier) else {
+                // A file the resolver does not read as source (a JSON file, a
+                // stylesheet) is still read.
+                let asset = importer
+                    .parent()
+                    .filter(|_| relative_specifier)
+                    .map(|parent| parent.join(specifier.split(['?', '#']).next().unwrap_or("")))
+                    .filter(|file| file.is_file());
+                if let Some(asset) = asset {
+                    files.extend(relative(&asset));
+                } else if unresolved.is_none()
+                    && index.names_an_unknown_module(&importer, &specifier)
+                    && !index.declares_types_for(&specifier)
+                {
+                    unresolved = Some(format!(
+                        "{} imports {specifier}",
+                        relative(&importer).unwrap_or_else(|| importer.display().to_string())
+                    ));
+                }
+                continue;
+            };
+            let Some(path) = relative(&target) else {
+                continue;
+            };
+            if let Some(dir) = Path::new(&path).parent() {
+                lookup_dirs.insert(dir.to_string_lossy().replace('\\', "/"));
+            }
+            if !in_roots(&path) {
+                files.insert(path);
+            }
+            if seen.insert(canonical(&target)) {
+                queue.push(target);
+            }
+        }
+    }
+    let mut unfollowed_extends = index.unfollowed_extends();
+
+    // Its config chain, and what that config includes beyond the roots.
+    if let Some(tsconfig) = service_tsconfig_path(root, &service_root, service) {
+        let (chain, unfollowed) =
+            crate::module_aliases::tsconfig_chain(root, &tsconfig, &index.internal_package_dirs());
+        for spec in unfollowed {
+            if !unfollowed_extends.contains(&spec) {
+                unfollowed_extends.push(spec);
+            }
+        }
+        for (key, is_files) in [("include", false), ("files", true)] {
+            // The nearest config that states the key is the one that counts.
+            let Some((config, entries)) = chain.iter().find_map(|(config, json)| {
+                json.get(key)
+                    .and_then(|value| value.as_array())
+                    .map(|entries| (config, entries))
+            }) else {
+                continue;
+            };
+            let base = root.join(config.parent().unwrap_or(Path::new("")));
+            for entry in entries.iter().filter_map(|entry| entry.as_str()) {
+                let target = base.join(static_prefix(entry));
+                let Some(path) = relative(&target) else {
+                    continue;
+                };
+                if is_files || target.is_file() {
+                    files.insert(path);
+                } else {
+                    dirs.insert(path);
+                }
+            }
+        }
+        for (config, _) in &chain {
+            files.extend(relative(&root.join(config)));
+        }
+    }
+    files.extend(walk.manifest.as_deref().and_then(relative));
+    files.extend(
+        crate::graphql::resolve_declared_schemas(root, &service.graphql_schemas)
+            .files
+            .iter()
+            .filter_map(|file| relative(file)),
+    );
+
+    ServiceInputs {
+        roots,
+        files,
+        dirs,
+        lookup_dirs,
+        unresolved,
+        unfollowed_extends,
+    }
+}
+
+/// The tsconfig that governs `service`: the one carrick.json names, else the
+/// nearest `tsconfig.json` at or above its directory. Repo-relative.
+fn service_tsconfig_path(root: &Path, service_root: &Path, service: &Config) -> Option<PathBuf> {
+    let found = match &service.tsconfig {
+        Some(named) => Some(service_root.join(named)).filter(|path| path.is_file()),
+        None => service_root
+            .ancestors()
+            .take_while(|dir| dir.starts_with(root))
+            .map(|dir| dir.join("tsconfig.json"))
+            .find(|path| path.is_file()),
+    }?;
+    found.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// The part of a tsconfig `include` entry before its first wildcard.
+fn static_prefix(entry: &str) -> PathBuf {
+    entry
+        .trim_start_matches("./")
+        .split('/')
+        .take_while(|segment| !segment.contains(['*', '?', '{', '[']))
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// `path` relative to the canonical top level `top`, with `/` separators.
+/// `None` for a path outside it. A path that is not on disk is placed by its
+/// nearest existing ancestor.
+fn top_relative(top: &Path, path: &Path) -> Option<String> {
+    let normalized = crate::workspace_resolver::normalize(path);
+    let (existing, rest): (PathBuf, PathBuf) = {
+        let mut existing = normalized.clone();
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            rest.push(existing.file_name()?.to_os_string());
+            existing = existing.parent()?.to_path_buf();
+        }
+        (existing, rest.into_iter().rev().collect())
+    };
+    let canonical = existing.canonicalize().ok()?.join(rest);
+    let relative = canonical.strip_prefix(top).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Whether a stored copy of a service differs from the pull request's base,
+/// judged by what that service reads (carrick#2228).
+///
+/// A pull-request run compares its findings with main's stored copy, and a
+/// copy stored at an older commit than the base is still main's when nothing
+/// its service reads changed in between. A service stored alone by a scoped
+/// push leaves the others at older commits, so a whole-tree comparison would
+/// call the copy stale on every pull request.
+///
+/// A copy whose services all sit at one commit was written by one scan of the
+/// whole repository, and is judged by the whole tree as it always was.
+pub struct CopyJudge<'a> {
+    repo_path: &'a str,
+    services: &'a [Config],
+    /// Main's copy sits at more than one commit.
+    scoped: bool,
+    top: Option<PathBuf>,
+    /// The pull request's own changes, base to the scanned tree.
+    pr_changes: std::cell::OnceCell<Result<Vec<ChangedPath>, String>>,
+}
+
+impl<'a> CopyJudge<'a> {
+    pub fn new(repo_path: &'a str, services: &'a [Config], main_self: &[CloudRepoData]) -> Self {
+        let commits: BTreeSet<&str> = main_self
+            .iter()
+            .map(|copy| copy.commit_hash.as_str())
+            .collect();
+        Self {
+            repo_path,
+            services,
+            scoped: commits.len() > 1,
+            top: crate::git_state::toplevel(repo_path).ok(),
+            pr_changes: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether `copy` differs from `base` in anything its service reads.
+    /// `None` when git cannot list the paths changed between them.
+    ///
+    /// Its inputs are computed on the scanned tree, which can differ from the
+    /// base's where the pull request itself edits a file outside the
+    /// service's roots that the service reads: then, and for a copy whose
+    /// service this tree does not configure or whose inputs cannot be read
+    /// whole, the whole trees are compared as before.
+    pub fn differs(&self, copy: &CloudRepoData, base: &str) -> Option<bool> {
+        if copy.commit_hash == base {
+            return Some(false);
+        }
+        let changed =
+            crate::git_state::changed_paths(self.repo_path, &copy.commit_hash, Some(base)).ok()?;
+        let whole_tree =
+            || crate::git_state::differs_under(self.repo_path, &copy.commit_hash, base).ok();
+        if !self.scoped {
+            return whole_tree();
+        }
+        let (Some(service), Some(top)) = (
+            self.services
+                .iter()
+                .find(|service| service.service_name == copy.service_name),
+            self.top.as_deref(),
+        ) else {
+            return whole_tree();
+        };
+        let inputs = service_inputs(self.repo_path, top, service);
+        if inputs.unresolved.is_some() || !inputs.unfollowed_extends.is_empty() {
+            return whole_tree();
+        }
+        let pr_changes = self
+            .pr_changes
+            .get_or_init(|| crate::git_state::changed_paths(self.repo_path, base, None));
+        let pr_edits_an_outside_input = match pr_changes {
+            Ok(pr_changes) => pr_changes
+                .iter()
+                .any(|change| inputs.reads_outside_roots(change)),
+            Err(_) => true,
+        };
+        if pr_edits_an_outside_input {
+            return whole_tree();
+        }
+        Some(
+            changed
+                .iter()
+                .any(|change| is_repo_input(&change.path) || inputs.reads(change)),
+        )
+    }
+}
+
+/// Whether a carried service's join fields differ from its stored blob's: its
+/// type verdicts, its SDK edges and what they left unresolved, and its
+/// boundary (carrick#2227). Read on the payload as the upload would send it,
+/// before it is stamped. An absent list and an empty one are the same answer,
+/// and order is not a difference.
+pub fn join_fields_changed(payload: &CloudRepoData, stored: &CloudRepoData) -> bool {
+    fn rows<T: serde::Serialize>(value: &Option<Vec<T>>) -> Vec<String> {
+        let mut rows: Vec<String> = value
+            .iter()
+            .flatten()
+            .map(|row| serde_json::to_string(row).unwrap_or_default())
+            .collect();
+        rows.sort();
+        rows
+    }
+    rows(&payload.compat_verdicts) != rows(&stored.compat_verdicts)
+        || rows(&payload.sdk_edges) != rows(&stored.sdk_edges)
+        || rows(&payload.sdk_unresolved) != rows(&stored.sdk_unresolved)
+        || payload.boundary != stored.boundary
+}
+
+/// A carried service's payload, when this run's join changed what its stored
+/// blob says: `payload` is the stored blob with this run's verdicts and SDK
+/// edges attached, `stored` the blob itself. `None` when nothing changed, so
+/// nothing is written.
+///
+/// Its boundary is the stored one with this run's SDK join folded in: the
+/// rest of it states the run that analysed the service, which this run did
+/// not repeat.
+pub fn refreshed_carried(
+    mut payload: CloudRepoData,
+    stored: &CloudRepoData,
+    sdk_unresolved: &[crate::cloud_storage::SdkUnresolved],
+    head: &str,
+    dirty: bool,
+) -> Option<CloudRepoData> {
+    payload.boundary = stored.boundary.clone().map(|mut boundary| {
+        boundary.fold_sdk_unresolved(sdk_unresolved);
+        boundary
+    });
+    if !join_fields_changed(&payload, stored) {
+        return None;
+    }
+    stamp_carried(&mut payload, head, dirty);
+    Some(payload)
+}
+
+/// Stamp a carried payload whose join fields changed as this run's: its
+/// inputs are unchanged since its stored commit, so its answers describe
+/// `head` too, and a new commit keeps the cloud's (commit, scanner) write
+/// dedupe from discarding it. It sent no file to the analyzer.
+pub fn stamp_carried(payload: &mut CloudRepoData, head: &str, dirty: bool) {
+    payload.commit_hash = head.to_string();
+    payload.dirty = dirty.then_some(true);
+    payload.last_updated = chrono::Utc::now();
+    payload.scanner_build = crate::cloud_storage::ScannerBuild::current();
+    if let Some(boundary) = payload.boundary.as_mut() {
+        boundary.commit_hash = head.to_string();
+        boundary.files_attempted = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THIS: ThisRun<'static> = ThisRun {
+        scanner_version: "1.0.0",
+        cache_version: 7,
+    };
+
+    fn stored(commit: &str) -> CloudRepoData {
+        let mut blob: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "mono",
+            "service_name": "api",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": "{\"serviceName\":\"api\"}",
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-10-01T00:00:00Z",
+            "commit_hash": commit,
+        }))
+        .unwrap();
+        blob.scanner_version = Some("1.0.0".to_string());
+        blob.cache_version = Some(7);
+        blob
+    }
+
+    fn changed(entries: &[(char, &str)]) -> Vec<ChangedPath> {
+        entries
+            .iter()
+            .map(|(status, path)| ChangedPath {
+                status: *status,
+                path: path.to_string(),
+            })
+            .collect()
+    }
+
+    fn api_inputs() -> ServiceInputs {
+        ServiceInputs {
+            roots: vec![Root {
+                dir: "apps/api".to_string(),
+                left_out: vec!["apps/api/nested".to_string()],
+            }],
+            files: ["packages/types/x.ts".to_string()].into(),
+            dirs: ["packages/shared".to_string()].into(),
+            lookup_dirs: ["libs/util".to_string()].into(),
+            ..ServiceInputs::default()
+        }
+    }
+
+    fn decide_with(
+        blob: Option<&CloudRepoData>,
+        changes: Result<&[ChangedPath], &str>,
+        inputs: ServiceInputs,
+    ) -> Scope {
+        decide(
+            blob,
+            THIS,
+            Some("{\"serviceName\":\"api\"}"),
+            changes,
+            || inputs,
+        )
+    }
+
+    fn reason(scope: &Scope) -> Option<Reason> {
+        match scope {
+            Scope::Analysed { reason, .. } => Some(*reason),
+            Scope::Carried { .. } => None,
+        }
+    }
+
+    #[test]
+    fn a_service_whose_inputs_did_not_change_is_carried() {
+        let blob = stored("abcdef1234");
+        let changes = changed(&[('M', "README.md"), ('M', "apps/web/src/a.ts")]);
+        assert_eq!(
+            decide_with(Some(&blob), Ok(&changes), api_inputs()),
+            Scope::Carried {
+                commit: "abcdef1234".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn each_input_kind_analyses_the_service() {
+        let blob = stored("abcdef1234");
+        for (change, expected) in [
+            (('M', "apps/api/src/server.ts"), Some(Reason::InputsChanged)),
+            (('M', "apps/api/nested/src/a.ts"), None),
+            (('M', "packages/types/x.ts"), Some(Reason::InputsChanged)),
+            (
+                ('M', "packages/shared/src/deep/y.ts"),
+                Some(Reason::InputsChanged),
+            ),
+            (('A', "libs/util/index.tsx"), Some(Reason::InputsChanged)),
+            (('M', "libs/util/other.ts"), None),
+            (('D', "libs/util/other.ts"), Some(Reason::InputsChanged)),
+            (('M', "apps/api2/x.ts"), None),
+            (('M', "yarn.lock"), Some(Reason::RepoInputChanged)),
+            (
+                ('M', "apps/web/package.json"),
+                Some(Reason::RepoInputChanged),
+            ),
+            (('M', "schema/a.graphqls"), Some(Reason::RepoInputChanged)),
+            (('M', "apps/web/.gitignore"), Some(Reason::RepoInputChanged)),
+            (('M', "carrick.json"), Some(Reason::RepoInputChanged)),
+            (('M', ".npmrc"), Some(Reason::RepoInputChanged)),
+            (
+                ('M', "apps/web/.yarnrc.yml"),
+                Some(Reason::RepoInputChanged),
+            ),
+            (('M', ".yarnrc"), Some(Reason::RepoInputChanged)),
+            (('M', "bunfig.toml"), Some(Reason::RepoInputChanged)),
+            (('M', ".gitmodules"), Some(Reason::RepoInputChanged)),
+            (('M', ".gitattributes"), Some(Reason::RepoInputChanged)),
+            // CONFIG_EXTENSIONS is not a repo input.
+            (('M', "packages/x/tsconfig.base.json"), None),
+        ] {
+            let changes = changed(&[change]);
+            assert_eq!(
+                reason(&decide_with(Some(&blob), Ok(&changes), api_inputs())),
+                expected,
+                "{change:?}"
+            );
+        }
+    }
+
+    /// The npm manifest publishes the input rule so carrick-cloud's push
+    /// filter reads it rather than restating it (carrick#2234). It must equal
+    /// the constants. On failure the message prints the whole expected field.
+    #[test]
+    fn npm_manifest_inputs_equal_the_constants() {
+        let expected = serde_json::json!({
+            "rule": INPUT_RULE,
+            "source_extensions": crate::file_finder::SOURCE_EXTENSIONS,
+            "repo_input_names": REPO_INPUT_NAMES,
+            "repo_input_extensions": REPO_INPUT_EXTENSIONS,
+            "config_extensions": CONFIG_EXTENSIONS,
+            "derive_names": crate::service_derivation::DEPLOY_CONFIG,
+        });
+        assert_eq!(
+            published_inputs(),
+            expected,
+            "npm/carrick/package.json carrickInputs differs from the constants; set it to:\n{}",
+            serde_json::to_string_pretty(&expected).unwrap()
+        );
+    }
+
+    fn published_inputs() -> serde_json::Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/npm/carrick/package.json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read npm manifest"))
+                .expect("parse npm manifest");
+        manifest["carrickInputs"].clone()
+    }
+
+    /// Rule 1 (see [`INPUT_RULE`]) over the parsed manifest field, which is
+    /// what the cloud reads.
+    fn rule_reads(field: &serde_json::Value, path: &str) -> bool {
+        let list = |key: &str| -> Vec<String> {
+            field[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is not a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_lowercase())
+                .collect()
+        };
+        let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        let extension = name
+            .rsplit_once('.')
+            .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+            .map(|(_, ext)| ext);
+        let named = list("repo_input_names")
+            .into_iter()
+            .chain(list("derive_names"))
+            .any(|n| n == name);
+        let by_extension = extension.is_some_and(|ext| {
+            [
+                "source_extensions",
+                "repo_input_extensions",
+                "config_extensions",
+            ]
+            .iter()
+            .any(|key| list(key).iter().any(|e| e == ext))
+        });
+        named || by_extension || extension.is_none()
+    }
+
+    #[test]
+    fn the_published_rule_reads_what_the_scanner_reads() {
+        let field = published_inputs();
+        let read = [
+            "apps/api/src/server.ts",
+            "SRC/A.TS",
+            "src/__tests__/a.test.ts",
+            "tests/fixtures/seed.ts",
+            "e2e/y.ts",
+            "src/a.stories.tsx",
+            "packages/x/tsconfig.build.json",
+            "deno/import_map.json",
+            "src/data/fixture.json",
+            "config.jsonc",
+            "schema/a.graphqls",
+            "deep/.gitignore",
+            ".npmrc",
+            "apps/web/.yarnrc.yml",
+            ".yarnrc",
+            "bunfig.toml",
+            ".gitmodules",
+            ".gitattributes",
+            "services/api/Dockerfile",
+            "vendor/submodule",
+            "bin/cli",
+        ];
+        let not_read = [
+            "docs/a.md",
+            "img.png",
+            "src/style.css",
+            "src/lib.rs",
+            "README.md",
+            ".github/workflows/ci.yml",
+        ];
+        for p in read {
+            assert!(rule_reads(&field, p), "{p} should be read");
+            // The scanner never reads less than the rule says.
+            let scanner = is_repo_input(p)
+                || crate::file_finder::is_scanned_source(Path::new(p), Path::new(""));
+            assert!(!scanner || rule_reads(&field, p), "{p}");
+        }
+        for p in not_read {
+            assert!(!rule_reads(&field, p), "{p} should not be read");
+            assert!(
+                !is_repo_input(p)
+                    && !crate::file_finder::is_scanned_source(Path::new(p), Path::new("")),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stored_blob_decides_before_any_path_is_read() {
+        let changes: Vec<ChangedPath> = Vec::new();
+        assert_eq!(
+            reason(&decide_with(None, Ok(&changes), api_inputs())),
+            Some(Reason::NoStored)
+        );
+        let mut other = stored("abcdef1234");
+        other.scanner_version = Some("0.9.0".to_string());
+        assert_eq!(
+            reason(&decide_with(Some(&other), Ok(&changes), api_inputs())),
+            Some(Reason::OtherScanner)
+        );
+        let mut other_cache = stored("abcdef1234");
+        other_cache.cache_version = Some(6);
+        assert_eq!(
+            reason(&decide_with(Some(&other_cache), Ok(&changes), api_inputs())),
+            Some(Reason::OtherScanner)
+        );
+        let mut dirty = stored("abcdef1234");
+        dirty.dirty = Some(true);
+        assert_eq!(
+            reason(&decide_with(Some(&dirty), Ok(&changes), api_inputs())),
+            Some(Reason::StoredDirty)
+        );
+        let mut degraded = stored("abcdef1234");
+        degraded.types_degraded = Some(crate::cloud_storage::TypeDegradation {
+            stage: "capture".to_string(),
+            detail: "died".to_string(),
+        });
+        assert_eq!(
+            reason(&decide_with(Some(&degraded), Ok(&changes), api_inputs())),
+            Some(Reason::StoredIncomplete)
+        );
+        let mut lost = stored("abcdef1234");
+        lost.boundary = Some(crate::boundary::ServiceBoundary {
+            files_lost: crate::boundary::Counted::new(2, Vec::new()),
+            ..Default::default()
+        });
+        assert_eq!(
+            reason(&decide_with(Some(&lost), Ok(&changes), api_inputs())),
+            Some(Reason::StoredIncomplete)
+        );
+        let mut reconfigured = stored("abcdef1234");
+        reconfigured.config_json = Some("{\"serviceName\":\"api\",\"include\":[\"x\"]}".into());
+        assert_eq!(
+            reason(&decide_with(
+                Some(&reconfigured),
+                Ok(&changes),
+                api_inputs()
+            )),
+            Some(Reason::ConfigChanged)
+        );
+        let blob = stored("abcdef1234");
+        assert_eq!(
+            reason(&decide_with(Some(&blob), Err("bad object"), api_inputs())),
+            Some(Reason::CommitMissing)
+        );
+    }
+
+    #[test]
+    fn inputs_that_cannot_be_read_whole_analyse_the_service() {
+        let blob = stored("abcdef1234");
+        let changes: Vec<ChangedPath> = Vec::new();
+        let unresolved = ServiceInputs {
+            unresolved: Some("apps/api/src/a.ts imports nowhere".to_string()),
+            ..api_inputs()
+        };
+        assert_eq!(
+            reason(&decide_with(Some(&blob), Ok(&changes), unresolved)),
+            Some(Reason::UnresolvedImport)
+        );
+        let unfollowed = ServiceInputs {
+            unfollowed_extends: vec!["@tsconfig/missing".to_string()],
+            ..api_inputs()
+        };
+        assert_eq!(
+            reason(&decide_with(Some(&blob), Ok(&changes), unfollowed)),
+            Some(Reason::ExtendsUnfollowed)
+        );
+    }
+
+    #[test]
+    fn an_include_entry_is_read_up_to_its_first_wildcard() {
+        assert_eq!(static_prefix("./types/**/*.d.ts"), PathBuf::from("types"));
+        assert_eq!(static_prefix("../../types"), PathBuf::from("../../types"));
+        assert_eq!(static_prefix("src/*"), PathBuf::from("src"));
+        assert_eq!(static_prefix("**/*"), PathBuf::new());
+    }
+
+    #[test]
+    fn join_fields_compare_as_sets_and_absent_is_empty() {
+        let stored = stored("abcdef1234");
+        let mut payload = stored.clone();
+        payload.compat_verdicts = Some(Vec::new());
+        payload.sdk_edges = Some(Vec::new());
+        assert!(!join_fields_changed(&payload, &stored));
+        payload.boundary = Some(crate::boundary::ServiceBoundary::default());
+        assert!(join_fields_changed(&payload, &stored));
+    }
+
+    #[test]
+    fn a_stamped_carried_payload_names_this_run() {
+        let mut payload = stored("abcdef1234");
+        payload.boundary = Some(crate::boundary::ServiceBoundary {
+            commit_hash: "abcdef1234".to_string(),
+            files_attempted: 3,
+            ..Default::default()
+        });
+        stamp_carried(&mut payload, "1234567fff", false);
+        assert_eq!(payload.commit_hash, "1234567fff");
+        assert_eq!(payload.dirty, None);
+        let boundary = payload.boundary.unwrap();
+        assert_eq!(boundary.commit_hash, "1234567fff");
+        assert_eq!(boundary.files_attempted, 0);
+    }
+
+    // --- carrick#2228: main's copy judged by each service's inputs ---
+
+    use crate::git_state::tests::{committed_repo, git_in};
+    use crate::pr_baseline::{MainCopy, main_copy};
+
+    /// Three services: `web` imports a file of `api` by a relative path, and
+    /// `worker` imports a workspace package by name.
+    fn workspace() -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, a) = committed_repo(&[
+            (
+                "package.json",
+                r#"{ "name": "mono", "private": true, "workspaces": ["apps/*", "packages/*"] }"#,
+            ),
+            (
+                "packages/shared/package.json",
+                r#"{ "name": "@fixture/shared", "main": "src/x.ts" }"#,
+            ),
+            ("packages/shared/src/x.ts", "export const x = 1;\n"),
+            ("apps/api/package.json", r#"{ "name": "api" }"#),
+            ("apps/api/src/server.ts", "export const server = 1;\n"),
+            (
+                "apps/api/src/types.ts",
+                "export interface Order { id: string }\n",
+            ),
+            ("apps/web/package.json", r#"{ "name": "web" }"#),
+            (
+                "apps/web/src/checkout.ts",
+                "import type { Order } from \"../../api/src/types\";\nexport const o: Order | null = null;\n",
+            ),
+            (
+                "apps/worker/package.json",
+                r#"{ "name": "worker", "dependencies": { "@fixture/shared": "*" } }"#,
+            ),
+            (
+                "apps/worker/src/job.ts",
+                "import { x } from \"@fixture/shared\";\nexport const job = x;\n",
+            ),
+            ("README.md", "readme\n"),
+        ]);
+        let services = ["api", "web", "worker"]
+            .iter()
+            .map(|name| {
+                serde_json::from_value(serde_json::json!({
+                    "name": name,
+                    "directory": format!("apps/{name}"),
+                }))
+                .unwrap()
+            })
+            .collect();
+        (repo, a, services)
+    }
+
+    fn commit_edit(repo: &Path, path: &str, contents: &str) -> String {
+        std::fs::write(repo.join(path), contents).unwrap();
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-qm", path]);
+        git_in(repo, &["rev-parse", "HEAD"])
+    }
+
+    fn copy_at(service: &str, commit: &str) -> CloudRepoData {
+        let mut copy = stored(commit);
+        copy.service_name = Some(service.to_string());
+        copy.scanner_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        copy
+    }
+
+    fn judged(
+        repo: &Path,
+        services: &[Config],
+        main_self: &[CloudRepoData],
+        base: &str,
+    ) -> MainCopy {
+        let repo_path = repo.to_string_lossy();
+        let judge = CopyJudge::new(&repo_path, services, main_self);
+        main_copy(
+            main_self,
+            Some(base),
+            |copy, base| judge.differs(copy, base),
+            || panic!("this scanner wrote every copy"),
+        )
+    }
+
+    /// Main moved past services it does not touch: `api` was re-stored at B,
+    /// `web` and `worker` stay at A, and nothing they read changed between A
+    /// and B. A PR from B that edits `worker` compares with main's copy.
+    /// The whole-tree comparison called it stale.
+    #[test]
+    fn a_copy_stored_before_a_change_it_does_not_read_is_current() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(
+            repo.path(),
+            "apps/api/src/server.ts",
+            "export const server = 2;\n",
+        );
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        std::fs::write(
+            repo.path().join("apps/worker/src/job.ts"),
+            "import { x } from \"@fixture/shared\";\nexport const job = x + 1;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Current
+        );
+        // What the whole trees say, for the same copy.
+        let whole = main_copy(
+            &main_self,
+            Some(&b),
+            |copy, base| {
+                crate::git_state::differs_under(
+                    &repo.path().to_string_lossy(),
+                    &copy.commit_hash,
+                    base,
+                )
+                .ok()
+            },
+            || false,
+        );
+        assert_eq!(whole, MainCopy::Stale);
+    }
+
+    /// A change on main to a file `web` imports from `api`'s root leaves
+    /// `web`'s copy at A stale.
+    #[test]
+    fn a_copy_stored_before_a_change_it_reads_is_stale() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(
+            repo.path(),
+            "apps/api/src/types.ts",
+            "export interface Order { id: string; total: number }\n",
+        );
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Stale
+        );
+    }
+
+    /// A PR that edits a file outside `worker`'s roots that `worker` reads:
+    /// its inputs on this tree may not be the base's, so the whole trees are
+    /// compared, as before.
+    #[test]
+    fn a_pr_editing_an_outside_input_falls_back_to_the_whole_tree() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(
+            repo.path(),
+            "apps/api/src/server.ts",
+            "export const server = 2;\n",
+        );
+        let main_self = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        std::fs::write(
+            repo.path().join("packages/shared/src/x.ts"),
+            "export const x = 2;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            judged(repo.path(), &services, &main_self, &b),
+            MainCopy::Stale
+        );
+    }
+
+    /// A base this clone does not hold, and a copy whose services all sit at
+    /// one commit, get the answer they always got.
+    #[test]
+    fn an_unknown_base_and_a_one_commit_copy_are_judged_as_before() {
+        let (repo, a, services) = workspace();
+        let b = commit_edit(repo.path(), "README.md", "changed\n");
+        let mixed = [
+            copy_at("api", &b),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &mixed, &"f".repeat(40)),
+            MainCopy::Current
+        );
+        let one_commit = [
+            copy_at("api", &a),
+            copy_at("web", &a),
+            copy_at("worker", &a),
+        ];
+        assert_eq!(
+            judged(repo.path(), &services, &one_commit, &b),
+            MainCopy::Stale,
+            "a README change is a whole-tree difference"
+        );
+    }
+}

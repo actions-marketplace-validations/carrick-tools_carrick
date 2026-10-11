@@ -24,6 +24,7 @@ import {
   SourceFile,
   Node,
   SyntaxKind,
+  VariableDeclarationKind,
   type FunctionDeclaration,
   type ArrowFunction,
   type BinaryExpression,
@@ -247,6 +248,54 @@ const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
  */
 type ResponseSiteStatus = 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
 
+/** One response branch's payload, before branches are joined. */
+interface PayloadCandidate {
+  typeString: string;
+  isExplicit: boolean;
+  node: Node;
+  anchorType: Type;
+  statedTypeNode?: Node;
+}
+
+/** A function that can build a response: one with a body to read. */
+type BuilderFunction = FunctionDeclaration | ArrowFunction | FunctionExpression;
+
+/**
+ * How a repository's own response builder fills an envelope (carrick#2200):
+ * the parameter it serialises into `body`, and the parameter its status
+ * member takes or the status its literal states.
+ */
+interface EnvelopeBuilder {
+  builder: BuilderFunction;
+  payloadParameter: number;
+  statusParameter?: number;
+  fixedStatus?: ResponseSiteStatus;
+}
+
+/**
+ * Why one returned branch of a serialised-body envelope handler was not read
+ * (carrick#2200). Each has its own sentence in `SERIALISED_BODY_UNREAD_DETAIL`.
+ */
+type EnvelopeUnreadCause = 'prebuilt' | 'not_serialised' | 'builder' | 'top_type';
+
+/** What one returned branch of an envelope handler sends. */
+type EnvelopeBranchRead = PayloadCandidate | 'dropped' | { unread: EnvelopeUnreadCause };
+
+/** The provenance sentence for each reason a branch was not read. */
+const SERIALISED_BODY_UNREAD_DETAIL: Record<EnvelopeUnreadCause, string> = {
+  prebuilt:
+    'A return hands back a status and body built somewhere else, such as a variable or a field of another result, so the value in its body was not read.',
+  not_serialised:
+    "A return's body string is not made by JSON.stringify, so the value it holds was not read.",
+  builder:
+    'A return calls a response helper that could not be followed to the one value it serialises, so what it sends was not read.',
+  top_type:
+    'A return serialises a value typed any or unknown, so the shape of its body is not known.',
+};
+
+/** `any` or `unknown` as a type in printed type text, not as a member name or a string. */
+const TOP_TYPE_TOKEN = /(?<![\w$'"`])(?:any|unknown)(?![\w$'"`?:])/;
+
 /** A response payload read out of one or more response sends. */
 interface RecoveredPayload {
   typeString: string;
@@ -375,6 +424,77 @@ function typeText(type: Type, enclosingNode?: Node): string {
  * `text` is `string`, alone or beside `null` and `undefined` in either order:
  * the only payload a raw-text read publishes (carrick#1842).
  */
+/**
+ * Source text with every plain string literal written in double quotes:
+ * `'/a'`, `"/a"` and an interpolation-free `` `/a` `` are one value, so text
+ * that differs only in its quotes compares equal (carrick#2056).
+ *
+ * The text is read left to right, pairing quotes the way the scanner does,
+ * so a template's closing backtick never pairs with the next template's
+ * opening one. A literal holding a quote, a backslash or an interpolation is
+ * copied as it is, and so is an unterminated one with everything after it.
+ */
+export function canonicalStringQuotes(text: string): string {
+  const isQuote = (ch: string): boolean => ch === "'" || ch === '"' || ch === '`';
+  // The index just past the literal opening at `start`, or -1.
+  const literalEnd = (start: number): number => {
+    const quote = text[start];
+    let j = start + 1;
+    while (j < text.length) {
+      const ch = text[j];
+      if (ch === '\\') {
+        j += 2;
+      } else if (ch === quote) {
+        return j + 1;
+      } else if (quote === '`' && ch === '$' && text[j + 1] === '{') {
+        const close = codeEnd(j + 2);
+        if (close < 0) return -1;
+        j = close + 1;
+      } else {
+        j++;
+      }
+    }
+    return -1;
+  };
+  // The index of the `}` that closes an interpolation whose code starts at `start`, or -1.
+  const codeEnd = (start: number): number => {
+    let depth = 0;
+    let j = start;
+    while (j < text.length) {
+      const ch = text[j];
+      if (isQuote(ch)) {
+        const end = literalEnd(j);
+        if (end < 0) return -1;
+        j = end;
+        continue;
+      }
+      if (ch === '{') depth++;
+      if (ch === '}') {
+        if (depth === 0) return j;
+        depth--;
+      }
+      j++;
+    }
+    return -1;
+  };
+
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (!isQuote(text[i])) {
+      out += text[i];
+      i++;
+      continue;
+    }
+    const end = literalEnd(i);
+    if (end < 0) return out + text.slice(i);
+    const body = text.slice(i + 1, end - 1);
+    out += /['"`\\]|\$\{/.test(body) ? text.slice(i, end) : `"${body}"`;
+    i = end;
+  }
+  return out;
+}
+
 function isBareStringText(text: string): boolean {
   const members = text.split('|').map((member) => member.trim());
   return (
@@ -1021,6 +1141,13 @@ export class TypeInferrer {
     const awaitedType = this.unwrapAsyncIterableType(
       this.unwrapPromiseType(returnType)
     );
+    // carrick#2200: a `{ statusCode, body: string }` return is transport the
+    // handler built itself; its contract is the value it serialised into
+    // `body`. Decided before the extraction config, whose rule for the
+    // envelope would read `body` and publish `string`.
+    if (this.serialisedBodyEnvelopeEngages(awaitedType, func)) {
+      return this.inferSerialisedBodyEnvelope(request, func);
+    }
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped && !unwrapResult.verifiedMachinery) {
       typeString = unwrapResult.typeString;
@@ -2000,23 +2127,14 @@ export class TypeInferrer {
         `Response locator at ${request.file_path}:${request.line_number} names an error ` +
           'or redirect send and its handler sends no success body; abstaining'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(site)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'no_success_payload',
-          detail:
-            "every response this route's handler sends states an error or redirect status, " +
-            'or carries no body a JSON contract can describe, so it publishes no success body',
-        },
-      ];
-      return abstain;
+      return this.decidedAbstain(request, this.getNodeLocation(site), {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_success_payload',
+        detail:
+          "every response this route's handler sends states an error or redirect status, " +
+          'or carries no body a JSON contract can describe, so it publishes no success body',
+      });
     }
 
     if (recovered && recovered.nodes.some((node) => contains(site, node))) {
@@ -2090,8 +2208,14 @@ export class TypeInferrer {
   ): InferredType | null {
     const callExpr = this.resolveTargetCallExpression(sourceFile, request);
 
+    // A call's result is read off the call. A locator that finds no call names
+    // nothing this can read, and whatever other node its text overlaps is not
+    // the call's result (carrick#2056); the retype abstains on the same miss.
     if (!callExpr) {
-      return this.inferExpression(sourceFile, request, extractionConfig);
+      this.log(
+        `Call-result locator at ${request.file_path}:${request.line_number} finds no call; leaving unresolved`
+      );
+      return null;
     }
 
     // Walk up from the already-found call expression instead of re-searching
@@ -2284,24 +2408,15 @@ export class TypeInferrer {
           `members of ${typeText(callExpr.getType(), callExpr)}; a part of a payload is not ` +
           'a payload, so this site states no response contract'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(callExpr)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'projected_value_only',
-          detail:
-            "every read of this call's result takes a member out of it and none reads the " +
-            'value itself, so what this site states is a part of a payload rather than the ' +
-            'payload a caller receives',
-        },
-      ];
-      return abstain;
+      return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+        path: '',
+        kind: 'unknown',
+        reason: 'projected_value_only',
+        detail:
+          "every read of this call's result takes a member out of it and none reads the " +
+          'value itself, so what this site states is a part of a payload rather than the ' +
+          'payload a caller receives',
+      });
     }
 
     typeString = this.unwrapPromise(typeString, returnType);
@@ -2574,19 +2689,27 @@ export class TypeInferrer {
       ) {
         break;
       }
-      if (
-        !Node.isParenthesizedExpression(parent) &&
-        !Node.isAwaitExpression(parent) &&
-        !Node.isNonNullExpression(parent) &&
-        !Node.isAsExpression(parent) &&
-        !Node.isTypeAssertion(parent) &&
-        !Node.isSatisfiesExpression(parent)
-      ) {
+      if (!this.wrapsReadTransparently(parent)) {
         return undefined;
       }
       current = parent;
     }
     return typeNode;
+  }
+
+  /**
+   * A wrapper between a body read and the binding it initialises that leaves
+   * the read's value as it is: `await`, parentheses, `!`, a cast, `satisfies`.
+   */
+  private wrapsReadTransparently(node: Node): boolean {
+    return (
+      Node.isParenthesizedExpression(node) ||
+      Node.isAwaitExpression(node) ||
+      Node.isNonNullExpression(node) ||
+      Node.isAsExpression(node) ||
+      Node.isTypeAssertion(node) ||
+      Node.isSatisfiesExpression(node)
+    );
   }
 
   /**
@@ -2931,6 +3054,29 @@ export class TypeInferrer {
       );
     }
 
+    // carrick#2057: the locator named a member of the body the handler parsed
+    // (`body.items` after `const body = (await request.json()) as ImportBody`,
+    // or a binding destructured from that read). A member is one field of the
+    // body, so publishing its type states the whole body is that field. The
+    // body is what the source states at the read; where it states nothing,
+    // nothing is published.
+    const bodyRead = this.parsedBodyReadHolding(located);
+    if (bodyRead) {
+      const stated = this.requestStatedAtBodyRead(request, bodyRead);
+      if (stated) {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number} names a member of the ` +
+            'body its handler parses; publishing the body the source states at that read'
+        );
+        return stated;
+      }
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} names a member of the ` +
+          'body its handler parses, and the source states no type at that read; leaving unresolved'
+      );
+      return null;
+    }
+
     // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
     // expression's type (not the surrounding `Promise<any>`) is read.
     let unwrapped = this.unwrapExpressionNode(located);
@@ -2968,23 +3114,14 @@ export class TypeInferrer {
         `Request locator at ${request.file_path}:${request.line_number} is a request config ` +
           'that carries no body member; the call sends no request body'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(unwrapped)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'no_request_body',
-          detail:
-            `the call's request config sets no '${inCall.member}' member, which is where the call ` +
-            'takes its body, so the call sends no request body',
-        },
-      ];
-      return abstain;
+      return this.decidedAbstain(request, this.getNodeLocation(unwrapped), {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_request_body',
+        detail:
+          `the call's request config sets no '${inCall.member}' member, which is where the call ` +
+          'takes its body, so the call sends no request body',
+      });
     }
 
     // A `fetch` body is almost always `JSON.stringify(payload)`, whose own type
@@ -3050,23 +3187,14 @@ export class TypeInferrer {
           `Request locator at ${request.file_path}:${request.line_number} reads the validated ` +
             `'${nonBodyPart}' part, which is not a body; the route declares no request body here`
         );
-        const abstain = this.createInferredType(
-          request,
-          'unknown',
-          false,
-          this.getNodeLocation(node)
-        );
-        abstain.any_provenance = [
-          {
-            path: '',
-            kind: 'unknown',
-            reason: 'no_request_body',
-            detail:
-              `the located read is the '${nonBodyPart}' part a validator binds, not a request body, ` +
-              'so the route states no body contract here',
-          },
-        ];
-        return abstain;
+        return this.decidedAbstain(request, this.getNodeLocation(node), {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_request_body',
+          detail:
+            `the located read is the '${nonBodyPart}' part a validator binds, not a request body, ` +
+            'so the route states no body contract here',
+        });
       }
     }
 
@@ -3652,21 +3780,12 @@ export class TypeInferrer {
       'rules verify and read no payload out of (a library response object around the body), ' +
       'so this site states no response contract'
   ): InferredType {
-    const abstain = this.createInferredType(
-      request,
-      'unknown',
-      false,
-      this.getNodeLocation(callExpr)
-    );
-    abstain.any_provenance = [
-      {
-        path: '',
-        kind: 'unknown',
-        reason: 'machinery_envelope',
-        detail,
-      },
-    ];
-    return abstain;
+    return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+      path: '',
+      kind: 'unknown',
+      reason: 'machinery_envelope',
+      detail,
+    });
   }
 
   /**
@@ -5155,13 +5274,7 @@ export class TypeInferrer {
     wire: WireFormat,
     alsoSerialisers?: ReadonlySet<string>
   ): RecoveredPayload | null {
-    const candidates: Array<{
-      typeString: string;
-      isExplicit: boolean;
-      node: Node;
-      anchorType: Type;
-      statedTypeNode?: Node;
-    }> = [];
+    const candidates: PayloadCandidate[] = [];
 
     const returned = expressions.flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
@@ -5181,36 +5294,55 @@ export class TypeInferrer {
         serialisers
       );
       if (!payloadNode) continue;
-
-      // A `satisfies X` / `as X` on the argument states the contract in source:
-      // read the ANNOTATION, not the literal the compiler widened it from.
-      // `expandAnnotationTypeNode` keeps the bare name when the declaration is
-      // not resolvable, which is the honest answer on a bare checkout.
-      const stated = this.statedTypeNodeOf(payloadNode);
-      if (stated) {
-        candidates.push({
-          typeString: this.expandAnnotationTypeNode(stated, wire),
-          isExplicit: true,
-          node: payloadNode,
-          anchorType: this.unwrapPromiseType(stated.getType()),
-          statedTypeNode: stated,
-        });
-        continue;
-      }
-
-      const payloadType = this.unwrapPromiseType(payloadNode.getType());
-      candidates.push({
-        typeString: this.expandResolvedTypeStructural(
-          payloadType,
-          typeText(payloadType, payloadNode),
-          wire
-        ),
-        isExplicit: false,
-        node: payloadNode,
-        anchorType: payloadType,
-      });
+      candidates.push(this.payloadCandidateOf(payloadNode, wire));
     }
+    return this.joinPayloadCandidates(candidates);
+  }
 
+  /** How one payload node reads: its stated annotation, else its resolved type. */
+  private payloadCandidateOf(payloadNode: Node, wire: WireFormat): PayloadCandidate {
+    // A `satisfies X` / `as X` on the argument states the contract in source:
+    // read the ANNOTATION, not the literal the compiler widened it from.
+    // `expandAnnotationTypeNode` keeps the bare name when the declaration is
+    // not resolvable, which is the honest answer on a bare checkout.
+    const stated = this.statedTypeNodeOf(payloadNode);
+    if (stated) {
+      return this.statedPayloadCandidate(payloadNode, stated, wire);
+    }
+    const payloadType = this.unwrapPromiseType(payloadNode.getType());
+    return {
+      typeString: this.expandResolvedTypeStructural(
+        payloadType,
+        typeText(payloadType, payloadNode),
+        wire
+      ),
+      isExplicit: false,
+      node: payloadNode,
+      anchorType: payloadType,
+    };
+  }
+
+  /** A payload whose contract a type node in the source states. */
+  private statedPayloadCandidate(
+    payloadNode: Node,
+    stated: Node,
+    wire: WireFormat
+  ): PayloadCandidate {
+    return {
+      typeString: this.expandAnnotationTypeNode(stated, wire),
+      isExplicit: true,
+      node: payloadNode,
+      anchorType: this.unwrapPromiseType(stated.getType()),
+      statedTypeNode: stated,
+    };
+  }
+
+  /**
+   * Join the payloads of several response branches into one contract, as
+   * several return statements are joined: an empty object drops beside a
+   * branch with members, equal texts dedupe, and the rest is a union.
+   */
+  private joinPayloadCandidates(candidates: PayloadCandidate[]): RecoveredPayload | null {
     if (candidates.length === 0) {
       return null;
     }
@@ -5245,6 +5377,557 @@ export class TypeInferrer {
       statedTypeNode:
         distinct.length === 1 ? distinct[0].statedTypeNode : undefined,
     };
+  }
+
+  // ===========================================================================
+  // Serialised-body envelopes (carrick#2200)
+  // ===========================================================================
+
+  /**
+   * True when a handler's awaited return, or a member of its union, is a
+   * serialised-body envelope: an object with a numeric `statusCode` or
+   * `status` member and a `body` member typed `string`. Either member may be
+   * optional, as a platform's result type declares them.
+   *
+   * HTTP vocabulary only, the class `RESPONSE_INIT_MEMBER_NAMES` is. A `body`
+   * typed as an object is not an envelope: a runtime that serialises the
+   * handler's return value sends that object as the payload, so the shape is
+   * ambiguous and keeps the ordinary reading.
+   */
+  private typeIsSerialisedBodyEnvelope(type: Type, at: Node): boolean {
+    const members = type.isUnion() ? type.getUnionTypes() : [type];
+    return members.some((member) => {
+      if (!member.isObject() || member.isArray() || member.getCallSignatures().length > 0) {
+        return false;
+      }
+      const body = this.envelopeMemberType(member, 'body', at);
+      if (!body || !(body.isString() || body.isStringLiteral())) return false;
+      return STATUS_MEMBER_NAMES.some((name) => {
+        const status = this.envelopeMemberType(member, name, at);
+        return status !== undefined && (status.isNumber() || statusCodesOfType(status) !== undefined);
+      });
+    });
+  }
+
+  /** A member's type with `undefined` and `null` removed, or `undefined` if absent. */
+  private envelopeMemberType(type: Type, name: string, at: Node): Type | undefined {
+    const property = type.getProperty(name);
+    if (!property) return undefined;
+    return property.getTypeAtLocation(at).getNonNullableType();
+  }
+
+  /**
+   * True when a handler's return is a serialised-body envelope AND the source
+   * shows the body is serialised, so the envelope reading applies:
+   *  - a returned branch builds an envelope whose `body` is `JSON.stringify`
+   *    of a value, inline, through a `const`, or in a builder the reading can
+   *    follow (`branchShowsSerialisation`); or
+   *  - the envelope type is declared outside the repository (a platform's
+   *    result type) with every member optional. Nothing else returns such a
+   *    type, so a value of it returned as-is is still transport. The repo's
+   *    own all-optional types (`Partial<Article>`) engage only on evidence.
+   *
+   * A domain object that merely has `status` and `body` members (an article,
+   * a message) shows neither and keeps the ordinary reading.
+   */
+  private serialisedBodyEnvelopeEngages(type: Type, func: FunctionLike): boolean {
+    if (!this.typeIsSerialisedBodyEnvelope(type, func)) return false;
+    const members = type.isUnion() ? type.getUnionTypes() : [type];
+    const platformShaped = members.some((member) => {
+      if (!this.typeIsSerialisedBodyEnvelope(member, func)) return false;
+      const properties = member.getProperties();
+      return properties.every(
+        (property) =>
+          property.hasFlags(ts.SymbolFlags.Optional) &&
+          this.symbolIsLibOrExternalOrigin(property)
+      );
+    });
+    if (platformShaped) return true;
+    return this.envelopeBranches(func).some((branch) =>
+      this.branchShowsSerialisation(branch, func, 0)
+    );
+  }
+
+  /**
+   * True when a returned branch builds an envelope from a serialised value:
+   * a literal whose `body` is `JSON.stringify(...)`, a call to a builder the
+   * reading can follow, or a call handing on one such envelope.
+   */
+  private branchShowsSerialisation(expression: Node, scope: FunctionLike, depth: number): boolean {
+    if (depth > RESPONSE_HELPER_MAX_DEPTH) return false;
+    const node = this.peelTransparentExpression(expression);
+    if (Node.isObjectLiteralExpression(node)) {
+      return this.serialisedBodyArgument(node, scope) !== undefined;
+    }
+    if (!Node.isCallExpression(node)) return false;
+    if (this.envelopeBuilderOf(node) !== undefined) return true;
+    return this.handedOnArguments(node).some((arg) =>
+      this.branchShowsSerialisation(arg, scope, depth + 1)
+    );
+  }
+
+  /**
+   * The arguments a call could hand back as its result: every argument but
+   * an object literal, which is the call's input (`create({ body:
+   * JSON.stringify(doc) })` stores a document, it does not respond with it),
+   * and but a function, whose returns are read as the call's callbacks.
+   */
+  private handedOnArguments(call: CallExpression): Node[] {
+    return call
+      .getArguments()
+      .map((arg) => this.peelTransparentExpression(arg))
+      .filter(
+        (arg) =>
+          !Node.isObjectLiteralExpression(arg) &&
+          !Node.isArrowFunction(arg) &&
+          !Node.isFunctionExpression(arg)
+      );
+  }
+
+  /**
+   * The returned branches of an envelope handler: each returned expression,
+   * conditional sides split. A returned call whose callbacks return values
+   * (`settle().then(ok, fail)`) is carried by those returns, plus every
+   * envelope it is handed directly (`withFallback(() => a, b)` can answer
+   * `b`); a call whose callbacks return nothing stays a branch of its own.
+   */
+  private envelopeBranches(func: FunctionLike): Node[] {
+    const carriedByCallbacks = new Set(
+      this.returnedExpressions(func).filter((expression) => {
+        const call = this.peelTransparentExpression(expression);
+        if (!Node.isCallExpression(call)) return false;
+        return call.getArguments().some((arg) => {
+          const callback = this.peelTransparentExpression(arg);
+          return (
+            (Node.isArrowFunction(callback) || Node.isFunctionExpression(callback)) &&
+            this.returnedExpressions(callback).length > 0
+          );
+        });
+      })
+    );
+    const handedEnvelopes = [...carriedByCallbacks].flatMap((expression) => {
+      const call = this.peelTransparentExpression(expression);
+      if (!Node.isCallExpression(call)) return [];
+      return call
+        .getArguments()
+        .map((arg) => this.peelTransparentExpression(arg))
+        .filter(
+          (arg) =>
+            !Node.isArrowFunction(arg) &&
+            !Node.isFunctionExpression(arg) &&
+            this.typeIsSerialisedBodyEnvelope(arg.getType(), arg)
+        );
+    });
+    return [
+      ...this.responseReturnedExpressions(func).filter(
+        (expression) => !carriedByCallbacks.has(expression)
+      ),
+      ...handedEnvelopes,
+    ].flatMap((expression) => this.expandResponseBranches(expression, 0));
+  }
+
+  /**
+   * The `function_return` answer for a handler that returns a serialised-body
+   * envelope: the union of the values its success branches serialised.
+   *
+   * Each returned branch is read by `readEnvelopeBranch`. Error and redirect
+   * branches contribute nothing (carrick#1161). If any branch cannot be read,
+   * the answer is `unknown` with the decided reason `serialised_body_unread`
+   * and one sentence per cause: the branches that did read are part of the
+   * contract, and neither the envelope nor its `string` body is any of it.
+   */
+  private inferSerialisedBodyEnvelope(
+    request: InferRequestItem,
+    func: FunctionLike
+  ): InferredType {
+    const wire = this.wireFormatFor(request);
+    const branches = this.envelopeBranches(func);
+
+    const candidates: PayloadCandidate[] = [];
+    const causes = new Set<EnvelopeUnreadCause>();
+    for (const branch of branches) {
+      const read = this.readEnvelopeBranch(branch, func, wire, 0);
+      if (read === 'dropped') continue;
+      if ('unread' in read) causes.add(read.unread);
+      else candidates.push(read);
+    }
+
+    const location = this.getNodeLocation(func);
+    if (causes.size > 0) {
+      this.log(
+        `Return at ${request.file_path}:${request.line_number} is a serialised-body ` +
+          `envelope and a returned branch was not read (${[...causes].join(', ')}); abstaining`
+      );
+      return this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'serialised_body_unread',
+        detail: [...causes].map((cause) => SERIALISED_BODY_UNREAD_DETAIL[cause]).join(' '),
+      });
+    }
+    const recovered = this.joinPayloadCandidates(candidates);
+    if (!recovered) {
+      return this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_success_payload',
+        detail:
+          'every status and body this handler returns states an error or redirect status, so it publishes no success body',
+      });
+    }
+    return this.inferredFromRecoveredPayload(request, recovered);
+  }
+
+  /** An `unknown` answer the inferrer decided, carrying its reason at the root. */
+  private decidedAbstain(
+    request: InferRequestItem,
+    location: SourceLocation,
+    reason: TypeProvenance
+  ): InferredType {
+    const abstain = this.createInferredType(request, 'unknown', false, location);
+    abstain.any_provenance = [reason];
+    return abstain;
+  }
+
+  /**
+   * What one returned branch of an envelope handler serialised:
+   *  - an envelope object literal: the argument of the `JSON.stringify` that
+   *    produced its `body`, inline or through a `const` in the same function;
+   *    its status member decides the branch;
+   *  - a call to a response builder this repository declares
+   *    (`envelopeBuilderOf`): the argument the builder serialises; the
+   *    argument or literal its status member takes decides the branch;
+   *  - any other call handing on exactly one envelope argument (never an
+   *    object literal, which is the call's input): that
+   *    envelope is read in its place. Its own stated status decides the
+   *    branch; only when it states none does a status the outer call's
+   *    arguments state decide (`log(ctx, 503, "code", prebuilt)`).
+   * Anything else, and a payload holding `any` or `unknown`, is unread, with
+   * its cause.
+   */
+  private readEnvelopeBranch(
+    expression: Node,
+    scope: FunctionLike,
+    wire: WireFormat,
+    depth: number
+  ): EnvelopeBranchRead {
+    if (depth > RESPONSE_HELPER_MAX_DEPTH) return { unread: 'builder' };
+    const node = this.peelTransparentExpression(expression);
+
+    if (Node.isObjectLiteralExpression(node)) {
+      const status = this.envelopeLiteralStatus(node);
+      if (status === 'error' || status === 'redirect') return 'dropped';
+      const payload = this.serialisedBodyArgument(node, scope);
+      return payload ? this.envelopePayloadCandidate(payload, wire) : { unread: 'not_serialised' };
+    }
+
+    if (!Node.isCallExpression(node)) return { unread: 'prebuilt' };
+
+    const builder = this.envelopeBuilderOf(node);
+    if (builder === 'failure') return 'dropped';
+    if (builder) {
+      const status = this.builderCallStatus(node, builder);
+      if (status === 'error' || status === 'redirect') return 'dropped';
+      const argument = node.getArguments()[builder.payloadParameter];
+      if (!argument) return { unread: 'builder' };
+      return this.builderPayloadCandidate(node, builder, argument, wire);
+    }
+
+    const envelopes = this.handedOnArguments(node).filter((arg) =>
+      this.typeIsSerialisedBodyEnvelope(arg.getType(), arg)
+    );
+    if (envelopes.length > 1) return { unread: 'builder' };
+    const inner = envelopes[0];
+    const innerStatus = inner ? this.envelopeOwnStatus(inner) : 'undecided';
+    if (innerStatus === 'undecided' || innerStatus === 'variable') {
+      const outer = this.responseSiteStatus(node);
+      if (outer === 'error' || outer === 'redirect') return 'dropped';
+    }
+    if (!inner) return { unread: 'builder' };
+    return this.readEnvelopeBranch(inner, scope, wire, depth + 1);
+  }
+
+  /** The status a builder call sends: its status argument, or the builder's literal. */
+  private builderCallStatus(call: CallExpression, builder: EnvelopeBuilder): ResponseSiteStatus {
+    if (builder.statusParameter !== undefined) {
+      return this.statusOfValue(call.getArguments()[builder.statusParameter]);
+    }
+    return builder.fixedStatus ?? 'undecided';
+  }
+
+  /**
+   * The status an envelope expression states itself: a literal's status
+   * member, or what a followable builder call sends. `'undecided'` for
+   * anything else (a variable holding an envelope states nothing here).
+   */
+  private envelopeOwnStatus(expression: Node): ResponseSiteStatus {
+    const node = this.peelTransparentExpression(expression);
+    if (Node.isObjectLiteralExpression(node)) return this.envelopeLiteralStatus(node);
+    if (!Node.isCallExpression(node)) return 'undecided';
+    const builder = this.envelopeBuilderOf(node);
+    if (builder === 'failure') return 'error';
+    return builder ? this.builderCallStatus(node, builder) : 'undecided';
+  }
+
+  /** The status an envelope literal's `statusCode` or `status` member states. */
+  private envelopeLiteralStatus(literal: ObjectLiteralExpression): ResponseSiteStatus {
+    for (const name of STATUS_MEMBER_NAMES) {
+      const value = this.envelopeMemberValue(literal, name);
+      if (value) return this.statusOfValue(value);
+    }
+    return 'undecided';
+  }
+
+  /** The status a value states, classified as a send's status argument is. */
+  private statusOfValue(value: Node | undefined): ResponseSiteStatus {
+    if (!value) return 'undecided';
+    const read = this.statedStatusCodes(this.peelTransparentExpression(value));
+    if (read === 'variable') return 'variable';
+    if (!read) return 'undecided';
+    const kind = classifyStatusCodes(read);
+    return kind === 'mixed' ? 'variable' : kind;
+  }
+
+  /**
+   * The value node an object literal gives a member: a property assignment's
+   * initializer, or a shorthand's own name.
+   */
+  private envelopeMemberValue(literal: ObjectLiteralExpression, name: string): Node | undefined {
+    const property = literal.getProperty(name);
+    if (property && Node.isPropertyAssignment(property)) return property.getInitializer();
+    if (property && Node.isShorthandPropertyAssignment(property)) return property.getNameNode();
+    return undefined;
+  }
+
+  /**
+   * The value an envelope literal's `body` serialises: the argument of a
+   * `JSON.stringify` written there, or written as the initializer of a
+   * `const` that `scope` declares and `body` names. `undefined` when `body`
+   * is built any other way.
+   */
+  private serialisedBodyArgument(
+    literal: ObjectLiteralExpression,
+    scope: FunctionLike
+  ): Node | undefined {
+    const raw = this.envelopeMemberValue(literal, 'body');
+    if (!raw) return undefined;
+    const value = this.peelTransparentExpression(raw);
+    const direct = this.unwrapJsonStringifyArg(value);
+    if (direct !== value) return direct;
+    const initializer = this.constInitializerInScope(value, scope);
+    if (!initializer) return undefined;
+    const bound = this.peelTransparentExpression(initializer);
+    const viaConst = this.unwrapJsonStringifyArg(bound);
+    return viaConst !== bound ? viaConst : undefined;
+  }
+
+  /**
+   * The initializer of the `const` an identifier (or a shorthand member's
+   * name) refers to, when `scope` itself declares it.
+   */
+  private constInitializerInScope(node: Node, scope: FunctionLike): Node | undefined {
+    for (const declaration of this.valueSymbolOf(node)?.getDeclarations() ?? []) {
+      if (!Node.isVariableDeclaration(declaration)) continue;
+      if (
+        declaration.getVariableStatement()?.getDeclarationKind() !==
+        VariableDeclarationKind.Const
+      ) {
+        continue;
+      }
+      if (this.findContainingFunctionForNode(declaration) !== scope) continue;
+      return declaration.getInitializer();
+    }
+    return undefined;
+  }
+
+  /**
+   * The symbol of the value a node names: a shorthand member's value symbol
+   * (its own symbol is the property), else the identifier's symbol.
+   */
+  private valueSymbolOf(node: Node): TsSymbol | undefined {
+    const parent = node.getParent();
+    if (parent && Node.isShorthandPropertyAssignment(parent) && parent.getNameNode() === node) {
+      return parent.getValueSymbol();
+    }
+    return Node.isIdentifier(node) ? node.getSymbol() : undefined;
+  }
+
+  /** The index of the `params` entry a node names, or `undefined`. */
+  private parameterIndexOf(node: Node, params: ParameterDeclaration[]): number | undefined {
+    for (const declaration of this.valueSymbolOf(node)?.getDeclarations() ?? []) {
+      const index = params.findIndex((param) => param === declaration);
+      if (index >= 0) return index;
+    }
+    return undefined;
+  }
+
+  /**
+   * How a call's callee builds an envelope, when the callee is a function this
+   * repository declares (not lib, not an installed package) and every return
+   * it makes is an envelope literal:
+   *  - returns whose status member is a literal 4xx or 5xx are its failure
+   *    path and are ignored; a builder with nothing else is `'failure'`, so a
+   *    call to it is an error branch;
+   *  - every other return must serialise the same parameter into `body` and
+   *    take its status from the same parameter, or state the same literal
+   *    success or redirect status.
+   * `undefined` when the callee is anything else.
+   */
+  private envelopeBuilderOf(call: CallExpression): EnvelopeBuilder | 'failure' | undefined {
+    let symbol = call.getExpression().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    if (!symbol || this.symbolIsLibOrExternalOrigin(symbol)) return undefined;
+    const builder = this.builderFunctionOf(symbol);
+    if (!builder) return undefined;
+
+    const params = builder.getParameters();
+    const returned = this.returnedExpressions(builder).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    let mapping: EnvelopeBuilder | undefined;
+    let sawFailure = false;
+    for (const expression of returned) {
+      const literal = this.peelTransparentExpression(expression);
+      if (!Node.isObjectLiteralExpression(literal)) return undefined;
+      const statusValue = STATUS_MEMBER_NAMES.map((name) =>
+        this.envelopeMemberValue(literal, name)
+      ).find((value) => value !== undefined);
+      if (!statusValue) return undefined;
+      const statusParameter = this.parameterIndexOf(statusValue, params);
+      let fixedStatus: ResponseSiteStatus | undefined;
+      if (statusParameter === undefined) {
+        const codes = this.statedStatusCodes(this.peelTransparentExpression(statusValue));
+        if (!Array.isArray(codes)) return undefined;
+        const kind = classifyStatusCodes(codes);
+        if (kind === 'error') {
+          sawFailure = true;
+          continue;
+        }
+        if (kind === 'mixed') return undefined;
+        fixedStatus = kind;
+      }
+      const serialised = this.serialisedBodyArgument(literal, builder);
+      const payloadParameter = serialised ? this.parameterIndexOf(serialised, params) : undefined;
+      if (payloadParameter === undefined) return undefined;
+      const here: EnvelopeBuilder = { builder, payloadParameter, statusParameter, fixedStatus };
+      if (
+        mapping &&
+        (mapping.payloadParameter !== here.payloadParameter ||
+          mapping.statusParameter !== here.statusParameter ||
+          mapping.fixedStatus !== here.fixedStatus)
+      ) {
+        return undefined;
+      }
+      mapping = here;
+    }
+    if (mapping) return mapping;
+    return sawFailure ? 'failure' : undefined;
+  }
+
+  /**
+   * The single function a callee symbol declares with a body: a function
+   * declaration, or a variable initialised with an arrow or function
+   * expression.
+   */
+  private builderFunctionOf(symbol: TsSymbol): BuilderFunction | undefined {
+    const bodies: BuilderFunction[] = [];
+    for (const declaration of symbol.getDeclarations()) {
+      if (Node.isFunctionDeclaration(declaration) && declaration.getBody()) {
+        bodies.push(declaration);
+      } else if (Node.isVariableDeclaration(declaration)) {
+        const initializer = declaration.getInitializer();
+        const fn = initializer ? this.peelTransparentExpression(initializer) : undefined;
+        if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn))) bodies.push(fn);
+      }
+    }
+    return bodies.length === 1 ? bodies[0] : undefined;
+  }
+
+  /**
+   * The payload a builder call serialises. The source states it, and the
+   * answer is explicit, when the argument carries `satisfies`/`as`, when the
+   * builder's parameter is one of its type parameters and the call passes
+   * type arguments (`reply<AddNoteResult>(201, x)`), or when the parameter is
+   * declared with a type that says something. Otherwise the argument's own
+   * type is read.
+   */
+  private builderPayloadCandidate(
+    call: CallExpression,
+    builder: EnvelopeBuilder,
+    argument: Node,
+    wire: WireFormat
+  ): EnvelopeBranchRead {
+    const payloadNode = this.peelTransparentExpression(argument);
+    if (this.statedTypeNodeOf(payloadNode)) {
+      return this.envelopePayloadCandidate(payloadNode, wire);
+    }
+    const declared = builder.builder.getParameters()[builder.payloadParameter]?.getTypeNode();
+    if (declared) {
+      const typeParameterIndex = builder.builder
+        .getTypeParameters()
+        .findIndex((tp) => tp.getName() === declared.getText().trim());
+      if (typeParameterIndex >= 0) {
+        const typeArgument = call.getTypeArguments()[typeParameterIndex];
+        if (typeArgument) {
+          return this.checkedEnvelopeCandidate(
+            this.statedPayloadCandidate(payloadNode, typeArgument, wire)
+          );
+        }
+      } else if (!this.typeNodeStatesNothing(declared)) {
+        return this.checkedEnvelopeCandidate(
+          this.statedPayloadCandidate(payloadNode, declared, wire)
+        );
+      }
+    }
+    return this.envelopePayloadCandidate(payloadNode, wire);
+  }
+
+  /**
+   * True when a declared parameter type does not say what is sent: a top
+   * type, the `object` keyword, an object type that names no member (`{}`,
+   * `Record<string, unknown>`), a union that admits both primitives and
+   * objects (a JSON-value type such as `string | number | Json[] | { [k:
+   * string]: Json }`), or a type that mentions a type parameter. A builder
+   * that takes "any value" states nothing about the payload a call hands it,
+   * so the argument's own type is read instead.
+   */
+  private typeNodeStatesNothing(typeNode: Node): boolean {
+    const type = typeNode.getType();
+    if (type.isAny() || type.isUnknown() || type.isTypeParameter()) return true;
+    if (type.getFlags() & ts.TypeFlags.NonPrimitive) return true;
+    if (type.isObject() && !type.isArray() && type.getProperties().length === 0) {
+      return true;
+    }
+    if (type.isUnion()) {
+      const members = type.getUnionTypes();
+      const primitive = members.some(
+        (member) =>
+          member.isString() ||
+          member.isNumber() ||
+          member.isBoolean() ||
+          member.isBooleanLiteral()
+      );
+      if (primitive && members.some((member) => member.isObject())) return true;
+    }
+    return [typeNode, ...typeNode.getDescendants()].some(
+      (node) => Node.isTypeReference(node) && node.getType().isTypeParameter()
+    );
+  }
+
+  /** A serialised value's candidate, unread when it holds a top type. */
+  private envelopePayloadCandidate(payloadNode: Node, wire: WireFormat): EnvelopeBranchRead {
+    return this.checkedEnvelopeCandidate(this.payloadCandidateOf(payloadNode, wire));
+  }
+
+  /**
+   * A payload candidate, or unread when its printed type is or holds `any`
+   * or `unknown` anywhere (`{ [x: string]: any }`, `{ data: any }`). A
+   * contract with a hole in it is not published on this path: the capture
+   * would refuse the text and re-read the line, which can publish the
+   * envelope.
+   */
+  private checkedEnvelopeCandidate(candidate: PayloadCandidate): EnvelopeBranchRead {
+    return TOP_TYPE_TOKEN.test(candidate.typeString) ? { unread: 'top_type' } : candidate;
   }
 
   /**
@@ -5653,15 +6336,8 @@ export class TypeInferrer {
     while (Node.isPropertyAccessExpression(callee)) {
       const receiver = this.peelTransparentExpression(callee.getExpression());
       if (!Node.isCallExpression(receiver)) return undefined;
-      const first = receiver.getArguments()[0];
-      if (first) {
-        const read = this.statedStatusCodes(this.peelTransparentExpression(first));
-        if (read === 'variable') return 'variable';
-        if (read) {
-          const kind = classifyStatusCodes(read);
-          return kind === 'mixed' ? 'variable' : kind;
-        }
-      }
+      const status = this.statusOfValue(receiver.getArguments()[0]);
+      if (status !== 'undecided') return status;
       callee = receiver.getExpression();
     }
     return undefined;
@@ -5772,6 +6448,26 @@ export class TypeInferrer {
   }
 
   /**
+   * The symbol an anchor is named from: the type's own symbol, unless that
+   * symbol's name is synthetic (`__type`, `__object`, ...), in which case the
+   * alias symbol (carrick#2148).
+   *
+   * `type Widget = { id: string }` and an instantiated `Page<Order>` carry
+   * the anonymous `__type` as their own symbol and the alias as their alias
+   * symbol. Reading the own symbol first and stopping because it is truthy
+   * left every object-literal alias without an anchor, while the same shape
+   * declared as an interface had one. The own symbol still wins whenever it
+   * has a real name, so every type anchored before keeps its anchor.
+   */
+  private anchorSymbolOf(type: Type): TsSymbol | undefined {
+    const own = type.getSymbol();
+    if (own && !own.getName().startsWith('__')) {
+      return own;
+    }
+    return type.getAliasSymbol() ?? own;
+  }
+
+  /**
    * The deterministic source symbol of a resolved type (`Payment` for a payload
    * typed `Payment`), or `undefined` when there is no single user-defined
    * symbol to anchor on. This is the same `getSymbol() || getAliasSymbol()` name
@@ -5781,7 +6477,7 @@ export class TypeInferrer {
    * `primary_type_symbol` so the manifest anchor no longer depends on the LLM.
    */
   private primaryTypeSymbol(type: Type): string | undefined {
-    const name = (type.getSymbol() || type.getAliasSymbol())?.getName();
+    const name = this.anchorSymbolOf(type)?.getName();
     // Reject the compiler's synthetic names for anonymous shapes (`__type`,
     // `__object`, `__function`, …). They are not user-facing type names, so
     // they would be a meaningless — and non-resolvable — anchor.
@@ -5802,7 +6498,8 @@ export class TypeInferrer {
    * declarations IN its `source_file`, so the request must point at the file
    * that actually declares the tsc-witnessed payload type.
    *
-   * The declarations read are those of the type's own symbol, so a name
+   * The declarations read are those of the symbol the anchor is named from
+   * (`anchorSymbolOf`: the type's own symbol, or its alias's), so a name
    * imported through a barrel reports the file that declares it, and a name
    * two files declare reports the one this type resolves to. A declaration in
    * an installed package or a TypeScript lib is reported as it is found, as
@@ -5821,7 +6518,7 @@ export class TypeInferrer {
     if (this.primaryTypeSymbol(type) === undefined) {
       return undefined;
     }
-    const decls = (type.getSymbol() || type.getAliasSymbol())?.getDeclarations() ?? [];
+    const decls = this.anchorSymbolOf(type)?.getDeclarations() ?? [];
     const declaring = decls.find(
       (d) =>
         Node.isInterfaceDeclaration(d) ||
@@ -6562,6 +7259,57 @@ export class TypeInferrer {
       return call;
     }
     return undefined;
+  }
+
+  /**
+   * The platform body read whose result `located` is a MEMBER of, or
+   * `undefined` (carrick#2057).
+   *
+   * A member is a property or element access off a binding, or a name
+   * destructured out of one. The binding must be initialised by the body read
+   * `platformBodyReadIn` finds in the function that declares it, with only
+   * transparent wrappers between the two (`await`, parentheses, `!`, a cast,
+   * `satisfies`). The binding itself is not a member, and neither is a member
+   * of anything else (a query object, a parameter, an outbound response).
+   */
+  private parsedBodyReadHolding(located: Node): CallExpression | undefined {
+    let node = this.unwrapExpressionNode(located);
+    let member = false;
+    while (
+      Node.isPropertyAccessExpression(node) ||
+      Node.isElementAccessExpression(node) ||
+      Node.isNonNullExpression(node) ||
+      Node.isParenthesizedExpression(node)
+    ) {
+      if (Node.isPropertyAccessExpression(node) || Node.isElementAccessExpression(node)) {
+        member = true;
+      }
+      node = node.getExpression();
+    }
+    if (!Node.isIdentifier(node)) return undefined;
+
+    let declaration: Node | undefined = node.getSymbol()?.getDeclarations()?.[0];
+    while (declaration && Node.isBindingElement(declaration)) {
+      member = true;
+      declaration = declaration.getParent()?.getParent();
+    }
+    if (!member || !declaration || !Node.isVariableDeclaration(declaration)) return undefined;
+
+    const handler = this.findContainingFunctionForNode(declaration);
+    const read = handler ? this.platformBodyReadIn(handler) : undefined;
+    if (!read) return undefined;
+    let current: Node = read;
+    for (;;) {
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (parent === declaration) {
+        return declaration.getInitializer() === current ? read : undefined;
+      }
+      if (!this.wrapsReadTransparently(parent)) {
+        return undefined;
+      }
+      current = parent;
+    }
   }
 
   /**
@@ -8157,30 +8905,122 @@ export class TypeInferrer {
     // locator whose exact match failed would bind to the smallest embedded
     // sub-expression (pickBestMatch prefers small nodes), e.g. the 8-char
     // literal "active" inside a res.json object payload (#335).
+    //
+    // A node the text itself places strictly inside what it names is a
+    // fragment, however much of the text it covers (carrick#2056): the
+    // `new URLSearchParams(…)` inside a call's URL argument, or the object a
+    // callback nested in the named object returns. Only the node the text
+    // names, or a wrapper the text adds around it, may be bound this way. A
+    // fragment still points at what the text names where the source agrees
+    // with the text up to it: the enclosing node of the named kind whose text
+    // opens with the text's own opening up to the fragment (`new Response(`
+    // before a payload, when the text dropped the call's second argument).
     const MIN_REVERSE_MATCH_LEN = 8;
     const MIN_REVERSE_MATCH_COVERAGE = 0.5;
-    const substringMatches = candidates.filter(
-      (c) =>
-        c.text.includes(normalizedTarget) ||
-        (c.text.length >= MIN_REVERSE_MATCH_LEN &&
-          c.text.length >= normalizedTarget.length * MIN_REVERSE_MATCH_COVERAGE &&
-          normalizedTarget.includes(c.text))
-    );
-
-    if (substringMatches.length > 0) {
-      // Prefer nodes where the LLM text is contained in the node text
-      const containingMatches = substringMatches.filter((c) =>
-        c.text.includes(normalizedTarget)
-      );
-
-      if (containingMatches.length > 0) {
-        return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
-      }
-
-      return this.pickBestMatch(substringMatches.map((c) => c.node), lineNumber) as T;
+    const containingMatches = candidates.filter((c) => c.text.includes(normalizedTarget));
+    if (containingMatches.length > 0) {
+      return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
     }
+    const reverseMatches = candidates.filter(
+      (c) =>
+        c.text.length >= MIN_REVERSE_MATCH_LEN &&
+        c.text.length >= normalizedTarget.length * MIN_REVERSE_MATCH_COVERAGE &&
+        normalizedTarget.includes(c.text)
+    );
+    if (reverseMatches.length === 0) return undefined;
 
-    return undefined;
+    const named = this.locatorNames(normalizedTarget);
+    if (!named) {
+      return this.pickBestMatch(reverseMatches.map((c) => c.node), lineNumber) as T;
+    }
+    const textOf = new Map<Node, string>(candidates.map((c) => [c.node, c.text]));
+    const bound = new Set<Node>();
+    for (const c of reverseMatches) {
+      if (named.texts.has(c.text)) {
+        bound.add(c.node);
+        continue;
+      }
+      const at = normalizedTarget.indexOf(c.text, named.rootStart + 1);
+      if (at < 0) continue;
+      const opening = normalizedTarget.slice(named.rootStart, at);
+      const enclosing = c.node.getFirstAncestor(
+        (ancestor) =>
+          ancestor.getKind() === named.rootKind &&
+          textOf.get(ancestor)?.startsWith(opening) === true
+      );
+      if (enclosing) bound.add(enclosing);
+    }
+    return bound.size > 0 ? (this.pickBestMatch([...bound], lineNumber) as T) : undefined;
+  }
+
+  /**
+   * What a locator's text names, read off its own parse (carrick#2056):
+   *
+   *  - `texts`: the normalized text of the expression it names and of each
+   *    wrapper it carries around it (`return`, a `const x =` binding, a label,
+   *    `await`, parentheses, a cast, `satisfies`, `!`). A node strictly inside
+   *    that expression is not among them;
+   *  - `rootKind` and `rootStart`: the innermost of those, its kind, and where
+   *    its text starts in the locator.
+   *
+   * `null` when the text does not parse as one expression or one statement:
+   * there is no structure to read, and the caller keeps its text rule.
+   */
+  private locatorNames(
+    normalizedTarget: string
+  ): { texts: Set<string>; rootKind: SyntaxKind; rootStart: number } | null {
+    const parsed = (source: string): ts.SourceFile | null => {
+      const file = ts.createSourceFile('locator.ts', source, ts.ScriptTarget.Latest, true);
+      const diagnostics = (file as unknown as { parseDiagnostics?: readonly unknown[] })
+        .parseDiagnostics;
+      return diagnostics && diagnostics.length === 0 && file.statements.length === 1 ? file : null;
+    };
+
+    // An object literal is a block as a statement, so try the text as an
+    // expression first.
+    const EXPRESSION_OPENING = '(\n';
+    const asExpression = parsed(`${EXPRESSION_OPENING}${normalizedTarget}\n);`);
+    let node: ts.Node | undefined;
+    let file: ts.SourceFile | null = asExpression;
+    let offset = 0;
+    if (asExpression) {
+      const statement = asExpression.statements[0];
+      if (ts.isExpressionStatement(statement) && ts.isParenthesizedExpression(statement.expression)) {
+        node = statement.expression.expression;
+        offset = EXPRESSION_OPENING.length;
+      }
+    } else {
+      file = parsed(normalizedTarget);
+      node = file?.statements[0];
+    }
+    if (!file || !node) return null;
+
+    const texts = new Set<string>();
+    let root: ts.Node | undefined;
+    while (node) {
+      if (ts.isLabeledStatement(node)) {
+        node = node.statement;
+      } else if (ts.isExpressionStatement(node) || ts.isReturnStatement(node)) {
+        node = node.expression;
+      } else if (ts.isVariableStatement(node)) {
+        const declarations = node.declarationList.declarations;
+        node = declarations.length === 1 ? declarations[0].initializer : undefined;
+      } else {
+        texts.add(this.normalizeWhitespace(node.getText(file)));
+        root = node;
+        node =
+          ts.isParenthesizedExpression(node) ||
+          ts.isAwaitExpression(node) ||
+          ts.isAsExpression(node) ||
+          ts.isSatisfiesExpression(node) ||
+          ts.isNonNullExpression(node) ||
+          ts.isTypeAssertionExpression(node)
+            ? node.expression
+            : undefined;
+      }
+    }
+    if (!root) return null;
+    return { texts, rootKind: root.kind, rootStart: root.getStart(file) - offset };
   }
 
   /**
@@ -8226,7 +9066,7 @@ export class TypeInferrer {
    * for the same reason.
    */
   private normalizeWhitespace(text: string): string {
-    return text
+    const collapsed = text
       .replace(/\s+/g, ' ')
       // A member chain broken before its dot (`client\n  .list(…)`) reads the
       // same as `client.list(…)`; a space around `.` / `?.` means nothing
@@ -8235,6 +9075,8 @@ export class TypeInferrer {
       .replace(/\s*,?\s*([}\)\]])/g, '$1')
       .replace(/([\(\[{])\s+/g, '$1')
       .trim();
+    // A string literal reads the same in any quotes (carrick#2056).
+    return canonicalStringQuotes(collapsed);
   }
 
   /**
