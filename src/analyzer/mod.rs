@@ -108,27 +108,35 @@ pub struct DependencyConflict {
 pub struct RepoPackageInfo {
     pub repo_name: String,
     pub version: String,
+    /// The specifier as written ([`crate::packages::PackageInfo::spec`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spec: String,
     pub source_path: PathBuf,
 }
 
-/// Project a [`DependencyConflict`] into its wire finding. Tier mapping:
-/// `Critical` (a semver major spread) → `major`; `Warning`/`Info` only reach
-/// here for pins that didn't parse as comparable semver (see
-/// `is_reportable_conflict`), so both map to `unparseable`.
-fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
-    let tier = match conflict.severity {
+/// The wire tier of a conflict's severity: `Critical` (a semver major spread)
+/// → `major`; `Warning`/`Info` only reach a conflict for pins that didn't
+/// parse as comparable semver (see `is_reportable_conflict`), so both map to
+/// `unparseable`.
+fn conflict_tier_of(severity: &ConflictSeverity) -> &'static str {
+    match severity {
         ConflictSeverity::Critical => tier::MAJOR,
         ConflictSeverity::Warning | ConflictSeverity::Info => tier::UNPARSEABLE,
-    };
+    }
+}
+
+/// Project a [`DependencyConflict`] into its wire finding.
+fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
     Finding::dependency_conflict(
         conflict.package_name.clone(),
-        tier,
+        conflict_tier_of(&conflict.severity),
         conflict
             .repos
             .iter()
             .map(|repo| PackageVersionRef {
                 repo: repo.repo_name.clone(),
                 version: repo.version.clone(),
+                spec: repo.spec.clone(),
                 // A blob uploaded before paths were relativized at the
                 // source carries the runner checkout here; strip it so the
                 // conflict row cites `package.json`, not a runner path.
@@ -773,6 +781,18 @@ impl EdgeDirections {
     /// Whether the check filed anything at all for this edge.
     pub fn is_empty(&self) -> bool {
         self.request.is_none() && self.response.is_none()
+    }
+
+    /// Whether the check compared two known types on every direction it filed
+    /// for this edge. False when it filed none. A `Compatible` verdict on an
+    /// edge that is not resolved is the probe raising no diagnostic over an
+    /// `any` or `unknown`, which is no comparison (see `verdict_state_for`).
+    pub fn resolved(&self) -> bool {
+        !self.is_empty()
+            && [&self.request, &self.response]
+                .into_iter()
+                .flatten()
+                .all(|direction| direction.resolved)
     }
 }
 
@@ -1804,6 +1824,7 @@ impl Analyzer {
                 let repo_package_info = RepoPackageInfo {
                     repo_name: repo_name.clone(),
                     version: package_info.version.clone(),
+                    spec: package_info.spec.clone(),
                     source_path: package_info.source_path.clone(),
                 };
 
@@ -1817,23 +1838,33 @@ impl Analyzer {
         // Find packages with conflicting versions
         let mut conflicts = Vec::new();
         for (package_name, repo_infos) in package_versions {
-            if repo_infos.len() > 1 {
-                // Check if all versions are the same
-                let first_version = &repo_infos[0].version;
-                let has_conflicts = repo_infos.iter().any(|info| info.version != *first_version);
-
-                if has_conflicts && Self::is_reportable_conflict(&repo_infos) {
-                    let severity = Self::determine_conflict_severity(&repo_infos);
-                    conflicts.push(DependencyConflict {
-                        package_name,
-                        repos: repo_infos,
-                        severity,
-                    });
-                }
+            if let Some(severity) = Self::conflict_severity(&repo_infos) {
+                conflicts.push(DependencyConflict {
+                    package_name,
+                    repos: repo_infos,
+                    severity,
+                });
             }
         }
 
         conflicts
+    }
+
+    /// The severity one package's declarations conflict at, or `None` when
+    /// they are no conflict: fewer than two services declare it, every
+    /// version is the same string, or the difference is not reportable.
+    fn conflict_severity(repo_infos: &[RepoPackageInfo]) -> Option<ConflictSeverity> {
+        let first_version = &repo_infos.first()?.version;
+        let has_conflicts = repo_infos.iter().any(|info| info.version != *first_version);
+        (has_conflicts && Self::is_reportable_conflict(repo_infos))
+            .then(|| Self::determine_conflict_severity(repo_infos))
+    }
+
+    /// The wire tier one package's declarations conflict at, or `None` when
+    /// they are no conflict. The one grading rule: a PR run asks it again
+    /// about main's declarations (`pr_baseline::mark_dependency_conflicts`).
+    pub(crate) fn conflict_tier(repo_infos: &[RepoPackageInfo]) -> Option<&'static str> {
+        Self::conflict_severity(repo_infos).map(|severity| conflict_tier_of(&severity))
     }
 
     /// A cross-service version difference is only worth reporting when the
@@ -4124,6 +4155,7 @@ mod tests {
                 .map(|(i, v)| RepoPackageInfo {
                     repo_name: format!("repo-{i}"),
                     version: (*v).to_string(),
+                    spec: String::new(),
                     source_path: PathBuf::from("package.json"),
                 })
                 .collect()

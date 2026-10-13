@@ -177,6 +177,20 @@ pub struct PackageVersionRef {
     pub repo: String,
     pub version: String,
     pub source: String,
+    /// The specifier as written (`^4.0.0`), which `version` has lost the
+    /// operators of. Omitted when the stored copy carries none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spec: String,
+}
+
+/// One service of this repo whose written specifier for a conflicting package
+/// differs between main's copy and the PR (carrick#2283). A side is `null`
+/// where the service does not declare the package there.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SpecChange {
+    pub service: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 /// Dependency-conflict tier: `"major"` (semver-incompatible major spread,
@@ -353,6 +367,15 @@ pub enum Finding {
         /// [`tier::MAJOR`] or [`tier::UNPARSEABLE`].
         tier: String,
         versions: Vec<PackageVersionRef>,
+        /// The services of this repo whose specifier the PR changed
+        /// (carrick#2283). Empty on a run that is not a PR run, and when the
+        /// PR left the package alone.
+        changed_by_pr: Vec<SpecChange>,
+        /// Whether main has this conflict at the same tier (carrick#2283).
+        /// `None` on a run that is not a PR run, and when it could not tell.
+        on_main: Option<bool>,
+        /// Why a PR run could not tell. Never set beside `on_main`.
+        on_main_unknown: Option<OnMainUnknown>,
     },
     /// Multiple repos encode the same external contract (#379): every side of
     /// the match is a call site, so no indexed service defines the route and
@@ -559,8 +582,8 @@ impl Finding {
     }
 
     /// Whether main already had this finding (carrick-cloud#1369). Clears any
-    /// reason the run could not tell. No-op for every kind that carries no
-    /// pairing.
+    /// reason the run could not tell. No-op for every kind but the mismatches
+    /// and a dependency conflict (carrick#2283).
     pub fn set_on_main(&mut self, value: Option<bool>) {
         match self {
             Finding::TypeMismatch {
@@ -569,6 +592,11 @@ impl Finding {
                 ..
             }
             | Finding::MethodMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::DependencyConflict {
                 on_main,
                 on_main_unknown,
                 ..
@@ -581,7 +609,8 @@ impl Finding {
     }
 
     /// The run could not tell whether main already had this finding, and why
-    /// (carrick-cloud#1408). No-op for every kind that carries no pairing.
+    /// (carrick-cloud#1408). No-op for every kind but the mismatches and a
+    /// dependency conflict (carrick#2283).
     pub fn set_on_main_unknown(&mut self, reason: OnMainUnknown) {
         match self {
             Finding::TypeMismatch {
@@ -590,6 +619,11 @@ impl Finding {
                 ..
             }
             | Finding::MethodMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::DependencyConflict {
                 on_main,
                 on_main_unknown,
                 ..
@@ -633,6 +667,9 @@ impl Finding {
             package_name: package_name.into(),
             tier: tier.into(),
             versions,
+            changed_by_pr: Vec::new(),
+            on_main: None,
+            on_main_unknown: None,
         }
     }
 
@@ -835,10 +872,19 @@ impl Serialize for Finding {
                 package_name,
                 tier,
                 versions,
+                changed_by_pr,
+                on_main,
+                on_main_unknown,
             } => {
                 map.serialize_entry("package_name", package_name)?;
                 map.serialize_entry("tier", tier)?;
                 map.serialize_entry("versions", versions)?;
+                // Omitted when the PR changed nothing, and on a run that is
+                // not a PR run.
+                if !changed_by_pr.is_empty() {
+                    map.serialize_entry("changed_by_pr", changed_by_pr)?;
+                }
+                serialize_on_main(&mut map, on_main, on_main_unknown)?;
             }
             Finding::SharedExternalContract {
                 method,
@@ -965,6 +1011,198 @@ pub struct PrResultPayload {
     /// surface reading the payload can say "types were not read" instead of
     /// inferring it from an absent type verdict.
     pub has_types: bool,
+    /// Which index the run compared with (carrick#2284). `None` on a run
+    /// that is not a PR run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<Baseline>,
+    /// What the run checked (carrick#2284). `None` on a run that is not a PR
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<Checked>,
+    /// The functions the PR added, edited or removed (carrick#2285). `None`
+    /// on a run that is not a PR run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions: Option<FunctionsBlock>,
+}
+
+/// The functions a pull request added, edited or removed, named by comparing
+/// each changed file with the copy its base commit holds (carrick#2285), or
+/// why the run could not name them.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum FunctionsBlock {
+    Named(NamedFunctions),
+    Unknown { unknown: FunctionsUnknown },
+}
+
+/// Why a PR run could not name the functions the PR changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionsUnknown {
+    /// The run does not know the commit the PR's tree is based on.
+    NoBaseCommit,
+    /// Git could not read the base commit or a file in it: a clone that does
+    /// not hold it.
+    BaseUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct NamedFunctions {
+    /// At most [`MAX_CHANGED_FUNCTIONS`]: added before edited, exported
+    /// first, then by file and line.
+    pub changed: Vec<ChangedFunction>,
+    /// At most [`MAX_REMOVED_FUNCTIONS`], by file and name.
+    pub removed: Vec<FunctionRef>,
+    pub counts: FunctionCounts,
+}
+
+/// Most entries `functions.changed` carries.
+pub const MAX_CHANGED_FUNCTIONS: usize = 100;
+/// Most entries `functions.removed` carries.
+pub const MAX_REMOVED_FUNCTIONS: usize = 200;
+/// Most entries one function's `calls` or `called_by` carries.
+pub const MAX_FUNCTION_EDGES: usize = 50;
+
+/// A function by where the index holds it: the path the uploaded blob
+/// carries for its file, and its name as the index spells it
+/// (`Class.member` for a method).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FunctionRef {
+    pub file: String,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionChange {
+    Added,
+    Edited,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ChangedFunction {
+    pub file: String,
+    pub name: String,
+    pub line: u32,
+    pub end_line: u32,
+    pub change: FunctionChange,
+    pub exported: bool,
+    /// This run's description of the function, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// The file's path at the base commit, when git reports it renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_file: Option<String>,
+    /// The functions it calls, as far as the scan resolves them.
+    pub calls: Vec<FunctionRef>,
+    /// The functions in this repo's services that call it.
+    pub called_by: Vec<FunctionRef>,
+}
+
+/// How many functions the PR changed. `added`, `edited` and `removed` count
+/// every one, listed or not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FunctionCounts {
+    pub added: usize,
+    pub edited: usize,
+    pub removed: usize,
+    /// Listed entries of `changed` that carry no `intent`.
+    pub without_intent: usize,
+    /// Entries left out of `changed` by its cap.
+    pub omitted: usize,
+}
+
+/// The index a PR run compared with: main's copy of this repo and every
+/// peer's, by commit (carrick#2284). Two posts for one pull request can
+/// differ because either moved, and this is what shows it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Baseline {
+    /// The commit the PR's tree is based on; `null` when the run does not
+    /// know it.
+    pub base_sha: Option<String>,
+    pub copy: BaselineCopy,
+    /// One entry per stored service of this repo, sorted by service.
+    pub main_index: Vec<MainIndexEntry>,
+    pub peers: PeerIndexes,
+}
+
+/// Whether main's copy of this repo is main as the PR's base has it
+/// (`pr_baseline::MainCopy`), or absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineCopy {
+    Current,
+    Stale,
+    OtherScanner,
+    /// This repo has no index on main.
+    None,
+}
+
+/// One stored service of this repo in main's copy.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MainIndexEntry {
+    /// `null` for an unnamed service.
+    pub service: Option<String>,
+    pub commit: String,
+    /// Omitted when the copy states none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanner_version: Option<String>,
+    /// Written only when the copy was scanned from a tree with uncommitted
+    /// changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dirty: bool,
+}
+
+/// The peer indexes a run read, as a count and one value that moves when any
+/// of them does.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PeerIndexes {
+    pub count: usize,
+    /// Lowercase hex sha256 over the lines `repo|service|commit`, one per
+    /// peer index, sorted and newline-terminated. An unnamed service is the
+    /// empty string.
+    pub sha256: String,
+}
+
+/// What a PR run checked (carrick#2284).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Checked {
+    /// Direct producer-consumer pairs. Each one outside `not_compared` is one
+    /// type comparison this run made.
+    pub pairs: PairCounts,
+    /// SDK-mediated edges, whose verdict is carried from the match the
+    /// package's own call formed and is no comparison of its own. Omitted
+    /// when the run has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdk_pairs: Option<PairCounts>,
+    pub dependencies: DependencyCounts,
+}
+
+/// Operation pairs (HTTP, GraphQL, socket, pub/sub) with a producer or a
+/// consumer in one of this repo's services, by type verdict. A pair is one
+/// call site against one producer operation. The first three count pairs the
+/// type check reached and say what it answered; `not_compared` counts the
+/// pairs it did not reach, whatever the protocol. `compatible` holds only
+/// pairs compared over two known types: a compatible verdict over an `any`
+/// or `unknown` counts as `unverifiable`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PairCounts {
+    pub compatible: usize,
+    pub unverifiable: usize,
+    pub incompatible: usize,
+    pub not_compared: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DependencyCounts {
+    /// Packages one of this repo's services and at least one other service
+    /// both declare.
+    pub shared: usize,
+    /// Packages whose written specifier the PR changed in a service of this
+    /// repo. Omitted when the run cannot say: this repo has no index on main,
+    /// or main's copy is not main as the PR's base has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<usize>,
 }
 
 #[cfg(test)]
@@ -1235,6 +1473,7 @@ mod tests {
                         repo: "billing".to_string(),
                         version: "4.0.0".to_string(),
                         source: "package.json".to_string(),
+                        spec: String::new(),
                     }],
                 ),
                 Finding::dependency_conflict("typescript", tier::UNPARSEABLE, vec![]),
@@ -1269,6 +1508,9 @@ mod tests {
                 operations_indexed: false,
             },
             has_types: true,
+            baseline: None,
+            checked: None,
+            functions: None,
         };
 
         let v = serde_json::to_value(&payload).unwrap();
@@ -1387,6 +1629,61 @@ mod tests {
         );
     }
 
+    fn zod_conflict(spec: &str) -> Finding {
+        Finding::dependency_conflict(
+            "zod",
+            tier::MAJOR,
+            vec![PackageVersionRef {
+                repo: "api".to_string(),
+                version: "4.0.0".to_string(),
+                source: "services/api/package.json".to_string(),
+                spec: spec.to_string(),
+            }],
+        )
+    }
+
+    /// carrick#2283: a dependency conflict nobody marked, from a copy with no
+    /// written specifier, is byte for byte what it was before the PR fields
+    /// existed. Each field appears only when it has something to say, and
+    /// `on_main` never beside `on_main_unknown`.
+    #[test]
+    fn a_dependency_conflict_writes_its_pr_fields_only_when_set() {
+        let bytes = |finding: &Finding| serde_json::to_string(finding).unwrap();
+        const BARE: &str = r#"{"kind":"dependency_conflict","severity":"gap","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json"}]}"#;
+        assert_eq!(bytes(&zod_conflict("")), BARE);
+
+        const WRITTEN: &str = r#"{"kind":"dependency_conflict","severity":"gap","package_name":"zod","tier":"major","versions":[{"repo":"api","version":"4.0.0","source":"services/api/package.json","spec":"^4.0.0"}]"#;
+        let mut marked = zod_conflict("^4.0.0");
+        assert_eq!(bytes(&marked), format!("{WRITTEN}}}"));
+
+        marked.set_on_main(Some(false));
+        assert_eq!(bytes(&marked), format!(r#"{WRITTEN},"on_main":false}}"#));
+
+        let Finding::DependencyConflict { changed_by_pr, .. } = &mut marked else {
+            unreachable!()
+        };
+        changed_by_pr.push(SpecChange {
+            service: "api".to_string(),
+            from: Some("^3.22.0".to_string()),
+            to: None,
+        });
+        assert_eq!(
+            bytes(&marked),
+            format!(
+                r#"{WRITTEN},"changed_by_pr":[{{"service":"api","from":"^3.22.0","to":null}}],"on_main":false}}"#
+            )
+        );
+
+        marked.set_on_main_unknown(OnMainUnknown::MainIndexStale);
+        let value = serde_json::to_value(&marked).unwrap();
+        assert_eq!(value["on_main_unknown"], json!("main_index_stale"));
+        assert!(value.get("on_main").is_none(), "{value:#}");
+        marked.set_on_main(Some(true));
+        let value = serde_json::to_value(&marked).unwrap();
+        assert_eq!(value["on_main"], json!(true));
+        assert!(value.get("on_main_unknown").is_none(), "{value:#}");
+    }
+
     /// #455: a verified entry's `type_verdict` serializes to the exact
     /// lowercase strings the cloud PR-comment renderer keys its honest buckets
     /// on (`"compatible"` / `"unverifiable"` / `"incompatible"`), and is
@@ -1477,11 +1774,134 @@ mod tests {
                 operations_indexed: false,
             },
             has_types: true,
+            baseline: None,
+            checked: None,
+            functions: None,
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert!(v.get("run_id").is_none());
         assert_eq!(v["head_sha"], "a".repeat(40));
         assert_eq!(v["delta"], serde_json::Value::Null);
+    }
+
+    /// carrick#2284: a payload with neither member is byte for byte what it
+    /// was before they existed, and with both it carries them in the shape
+    /// the cloud reads, each optional part written only when it has something
+    /// to say.
+    #[test]
+    fn baseline_and_checked_are_written_only_when_the_run_states_them() {
+        let mut payload = PrResultPayload {
+            repo: "r".to_string(),
+            pr_number: 1,
+            head_sha: None,
+            run_id: None,
+            topology: Topology {
+                repo_name: "r".to_string(),
+                local_service_count: 1,
+                peer_repo_count: 0,
+            },
+            stats: ScanStats {
+                endpoints: 0,
+                calls: 0,
+            },
+            findings: vec![],
+            delta: None,
+            verified: vec![],
+            graphql: GraphqlStatus {
+                libraries: vec![],
+                operations_indexed: false,
+            },
+            has_types: true,
+            baseline: None,
+            checked: None,
+            functions: None,
+        };
+        const BARE: &str = r#"{"repo":"r","pr_number":1,"head_sha":null,"topology":{"repo_name":"r","local_service_count":1,"peer_repo_count":0},"stats":{"endpoints":0,"calls":0},"findings":[],"delta":null,"verified":[],"graphql":{"libraries":[],"operations_indexed":false},"has_types":true}"#;
+        assert_eq!(serde_json::to_string(&payload).unwrap(), BARE);
+
+        payload.baseline = Some(Baseline {
+            base_sha: Some("b".repeat(40)),
+            copy: BaselineCopy::Current,
+            main_index: vec![
+                MainIndexEntry {
+                    service: Some("api".to_string()),
+                    commit: "c".repeat(40),
+                    scanner_version: Some("0.3.113".to_string()),
+                    dirty: true,
+                },
+                MainIndexEntry {
+                    service: None,
+                    commit: "d".repeat(40),
+                    scanner_version: None,
+                    dirty: false,
+                },
+            ],
+            peers: PeerIndexes {
+                count: 12,
+                sha256: "e".repeat(64),
+            },
+        });
+        payload.checked = Some(Checked {
+            pairs: PairCounts {
+                compatible: 22,
+                unverifiable: 5,
+                incompatible: 1,
+                not_compared: 3,
+            },
+            sdk_pairs: Some(PairCounts {
+                compatible: 4,
+                unverifiable: 0,
+                incompatible: 1,
+                not_compared: 2,
+            }),
+            dependencies: DependencyCounts {
+                shared: 41,
+                changed: Some(2),
+            },
+        });
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            v["baseline"],
+            json!({
+                "base_sha": "b".repeat(40),
+                "copy": "current",
+                "main_index": [
+                    { "service": "api", "commit": "c".repeat(40), "scanner_version": "0.3.113", "dirty": true },
+                    { "service": null, "commit": "d".repeat(40) },
+                ],
+                "peers": { "count": 12, "sha256": "e".repeat(64) },
+            })
+        );
+        assert_eq!(
+            v["checked"],
+            json!({
+                "pairs": { "compatible": 22, "unverifiable": 5, "incompatible": 1, "not_compared": 3 },
+                "sdk_pairs": { "compatible": 4, "unverifiable": 0, "incompatible": 1, "not_compared": 2 },
+                "dependencies": { "shared": 41, "changed": 2 },
+            })
+        );
+
+        let Some(baseline) = &mut payload.baseline else {
+            unreachable!()
+        };
+        baseline.base_sha = None;
+        baseline.copy = BaselineCopy::None;
+        let Some(checked) = &mut payload.checked else {
+            unreachable!()
+        };
+        checked.dependencies.changed = None;
+        checked.sdk_pairs = None;
+        let v = serde_json::to_value(&payload).unwrap();
+        assert!(v["checked"].get("sdk_pairs").is_none(), "{v:#}");
+        assert_eq!(v["baseline"]["base_sha"], serde_json::Value::Null);
+        assert_eq!(v["baseline"]["copy"], "none");
+        assert_eq!(v["checked"]["dependencies"], json!({ "shared": 41 }));
+        for (copy, word) in [
+            (BaselineCopy::Stale, "stale"),
+            (BaselineCopy::OtherScanner, "other_scanner"),
+        ] {
+            assert_eq!(serde_json::to_value(copy).unwrap(), json!(word));
+        }
     }
 
     /// The wire spellings cloud#599 codes against, pinned exactly: a renderer

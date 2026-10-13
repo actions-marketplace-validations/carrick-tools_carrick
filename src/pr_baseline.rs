@@ -33,16 +33,20 @@
 //! files the PR left alone ([`untouched_reading`], carrick#1530): read as this
 //! run reads them, it counts as main's.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
-use crate::analyzer::ApiEndpointDetails;
-use crate::cloud_storage::{CloudRepoData, DirectionVerdict, ManifestTypeKind};
-use crate::findings::{Finding, OnMainUnknown};
+use crate::analyzer::{Analyzer, ApiEndpointDetails, CrossRepoMatch, RepoPackageInfo};
+use crate::cloud_storage::{CloudRepoData, DirectionVerdict, ManifestTypeKind, SdkEdge};
+use crate::findings::{
+    BaselineCopy, Finding, MainIndexEntry, OnMainUnknown, PairCounts, PeerIndexes, SpecChange,
+};
 use crate::operation::TypeVerdict;
+use crate::packages::{PackageInfo, Packages};
 
 /// A comparison bucket: kind, pairing, and the consumer file of one site.
 type SiteGroup = (&'static str, String, String);
@@ -258,6 +262,336 @@ pub fn mark_all_on_main(pr: &mut [Finding]) {
             finding.set_on_main(Some(true));
         }
     }
+}
+
+/// What each service of this repo declares, keyed by service id
+/// (`service_name`, else the repo), the key a dependency conflict names its
+/// versions by.
+pub type ServicePackages = BTreeMap<String, Packages>;
+
+/// The declarations of each stored or scanned service of this repo. A service
+/// with no package data declares nothing.
+pub fn service_packages(services: &[CloudRepoData]) -> ServicePackages {
+    services
+        .iter()
+        .map(|service| {
+            (
+                service
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| service.repo_name.clone()),
+                service.packages.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// What a PR run compares its dependency conflicts with (carrick#2283).
+#[derive(Clone, Debug)]
+pub struct DependencyBaseline {
+    /// What this run's services declare.
+    pub pr: ServicePackages,
+    /// What main's copy of them declares.
+    pub main: ServicePackages,
+    pub copy: MainCopy,
+}
+
+impl DependencyBaseline {
+    /// The services whose written specifier for `package` the PR changed.
+    /// Empty unless the copy is main as the PR's base has it, and a service
+    /// only one side holds is never named: see [`mark_dependency_conflicts`].
+    fn changes(&self, package: &str) -> Vec<SpecChange> {
+        if self.copy != MainCopy::Current {
+            return Vec::new();
+        }
+        self.pr
+            .iter()
+            .filter_map(|(service, pr)| {
+                let main = self.main.get(service)?;
+                spec_change(
+                    service,
+                    main.get_dependencies().get(package),
+                    pr.get_dependencies().get(package),
+                )
+            })
+            .collect()
+    }
+
+    /// How many packages the PR changed the written specifier of in a service
+    /// of this repo (carrick#2284), by the comparison [`Self::changes`] makes.
+    /// `None` when the copy is not main as the PR's base has it: a count
+    /// against it would be a guess, and zero a false claim.
+    pub fn changed_packages(&self) -> Option<usize> {
+        (self.copy == MainCopy::Current).then(|| {
+            let declared: BTreeSet<&String> = self
+                .pr
+                .values()
+                .chain(self.main.values())
+                .flat_map(|packages| packages.get_dependencies().keys())
+                .collect();
+            declared
+                .into_iter()
+                .filter(|package| !self.changes(package).is_empty())
+                .count()
+        })
+    }
+}
+
+/// How many packages one of this repo's services (`ours`) and at least one
+/// other service both declare (carrick#2284). `all` is every service in the
+/// run, this repo's and the peers', by service id; the other service may be a
+/// sibling in this repo.
+pub fn shared_packages(ours: &BTreeSet<String>, all: &ServicePackages) -> usize {
+    let mut declarers: BTreeMap<&String, (usize, bool)> = BTreeMap::new();
+    for (service, packages) in all {
+        for package in packages.get_dependencies().keys() {
+            let entry = declarers.entry(package).or_default();
+            entry.0 += 1;
+            entry.1 |= ours.contains(service);
+        }
+    }
+    declarers
+        .values()
+        .filter(|(services, ours)| *ours && *services > 1)
+        .count()
+}
+
+/// One entry per stored service of this repo in main's copy, sorted by
+/// service (carrick#2284).
+pub fn main_index(main_self: &[CloudRepoData]) -> Vec<MainIndexEntry> {
+    let mut entries: Vec<MainIndexEntry> = main_self
+        .iter()
+        .map(|service| MainIndexEntry {
+            service: service.service_name.clone(),
+            commit: service.commit_hash.clone(),
+            scanner_version: service.scanner_version.clone(),
+            dirty: service.dirty == Some(true),
+        })
+        .collect();
+    entries.sort_by(|a, b| (&a.service, &a.commit).cmp(&(&b.service, &b.commit)));
+    entries
+}
+
+/// The peer indexes a run read: how many, and one value that is the same for
+/// the same indexes in any order and moves when one of them does
+/// (carrick#2284).
+pub fn peer_indexes(peers: &[CloudRepoData]) -> PeerIndexes {
+    let mut lines: Vec<String> = peers
+        .iter()
+        .map(|peer| {
+            format!(
+                "{}|{}|{}\n",
+                peer.repo_name,
+                peer.service_name.as_deref().unwrap_or_default(),
+                peer.commit_hash
+            )
+        })
+        .collect();
+    lines.sort();
+    PeerIndexes {
+        count: peers.len(),
+        sha256: format!("{:x}", Sha256::digest(lines.concat().as_bytes())),
+    }
+}
+
+/// The wire word for main's copy, `None` being no index of this repo on main.
+pub fn baseline_copy(copy: Option<MainCopy>) -> BaselineCopy {
+    match copy {
+        Some(MainCopy::Current) => BaselineCopy::Current,
+        Some(MainCopy::Stale) => BaselineCopy::Stale,
+        Some(MainCopy::OtherScanner) => BaselineCopy::OtherScanner,
+        None => BaselineCopy::None,
+    }
+}
+
+/// What a verdict counts as: itself, except that `Compatible` over types the
+/// check could not fully read is `Unverifiable`. The probe raises no
+/// diagnostic against an `any` or `unknown`, so such a verdict compared
+/// nothing, and a count of compatible pairs must not hold it.
+fn counted_as(verdict: TypeVerdict, resolved: bool) -> TypeVerdict {
+    match verdict {
+        TypeVerdict::Compatible if !resolved => TypeVerdict::Unverifiable,
+        other => other,
+    }
+}
+
+fn tally(verdicts: impl Iterator<Item = Option<TypeVerdict>>) -> PairCounts {
+    let mut counts = PairCounts::default();
+    for verdict in verdicts {
+        match verdict {
+            Some(TypeVerdict::Compatible) => counts.compatible += 1,
+            Some(TypeVerdict::Unverifiable) => counts.unverifiable += 1,
+            Some(TypeVerdict::Incompatible) => counts.incompatible += 1,
+            None => counts.not_compared += 1,
+        }
+    }
+    counts
+}
+
+/// Count the operation pairs with a producer or a consumer in one of this
+/// repo's services (`ours`, by service id), by type verdict (carrick#2284).
+///
+/// A pair is one matched call site against one producer operation, whatever
+/// the protocol, and each one counted outside `not_compared` is one type
+/// comparison this run made. One the type check did not reach has no verdict
+/// and counts as `not_compared`. `compatible` holds only pairs `resolved`
+/// says were compared over two known types on every direction
+/// (`EdgeDirections::resolved`); a compatible verdict that was not counts as
+/// `unverifiable`. A shared external contract is not counted at all: both of
+/// its sides are call sites, so there is no producer for a pair to be with.
+pub fn pair_counts(
+    matches: &[CrossRepoMatch],
+    ours: &BTreeSet<String>,
+    resolved: impl Fn(&CrossRepoMatch) -> bool,
+) -> PairCounts {
+    tally(
+        matches
+            .iter()
+            .filter(|pair| pair.relationship == carrick_match::MatchRelationship::ProducerConsumer)
+            .filter(|pair| ours.contains(&pair.producer_repo) || ours.contains(&pair.consumer_repo))
+            .map(|pair| {
+                pair.type_verdict
+                    .map(|verdict| counted_as(verdict, resolved(pair)))
+            }),
+    )
+}
+
+/// Count the SDK-mediated edges with a consumer or a producer in one of this
+/// repo's services, by type verdict (carrick#2284). `None` when there is none.
+///
+/// Counted apart from [`pair_counts`] because an edge's verdict is carried
+/// from the match the package's own call formed: counting it beside that
+/// match would state two comparisons where one ran. Each edge counts once,
+/// under the worse of the directions it states, each read as [`pair_counts`]
+/// reads a verdict, and as `not_compared` when it states neither. Its sides
+/// are its consumer and its producer, never the package's repo.
+pub fn sdk_pair_counts(sdk_edges: &[SdkEdge], ours: &BTreeSet<String>) -> Option<PairCounts> {
+    let mut edges = sdk_edges
+        .iter()
+        .filter(|edge| ours.contains(&edge.producer_repo) || ours.contains(&edge.consumer_repo))
+        .peekable();
+    edges.peek()?;
+    Some(tally(edges.map(|edge| {
+        let stated = |direction: &Option<DirectionVerdict>| {
+            direction
+                .as_ref()
+                .map(|direction| counted_as(direction.verdict, direction.resolved))
+        };
+        match (stated(&edge.request), stated(&edge.response)) {
+            (Some(request), Some(response)) => Some(request.combine(response)),
+            (one, other) => one.or(other),
+        }
+    })))
+}
+
+/// Mark each dependency conflict of a PR run with whether main has it, and
+/// with the services of this repo whose specifier the PR changed
+/// (carrick#2283). `baseline` is `None` when this repo has no index on main.
+///
+/// Main's side needs no analysis. It is the finding's own versions with this
+/// repo's entries replaced by what main's copy declares, graded by the rule
+/// that graded the finding (`Analyzer::conflict_tier`). Main has the conflict
+/// when that grades at the finding's tier. That answer holds whatever the copy
+/// is; "main does not have it" is only said of a copy that is main as the PR's
+/// base has it, as for a mismatch. A PR that leaves the manifests alone
+/// replaces each entry with itself, so its conflicts are all main's.
+///
+/// Both claims a reader acts on fail closed:
+///
+/// - A service is named as changed only when both sides hold it and the copy
+///   is main as the PR's base has it. Against any other copy the difference
+///   may be main's own since the copy was written. A service only one side
+///   holds may be one the PR adds or removes, or one the copy is missing, and
+///   the declarations cannot tell which.
+/// - "Main does not have it" is not said of a conflict that names a service
+///   of this run main's copy has no entry for. That reads as no index of it
+///   on main ([`OnMainUnknown::NoMainIndex`]).
+pub fn mark_dependency_conflicts(pr: &mut [Finding], baseline: Option<&DependencyBaseline>) {
+    for finding in pr.iter_mut() {
+        let Finding::DependencyConflict {
+            package_name,
+            tier,
+            versions,
+            changed_by_pr,
+            ..
+        } = finding
+        else {
+            continue;
+        };
+        let Some(baseline) = baseline else {
+            finding.set_on_main_unknown(OnMainUnknown::NoMainIndex);
+            continue;
+        };
+        let declared = |side: &'_ ServicePackages, service: &str| {
+            side.get(service)
+                .and_then(|packages| packages.get_dependencies().get(package_name.as_str()))
+                .cloned()
+        };
+        let ours: BTreeSet<&String> = baseline.pr.keys().chain(baseline.main.keys()).collect();
+        let mut mains: Vec<RepoPackageInfo> = versions
+            .iter()
+            .filter(|entry| !ours.contains(&entry.repo))
+            .map(|entry| RepoPackageInfo {
+                repo_name: entry.repo.clone(),
+                version: entry.version.clone(),
+                spec: entry.spec.clone(),
+                source_path: entry.source.clone().into(),
+            })
+            .collect();
+        // A service of this run the conflict names, which main's copy has no
+        // entry for: new in the PR, or missing from the copy.
+        let unplaced = versions.iter().any(|entry| {
+            baseline.pr.contains_key(&entry.repo) && !baseline.main.contains_key(&entry.repo)
+        });
+        for service in &ours {
+            if let Some(info) = declared(&baseline.main, service) {
+                mains.push(RepoPackageInfo {
+                    repo_name: service.to_string(),
+                    version: info.version,
+                    spec: info.spec,
+                    source_path: info.source_path,
+                });
+            }
+        }
+        let on_main = Analyzer::conflict_tier(&mains) == Some(tier.as_str());
+        *changed_by_pr = baseline.changes(package_name);
+        match (on_main, baseline.copy) {
+            (true, _) => finding.set_on_main(Some(true)),
+            (false, MainCopy::Current) if unplaced => {
+                finding.set_on_main_unknown(OnMainUnknown::NoMainIndex)
+            }
+            (false, MainCopy::Current) => finding.set_on_main(Some(false)),
+            (false, MainCopy::Stale) => finding.set_on_main_unknown(OnMainUnknown::MainIndexStale),
+            (false, MainCopy::OtherScanner) => {
+                finding.set_on_main_unknown(OnMainUnknown::MainIndexOtherScanner)
+            }
+        }
+    }
+}
+
+/// The change in one service's written specifier for a package, or `None`
+/// when both sides state the same one. A copy stored before the specifier was
+/// kept has only the cleaned version, so against such a side the versions are
+/// compared and reported: `^4.0.0` against a stored `4.0.0` is no change.
+fn spec_change(
+    service: &str,
+    from: Option<&PackageInfo>,
+    to: Option<&PackageInfo>,
+) -> Option<SpecChange> {
+    let by_version = [from, to].iter().flatten().any(|info| info.spec.is_empty());
+    let written = |info: &PackageInfo| {
+        if by_version {
+            info.version.clone()
+        } else {
+            info.spec.clone()
+        }
+    };
+    let (from, to) = (from.map(written), to.map(written));
+    (from != to).then(|| SpecChange {
+        service: service.to_string(),
+        from,
+        to,
+    })
 }
 
 /// Whether any finding carries a pairing to compare. Without one, the
@@ -1520,5 +1854,728 @@ mod tests {
         mark_all_unknown(&mut pr, OnMainUnknown::NoMainIndex);
         assert_eq!(unknown(&pr[0]), Some(OnMainUnknown::NoMainIndex));
         assert_eq!(unknown(&pr[1]), None);
+    }
+}
+
+/// carrick#2283. One repo with two services, `api` and `web`, and one peer,
+/// `billing`.
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    use crate::findings::{PackageVersionRef, tier};
+    use serde_json::json;
+
+    /// A manifest's dependencies as the scan stores them: the specifier as
+    /// written, and the version with its range operator gone.
+    fn packages(declared: &[(&str, &str)]) -> Packages {
+        stored(
+            &declared
+                .iter()
+                .map(|(name, spec)| (*name, spec.trim_start_matches(['^', '~']), *spec))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Dependencies as `(name, version, spec)`, for a copy stored with no
+    /// written specifier.
+    fn stored(declared: &[(&str, &str, &str)]) -> Packages {
+        Packages {
+            merged_dependencies: declared
+                .iter()
+                .map(|(name, version, spec)| {
+                    (
+                        name.to_string(),
+                        PackageInfo {
+                            name: name.to_string(),
+                            version: version.to_string(),
+                            spec: spec.to_string(),
+                            source_path: "package.json".into(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Packages::default()
+        }
+    }
+
+    fn services(declared: &[(&str, Packages)]) -> ServicePackages {
+        declared
+            .iter()
+            .map(|(service, packages)| (service.to_string(), packages.clone()))
+            .collect()
+    }
+
+    /// The conflict the PR run found: every service's declaration of
+    /// `package`, this repo's as the PR has them.
+    fn conflict(
+        package: &str,
+        tier: &str,
+        pr: &ServicePackages,
+        peers: &[(&str, &str)],
+    ) -> Finding {
+        let ours = pr.iter().filter_map(|(service, packages)| {
+            let info = packages.get_dependencies().get(package)?;
+            Some((service.clone(), info.version.clone(), info.spec.clone()))
+        });
+        let theirs = peers.iter().map(|(service, spec)| {
+            (
+                service.to_string(),
+                spec.trim_start_matches(['^', '~']).to_string(),
+                spec.to_string(),
+            )
+        });
+        Finding::dependency_conflict(
+            package,
+            tier,
+            ours.chain(theirs)
+                .map(|(repo, version, spec)| PackageVersionRef {
+                    source: format!("{repo}/package.json"),
+                    repo,
+                    version,
+                    spec,
+                })
+                .collect(),
+        )
+    }
+
+    /// Mark one conflict and return it as the cloud reads it.
+    fn marked(
+        package: &str,
+        tier: &str,
+        peers: &[(&str, &str)],
+        pr: &ServicePackages,
+        main: Option<(&ServicePackages, MainCopy)>,
+    ) -> serde_json::Value {
+        let mut findings = vec![conflict(package, tier, pr, peers)];
+        let baseline = main.map(|(main, copy)| DependencyBaseline {
+            pr: pr.clone(),
+            main: main.clone(),
+            copy,
+        });
+        mark_dependency_conflicts(&mut findings, baseline.as_ref());
+        serde_json::to_value(&findings[0]).unwrap()
+    }
+
+    const BILLING_ZOD: &[(&str, &str)] = &[("billing", "^3.22.0")];
+    const BILLING_REACT: &[(&str, &str)] = &[("billing", "^18.2.0")];
+
+    /// `api` moves `zod` across a major while the peer stays.
+    fn zod_bump() -> (ServicePackages, ServicePackages) {
+        let web = packages(&[("react", "^18.2.0")]);
+        let main = services(&[
+            ("api", packages(&[("zod", "^3.22.0")])),
+            ("web", web.clone()),
+        ]);
+        let pr = services(&[("api", packages(&[("zod", "^4.0.0")])), ("web", web)]);
+        (main, pr)
+    }
+
+    #[test]
+    fn a_conflict_the_pr_made_is_not_on_main_and_names_the_service() {
+        let (main, pr) = zod_bump();
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(false), "{finding:#}");
+        assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([{ "service": "api", "from": "^3.22.0", "to": "^4.0.0" }]),
+            "{finding:#}"
+        );
+        assert_eq!(finding["versions"][0]["spec"], json!("^4.0.0"));
+    }
+
+    #[test]
+    fn a_conflict_the_pr_left_alone_is_on_main_and_names_no_service() {
+        let side = services(&[
+            ("api", packages(&[("zod", "^3.22.0")])),
+            ("web", packages(&[("react", "^17.0.2")])),
+        ]);
+        // Whatever the copy: a stale one still shows the conflict.
+        for copy in [MainCopy::Current, MainCopy::Stale, MainCopy::OtherScanner] {
+            let finding = marked(
+                "react",
+                tier::MAJOR,
+                BILLING_REACT,
+                &side,
+                Some((&side, copy)),
+            );
+            assert_eq!(finding["on_main"], json!(true), "{copy:?}: {finding:#}");
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+            assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_the_pr_moved_without_making_is_on_main_and_names_the_service() {
+        let main = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let pr = services(&[("web", packages(&[("react", "^16.14.0")]))]);
+        let finding = marked(
+            "react",
+            tier::MAJOR,
+            BILLING_REACT,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([{ "service": "web", "from": "^17.0.2", "to": "^16.14.0" }]),
+            "{finding:#}"
+        );
+    }
+
+    #[test]
+    fn a_copy_that_is_not_main_never_calls_a_conflict_introduced() {
+        let (main, pr) = zod_bump();
+        for (copy, reason) in [
+            (MainCopy::Stale, "main_index_stale"),
+            (MainCopy::OtherScanner, "main_index_other_scanner"),
+        ] {
+            let finding = marked("zod", tier::MAJOR, BILLING_ZOD, &pr, Some((&main, copy)));
+            assert_eq!(finding["on_main_unknown"], json!(reason), "{finding:#}");
+            assert!(finding.get("on_main").is_none(), "{finding:#}");
+            // The difference may be main's own since the copy was written.
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+        }
+    }
+
+    /// The same holds when such a copy does show the conflict.
+    #[test]
+    fn a_copy_that_is_not_main_names_no_service_as_changed() {
+        let main = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let pr = services(&[("web", packages(&[("react", "^16.14.0")]))]);
+        for copy in [MainCopy::Stale, MainCopy::OtherScanner] {
+            let finding = marked(
+                "react",
+                tier::MAJOR,
+                BILLING_REACT,
+                &pr,
+                Some((&main, copy)),
+            );
+            assert_eq!(finding["on_main"], json!(true), "{copy:?}: {finding:#}");
+            assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+        }
+    }
+
+    /// A service main's copy has no entry for may be new in the PR or missing
+    /// from the copy. Its conflict is not called introduced, and it is not
+    /// named as changed.
+    #[test]
+    fn a_service_mains_copy_does_not_hold_is_never_called_introduced() {
+        let api = packages(&[("zod", "^3.22.0")]);
+        let main = services(&[("api", api.clone())]);
+        let pr = services(&[("api", api), ("worker", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(
+            finding["on_main_unknown"],
+            json!("no_main_index"),
+            "{finding:#}"
+        );
+        assert!(finding.get("on_main").is_none(), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+        // Main conflicts without it: that much is known.
+        let api = packages(&[("zod", "^4.0.0")]);
+        let main = services(&[("api", api.clone())]);
+        let pr = services(&[("api", api), ("worker", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+    }
+
+    #[test]
+    fn a_run_with_no_main_index_says_so() {
+        let (_, pr) = zod_bump();
+        let finding = marked("zod", tier::MAJOR, BILLING_ZOD, &pr, None);
+        assert_eq!(
+            finding["on_main_unknown"],
+            json!("no_main_index"),
+            "{finding:#}"
+        );
+        assert!(finding.get("on_main").is_none(), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+    }
+
+    /// A copy stored before the specifier was kept holds only the cleaned
+    /// version, and `^17.0.2` against its `17.0.2` is no change.
+    #[test]
+    fn a_copy_with_no_written_specifier_is_compared_by_version() {
+        let pr = services(&[("web", packages(&[("react", "^17.0.2")]))]);
+        let main = services(&[("web", stored(&[("react", "17.0.2", "")]))]);
+        let finding = marked(
+            "react",
+            tier::MAJOR,
+            BILLING_REACT,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+        let main = services(&[("web", stored(&[("react", "16.14.0", "")]))]);
+        let finding = marked(
+            "react",
+            tier::MAJOR,
+            BILLING_REACT,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([{ "service": "web", "from": "16.14.0", "to": "17.0.2" }]),
+            "{finding:#}"
+        );
+    }
+
+    /// A service both sides hold that starts or stops declaring the package
+    /// has no specifier on one side. A service only main's copy holds
+    /// (`jobs`) is not named.
+    #[test]
+    fn a_service_that_adds_or_drops_the_package_has_a_null_side() {
+        let main = services(&[
+            ("api", packages(&[("zod", "^4.0.0")])),
+            ("web", packages(&[])),
+            ("jobs", packages(&[("zod", "^4.0.0")])),
+        ]);
+        let pr = services(&[
+            ("api", packages(&[])),
+            ("web", packages(&[("zod", "^4.0.0")])),
+        ]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(true), "{finding:#}");
+        assert_eq!(
+            finding["changed_by_pr"],
+            json!([
+                { "service": "api", "from": "^4.0.0", "to": null },
+                { "service": "web", "from": null, "to": "^4.0.0" },
+            ]),
+            "{finding:#}"
+        );
+    }
+
+    /// Main is graded by the finding's own rule: two services on one pin that
+    /// is not semver are no conflict, and a conflict at another tier is not
+    /// this one.
+    #[test]
+    fn main_is_graded_by_the_rule_that_graded_the_finding() {
+        let peer: &[(&str, &str)] = &[("billing", "workspace:*")];
+        let main = services(&[("api", packages(&[("ui-kit", "workspace:*")]))]);
+        let pr = services(&[("api", packages(&[("ui-kit", "github:acme/ui-kit")]))]);
+        let finding = marked(
+            "ui-kit",
+            tier::UNPARSEABLE,
+            peer,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(false), "{finding:#}");
+
+        let main = services(&[("api", packages(&[("zod", "next")]))]);
+        let pr = services(&[("api", packages(&[("zod", "^4.0.0")]))]);
+        let finding = marked(
+            "zod",
+            tier::MAJOR,
+            BILLING_ZOD,
+            &pr,
+            Some((&main, MainCopy::Current)),
+        );
+        assert_eq!(finding["on_main"], json!(false), "{finding:#}");
+    }
+
+    /// Each marking keeps to its own kind: a mismatch is not marked from the
+    /// declarations, and a dependency conflict is not marked from main's
+    /// analysis or its failure.
+    #[test]
+    fn a_mismatch_and_a_dependency_conflict_are_marked_apart() {
+        let (main, pr) = zod_bump();
+        let pair = "orders-api|PUT|/orders/:id~web|src/a.ts|method";
+        let mismatch = Finding::method_mismatch(
+            "PUT",
+            "/orders/:id",
+            None,
+            vec!["src/a.ts:3".to_string()],
+            "POST",
+        )
+        .with_pair(Some(pair.to_string()));
+        let mut findings = vec![
+            mismatch.clone(),
+            conflict("zod", tier::MAJOR, &pr, BILLING_ZOD),
+        ];
+        let baseline = DependencyBaseline {
+            pr,
+            main,
+            copy: MainCopy::Current,
+        };
+        mark_dependency_conflicts(&mut findings, Some(&baseline));
+        assert_eq!(findings[0], mismatch);
+        let conflict = findings[1].clone();
+
+        mark_all_unknown(&mut findings, OnMainUnknown::MainSideFailed);
+        assert_eq!(findings[1], conflict);
+        mark_all_on_main(&mut findings);
+        assert_eq!(findings[1], conflict);
+        mark_on_main(&mut findings, &MainSide::default(), MainCopy::Stale);
+        assert_eq!(findings[1], conflict);
+    }
+
+    /// carrick#2284: the count of changed packages is the comparison the
+    /// marking makes, and is not stated against a copy that is not main.
+    #[test]
+    fn changed_packages_counts_what_the_marking_names() {
+        let (main, mut pr) = zod_bump();
+        // A package only the PR's new service declares is not a change.
+        pr.insert("worker".to_string(), packages(&[("ioredis", "^5.0.0")]));
+        let mut baseline = DependencyBaseline {
+            pr,
+            main,
+            copy: MainCopy::Current,
+        };
+        assert_eq!(baseline.changed_packages(), Some(1));
+        for copy in [MainCopy::Stale, MainCopy::OtherScanner] {
+            baseline.copy = copy;
+            assert_eq!(baseline.changed_packages(), None, "{copy:?}");
+        }
+
+        let (main, _) = zod_bump();
+        let unchanged = DependencyBaseline {
+            pr: main.clone(),
+            main,
+            copy: MainCopy::Current,
+        };
+        assert_eq!(unchanged.changed_packages(), Some(0));
+    }
+
+    /// A package is shared when one of this repo's services and any other
+    /// service declare it, a sibling in this repo included.
+    #[test]
+    fn shared_packages_counts_what_this_repo_declares_with_another_service() {
+        let all = services(&[
+            ("api", packages(&[("zod", "^4.0.0"), ("react", "^18.2.0")])),
+            (
+                "web",
+                packages(&[("react", "^18.2.0"), ("lodash", "^4.17.21")]),
+            ),
+            (
+                "billing",
+                packages(&[("zod", "^3.22.0"), ("express", "^4.18.0")]),
+            ),
+            ("ledger", packages(&[("express", "^4.18.0")])),
+        ]);
+        let ours: BTreeSet<String> = ["api", "web"].map(String::from).into();
+        // `zod` with a peer and `react` with a sibling. `lodash` is ours
+        // alone, and `express` is shared between two peers.
+        assert_eq!(shared_packages(&ours, &all), 2);
+    }
+}
+
+/// carrick#2284: what a PR result says of the index it compared with and of
+/// the pairs it checked.
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use crate::findings::BaselineCopy;
+    use serde_json::json;
+
+    fn stored(
+        repo: &str,
+        service: Option<&str>,
+        commit: &str,
+        scanner: Option<&str>,
+        dirty: bool,
+    ) -> CloudRepoData {
+        serde_json::from_value(json!({
+            "repo_name": repo,
+            "service_name": service,
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-25T14:23:32Z",
+            "commit_hash": commit,
+            "scanner_version": scanner,
+            "dirty": dirty,
+        }))
+        .expect("a stored copy reads back")
+    }
+
+    const THIS: Option<&str> = Some(env!("CARGO_PKG_VERSION"));
+
+    /// Two services stored at two commits by one scanner version.
+    #[test]
+    fn main_index_names_each_stored_service_by_commit() {
+        let main = vec![
+            stored("shop", Some("web"), "bbbb2222", THIS, false),
+            stored("shop", Some("api"), "aaaa1111", THIS, false),
+        ];
+        assert_eq!(
+            serde_json::to_value(main_index(&main)).unwrap(),
+            json!([
+                { "service": "api", "commit": "aaaa1111", "scanner_version": env!("CARGO_PKG_VERSION") },
+                { "service": "web", "commit": "bbbb2222", "scanner_version": env!("CARGO_PKG_VERSION") },
+            ])
+        );
+        let copy = main_copy(&main, None, |_, _| None, || true);
+        assert_eq!(copy, MainCopy::Current);
+        assert_eq!(baseline_copy(Some(copy)), BaselineCopy::Current);
+
+        // An unnamed service, a copy that states no scanner, a dirty tree.
+        let main = vec![stored("shop", None, "cccc3333", None, true)];
+        assert_eq!(
+            serde_json::to_value(main_index(&main)).unwrap(),
+            json!([{ "service": null, "commit": "cccc3333", "dirty": true }])
+        );
+        let copy = main_copy(&main, None, |_, _| None, || true);
+        assert_eq!(copy, MainCopy::Stale);
+        assert_eq!(baseline_copy(Some(copy)), BaselineCopy::Stale);
+        assert_eq!(
+            baseline_copy(Some(MainCopy::OtherScanner)),
+            BaselineCopy::OtherScanner
+        );
+        assert_eq!(baseline_copy(None), BaselineCopy::None);
+    }
+
+    #[test]
+    fn the_peer_value_follows_the_indexes_and_not_their_order() {
+        let billing = stored("billing", None, "1111", THIS, false);
+        let ledger_api = stored("ledger", Some("api"), "2222", THIS, false);
+        let ledger_jobs = stored("ledger", Some("jobs"), "3333", THIS, false);
+        let one = peer_indexes(&[billing.clone(), ledger_api.clone(), ledger_jobs.clone()]);
+        let other = peer_indexes(&[ledger_jobs.clone(), billing.clone(), ledger_api.clone()]);
+        assert_eq!(one, other);
+        assert_eq!(one.count, 3);
+        // The lines it is taken over, so a reader can compute it too.
+        assert_eq!(
+            one.sha256,
+            format!(
+                "{:x}",
+                Sha256::digest(b"billing||1111\nledger|api|2222\nledger|jobs|3333\n")
+            )
+        );
+
+        let moved = stored("ledger", Some("jobs"), "4444", THIS, false);
+        let after = peer_indexes(&[billing, ledger_api, moved]);
+        assert_eq!(after.count, 3);
+        assert_ne!(after.sha256, one.sha256);
+
+        assert_eq!(peer_indexes(&[]).count, 0);
+    }
+
+    fn pair(
+        producer: &str,
+        consumer: &str,
+        path: &str,
+        verdict: Option<TypeVerdict>,
+    ) -> CrossRepoMatch {
+        CrossRepoMatch {
+            producer_repo: producer.to_string(),
+            producer_key: format!("http|GET|{path}"),
+            consumer_repo: consumer.to_string(),
+            consumer_key: format!("http|GET|{path}"),
+            consumer_location: Some("src/client.ts:3".to_string()),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: verdict,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        }
+    }
+
+    fn sdk_edge(
+        consumer: &str,
+        producer: &str,
+        request: Option<(&str, bool)>,
+        response: Option<(&str, bool)>,
+    ) -> SdkEdge {
+        let direction = |stated: Option<(&str, bool)>| {
+            stated.map(|(verdict, resolved)| json!({ "verdict": verdict, "resolved": resolved }))
+        };
+        serde_json::from_value(json!({
+            "consumer_repo": consumer,
+            "consumer_location": "src/pay.ts:9",
+            "package": "@acme/ledger-sdk",
+            "callee": "ledger.payments.create",
+            "sdk_repo": "ledger-sdk",
+            "sdk_member": "payments.create",
+            "sdk_location": "src/index.ts:4",
+            "producer_repo": producer,
+            "producer_key": "http|POST|/v1/payments",
+            "request": direction(request),
+            "response": direction(response),
+            "scanner_version": env!("CARGO_PKG_VERSION"),
+        }))
+        .expect("an SDK edge reads back")
+    }
+
+    fn ours() -> BTreeSet<String> {
+        ["api", "web"].map(String::from).into()
+    }
+
+    fn counts(
+        compatible: usize,
+        unverifiable: usize,
+        incompatible: usize,
+        not: usize,
+    ) -> PairCounts {
+        PairCounts {
+            compatible,
+            unverifiable,
+            incompatible,
+            not_compared: not,
+        }
+    }
+
+    #[test]
+    fn pairs_with_a_side_in_this_repo_are_counted_by_verdict() {
+        let mut shared_contract = pair("web", "billing", "/v2/rates", None);
+        shared_contract.relationship = carrick_match::MatchRelationship::SharedExternalContract;
+        let matches = vec![
+            pair("api", "billing", "/orders", Some(TypeVerdict::Compatible)),
+            pair(
+                "billing",
+                "web",
+                "/invoices",
+                Some(TypeVerdict::Unverifiable),
+            ),
+            // Both sides in this repo: one pair, counted once.
+            pair("api", "web", "/users", Some(TypeVerdict::Incompatible)),
+            pair("api", "billing", "/health", None),
+            // Between two peers.
+            pair(
+                "billing",
+                "ledger",
+                "/entries",
+                Some(TypeVerdict::Compatible),
+            ),
+            // No producer to be a pair with.
+            shared_contract,
+        ];
+        assert_eq!(pair_counts(&matches, &ours(), |_| true), counts(1, 1, 1, 1));
+        assert_eq!(
+            pair_counts(&matches, &BTreeSet::new(), |_| true),
+            PairCounts::default()
+        );
+    }
+
+    /// The probe raises no diagnostic over an `any`, so a compatible verdict
+    /// the check did not reach over two known types compared nothing. It
+    /// counts as unverifiable. The other verdicts count as they read.
+    #[test]
+    fn a_compatible_verdict_over_unknown_types_counts_as_unverifiable() {
+        let matches = vec![
+            pair("api", "billing", "/orders", Some(TypeVerdict::Compatible)),
+            pair("api", "billing", "/carts", Some(TypeVerdict::Compatible)),
+            pair("api", "billing", "/users", Some(TypeVerdict::Incompatible)),
+            pair("api", "billing", "/health", None),
+        ];
+        let known = |pair: &CrossRepoMatch| pair.producer_key.ends_with("/orders");
+        assert_eq!(pair_counts(&matches, &ours(), known), counts(1, 1, 1, 1));
+    }
+
+    /// What the engine asks of each pair: every direction the check filed
+    /// compared two known types, and it filed at least one.
+    #[test]
+    fn an_edge_is_resolved_only_when_every_filed_direction_is() {
+        use crate::analyzer::{EdgeDirections, PairDirectionOutcome};
+        let direction = |resolved: bool| {
+            Some(PairDirectionOutcome {
+                verdict: TypeVerdict::Compatible,
+                reason: None,
+                resolved,
+                unresolved_reason: None,
+                notes: Vec::new(),
+                producer_wider: false,
+            })
+        };
+        let edge = |request, response| EdgeDirections { request, response };
+        assert!(edge(direction(true), direction(true)).resolved());
+        assert!(edge(None, direction(true)).resolved());
+        assert!(!edge(direction(true), direction(false)).resolved());
+        assert!(!edge(direction(false), None).resolved());
+        assert!(!edge(None, None).resolved());
+    }
+
+    const KNOWN: bool = true;
+
+    #[test]
+    fn an_sdk_edge_counts_once_under_its_worse_direction() {
+        let worse = |request, response| {
+            sdk_pair_counts(&[sdk_edge("web", "billing", request, response)], &ours())
+                .expect("the edge is this repo's")
+        };
+        assert_eq!(
+            worse(Some(("compatible", KNOWN)), Some(("compatible", KNOWN))),
+            counts(1, 0, 0, 0)
+        );
+        assert_eq!(
+            worse(Some(("compatible", KNOWN)), Some(("unverifiable", KNOWN))),
+            counts(0, 1, 0, 0)
+        );
+        assert_eq!(
+            worse(Some(("incompatible", KNOWN)), Some(("unverifiable", KNOWN))),
+            counts(0, 0, 1, 0)
+        );
+        assert_eq!(worse(None, Some(("compatible", KNOWN))), counts(1, 0, 0, 0));
+        assert_eq!(worse(None, None), counts(0, 0, 0, 1));
+        // A compatible direction over unknown types is unverifiable.
+        assert_eq!(
+            worse(Some(("compatible", KNOWN)), Some(("compatible", !KNOWN))),
+            counts(0, 1, 0, 0)
+        );
+
+        // Its sides are its consumer and its producer: the package's repo is
+        // neither, and an edge between two peers is not this repo's.
+        let edges = vec![
+            sdk_edge("billing", "api", Some(("compatible", KNOWN)), None),
+            sdk_edge("billing", "ledger", Some(("incompatible", KNOWN)), None),
+        ];
+        let mut with_sdk_repo = ours();
+        with_sdk_repo.insert("ledger-sdk".to_string());
+        assert_eq!(sdk_pair_counts(&edges, &ours()), Some(counts(1, 0, 0, 0)));
+        assert_eq!(sdk_pair_counts(&edges[1..], &with_sdk_repo), None);
+        assert_eq!(sdk_pair_counts(&[], &ours()), None);
+    }
+
+    /// An edge and the direct pair its verdict was carried from are counted
+    /// in different places, so one comparison is stated once.
+    #[test]
+    fn an_sdk_edge_is_never_counted_among_the_direct_pairs() {
+        // The package's own call, in a service of this repo, against a peer.
+        let matches = vec![pair(
+            "billing",
+            "api",
+            "/v1/payments",
+            Some(TypeVerdict::Compatible),
+        )];
+        let edges = vec![sdk_edge(
+            "web",
+            "billing",
+            Some(("compatible", KNOWN)),
+            Some(("compatible", KNOWN)),
+        )];
+        assert_eq!(pair_counts(&matches, &ours(), |_| true), counts(1, 0, 0, 0));
+        assert_eq!(sdk_pair_counts(&edges, &ours()), Some(counts(1, 0, 0, 0)));
     }
 }

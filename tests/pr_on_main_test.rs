@@ -362,6 +362,533 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
 }
 
+/// Declare `name` at `spec` in the repo's manifest.
+fn set_dependency(repo: &Path, name: &str, spec: &str) {
+    let manifest = repo.join("package.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    json["dependencies"][name] = serde_json::json!(spec);
+    std::fs::write(&manifest, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+}
+
+fn conflict_on(findings: &[serde_json::Value], package: &str) -> serde_json::Value {
+    findings
+        .iter()
+        .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == package)
+        .cloned()
+        .unwrap_or_else(|| panic!("no dependency_conflict on {package} in {findings:#?}"))
+}
+
+/// The written specifier each service's entry of a conflict carries.
+fn specs_of(finding: &serde_json::Value) -> Vec<(String, String)> {
+    let mut specs: Vec<(String, String)> = finding["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["repo"].as_str().unwrap().to_string(),
+                entry["spec"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    specs.sort();
+    specs
+}
+
+/// carrick#2283: a PR run says of each dependency conflict whether main has
+/// it and which service's specifier the PR changed. No call here is wrong,
+/// so the run has no mismatch and main's analysis never runs: the conflict is
+/// marked from the manifests alone.
+#[tokio::test]
+async fn a_pr_run_marks_a_dependency_conflict_without_a_mismatch_to_compare() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, consumer) = setup();
+    let store = Store::default();
+    set_dependency(&producer, "zod", "^3.22.0");
+    commit(&producer, "zod 3");
+    scan(&store, &producer).await;
+
+    // No index of the consumer on main: the run cannot tell, and says why.
+    set_dependency(&consumer, "zod", "^4.0.0");
+    commit(&consumer, "zod 4");
+    let findings = pr_scan(&store, &consumer).await;
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["kind"] != "method_mismatch" && f["kind"] != "type_mismatch"),
+        "this run is meant to have no mismatch: {findings:#?}"
+    );
+    let finding = conflict_on(&findings, "zod");
+    assert_eq!(finding["tier"], serde_json::json!("major"), "{finding:#}");
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("no_main_index"),
+        "{finding:#}"
+    );
+    assert!(finding.get("on_main").is_none(), "{finding:#}");
+    assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+
+    // Main agrees with the producer; the PR moves the consumer a major on.
+    set_dependency(&consumer, "zod", "^3.22.0");
+    commit(&consumer, "main: zod 3");
+    scan(&store, &consumer).await;
+    set_dependency(&consumer, "zod", "^4.0.0");
+    commit(&consumer, "pr: zod 4");
+    let runs = main_side_runs();
+    let findings = pr_scan(&store, &consumer).await;
+    assert_eq!(main_side_runs(), runs, "nothing here needs main's analysis");
+    let finding = conflict_on(&findings, "zod");
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+    assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+    assert_eq!(
+        finding["changed_by_pr"],
+        serde_json::json!([{ "service": "inventory-svc", "from": "^3.22.0", "to": "^4.0.0" }]),
+        "{finding:#}"
+    );
+    assert_eq!(
+        specs_of(&finding),
+        vec![
+            ("catalog-web".to_string(), "^3.22.0".to_string()),
+            ("inventory-svc".to_string(), "^4.0.0".to_string()),
+        ],
+        "{finding:#}"
+    );
+
+    // Main has the conflict already; the PR edits a source file and leaves
+    // the manifest alone.
+    scan(&store, &consumer).await;
+    set_consumer_verb(&consumer, "GET", 3);
+    commit(&consumer, "pr: unrelated edit");
+    let finding = conflict_on(&pr_scan(&store, &consumer).await, "zod");
+    assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+    assert!(finding.get("changed_by_pr").is_none(), "{finding:#}");
+}
+
+/// The value a run states for its peer indexes: sha256 over one
+/// `repo|service|commit` line per peer, sorted.
+fn peer_value(lines: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines = lines.to_vec();
+    lines.sort();
+    format!("{:x}", Sha256::digest(lines.concat().as_bytes()))
+}
+
+/// carrick#2284: a PR result names the index commits the run compared with
+/// and counts what it checked. The run here is untyped, so every pair it
+/// matched is one it did not compare.
+#[tokio::test]
+async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    set_dependency(&producer, "zod", "^3.22.0");
+    commit(&producer, "zod 3");
+    scan(&store, &producer).await;
+    let peers = serde_json::json!({
+        "count": 1,
+        "sha256": peer_value(&[format!("catalog-web||{}\n", head(&producer))]),
+    });
+
+    // No index of the consumer on main.
+    set_dependency(&consumer, "zod", "^3.22.0");
+    commit(&consumer, "zod 3");
+    let payload = pr_payload(&store, &consumer).await;
+    assert_eq!(
+        payload["baseline"],
+        serde_json::json!({
+            "base_sha": null,
+            "copy": "none",
+            "main_index": [],
+            "peers": peers,
+        }),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["checked"]["dependencies"],
+        serde_json::json!({ "shared": 1 }),
+        "{payload:#}"
+    );
+
+    // Main's copy, and a PR based on it that moves the shared package.
+    scan(&store, &consumer).await;
+    let main_at = head(&consumer);
+    set_dependency(&consumer, "zod", "^4.0.0");
+    commit(&consumer, "pr: zod 4");
+    event_with_base(tmp.path(), &main_at);
+    let payload = pr_payload(&store, &consumer).await;
+    assert_eq!(
+        payload["baseline"],
+        serde_json::json!({
+            "base_sha": main_at,
+            "copy": "current",
+            "main_index": [{
+                "service": null,
+                "commit": main_at,
+                "scanner_version": env!("CARGO_PKG_VERSION"),
+            }],
+            "peers": peers,
+        }),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["checked"],
+        serde_json::json!({
+            "pairs": { "compatible": 0, "unverifiable": 0, "incompatible": 0, "not_compared": 3 },
+            "dependencies": { "shared": 1, "changed": 1 },
+        }),
+        "{payload:#}"
+    );
+}
+
+/// A repository of its own, written file by file.
+fn written_repo(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let repo = unlinked(root).join(name);
+    for (file, source) in files {
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "init");
+    repo
+}
+
+/// The `(file_path, name)` of every function row the store holds for `repo`:
+/// the key the cloud joins a PR's function to main's row by.
+fn stored_function_keys(store: &Store, repo: &str) -> Vec<(String, String)> {
+    let mut keys: Vec<(String, String)> = store
+        .repos
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|stored| stored.repo_name == repo)
+        .flat_map(|stored| stored.function_definitions.values())
+        .map(|row| {
+            (
+                row.file_path.to_string_lossy().into_owned(),
+                row.name.clone(),
+            )
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn function_named<'a>(block: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    block["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {block:#}"))
+}
+
+/// carrick#2285: a PR result names the functions the PR added, edited or
+/// removed, from the base commit's tree. `m` calls `f` and is not edited:
+/// its description depends on `f`'s, so its intent hash moves in this run,
+/// and it is not listed. A function is named by the file path and the name
+/// main's uploaded row carries, which is what the cloud joins the two by.
+#[tokio::test]
+async fn a_pr_result_names_the_functions_the_pr_changed() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let repo = written_repo(
+        tmp.path(),
+        "toolkit",
+        &[
+            ("package.json", r#"{ "name": "toolkit", "private": true }"#),
+            (
+                "src/a.ts",
+                "export function f(x: number): number {\n  return x + 1;\n}\n\n\
+                 export function g(): string {\n  return \"g\";\n}\n\n\
+                 function h(): void {}\n",
+            ),
+            (
+                "src/b.ts",
+                "export function p(): number {\n  return 1;\n}\n\n\
+                 export const q = (): number => 2;\n",
+            ),
+            (
+                "src/d.ts",
+                "import { f } from \"./a\";\n\nexport function m(): number {\n  return f(1);\n}\n",
+            ),
+            (
+                "src/shelf.ts",
+                "export class Shelf {\n  count(): number {\n    return 1;\n  }\n}\n",
+            ),
+        ],
+    );
+    let store = Store::default();
+    scan(&store, &repo).await;
+    let main_at = head(&repo);
+    let main_keys = stored_function_keys(&store, "toolkit");
+    assert!(
+        main_keys.contains(&("src/a.ts".to_string(), "f".to_string())),
+        "{main_keys:?}"
+    );
+
+    // The PR: `f` edited, a comment above `g`, `h` deleted, `k` new; `b.ts`
+    // renamed untouched; a method edited; `e.ts` new, calling `k`.
+    std::fs::write(
+        repo.join("src/a.ts"),
+        "export function f(x: number): number {\n  return x + 2;\n}\n\n\
+         // A note about g,\n// two lines long.\n\
+         export function g(): string {\n  return \"g\";\n}\n\n\
+         export function k(): number {\n  return 3;\n}\n",
+    )
+    .unwrap();
+    git(&repo, &["mv", "src/b.ts", "src/c.ts"]);
+    std::fs::write(
+        repo.join("src/shelf.ts"),
+        "export class Shelf {\n  count(): number {\n    return 2;\n  }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/e.ts"),
+        "import { k } from \"./a\";\n\nexport function n(): number {\n  return k();\n}\n",
+    )
+    .unwrap();
+    commit(&repo, "pr");
+    event_with_base(tmp.path(), &main_at);
+    let payload = pr_payload(&store, &repo).await;
+    let block = &payload["functions"];
+
+    let mut listed: Vec<(String, String, String)> = block["changed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no functions.changed in {payload:#}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["file"].as_str().unwrap().to_string(),
+                entry["name"].as_str().unwrap().to_string(),
+                entry["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    listed.sort();
+    let entry = |file: &str, name: &str, change: &str| {
+        (file.to_string(), name.to_string(), change.to_string())
+    };
+    assert_eq!(
+        listed,
+        vec![
+            entry("src/a.ts", "f", "edited"),
+            entry("src/a.ts", "k", "added"),
+            entry("src/e.ts", "n", "added"),
+            entry("src/shelf.ts", "Shelf.count", "edited"),
+        ],
+        "g only moved, m was not touched, c.ts is b.ts renamed: {block:#}"
+    );
+    assert_eq!(
+        block["removed"],
+        serde_json::json!([{ "file": "src/a.ts", "name": "h" }]),
+        "{block:#}"
+    );
+    assert_eq!(block["counts"]["added"], serde_json::json!(2), "{block:#}");
+    assert_eq!(block["counts"]["edited"], serde_json::json!(2), "{block:#}");
+    assert_eq!(
+        block["counts"]["removed"],
+        serde_json::json!(1),
+        "{block:#}"
+    );
+
+    // The call edges, by the same file and name.
+    let reference = |file: &str, name: &str| serde_json::json!([{ "file": file, "name": name }]);
+    assert_eq!(
+        function_named(block, "f")["called_by"],
+        reference("src/d.ts", "m"),
+        "{block:#}"
+    );
+    assert_eq!(
+        function_named(block, "n")["calls"],
+        reference("src/a.ts", "k"),
+        "{block:#}"
+    );
+    assert_eq!(
+        function_named(block, "k")["called_by"],
+        reference("src/e.ts", "n"),
+        "{block:#}"
+    );
+
+    // Every edited function is named as main's row names it, a method
+    // included: the cloud finds main's copy by this key and no other.
+    for edited in ["f", "Shelf.count"] {
+        let named = function_named(block, edited);
+        let key = (
+            named["file"].as_str().unwrap().to_string(),
+            named["name"].as_str().unwrap().to_string(),
+        );
+        assert!(
+            main_keys.contains(&key),
+            "{key:?} is not a key main's index holds: {main_keys:?}"
+        );
+    }
+
+    // With no base commit the run says so and names nothing.
+    // SAFETY: the tests in this binary run one at a time (SERIAL).
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    let payload = pr_payload(&store, &repo).await;
+    assert_eq!(
+        payload["functions"],
+        serde_json::json!({ "unknown": "no_base_commit" }),
+        "{payload:#}"
+    );
+}
+
+/// Run the built binary over `repo` as the GitHub Action does on a
+/// `pull_request` event: from inside the checkout, with the path it is given,
+/// offline. Returns the result the run posted.
+fn action_pr_result(repo: &Path, path: &str, scratch: &Path) -> serde_json::Value {
+    let store = scratch.join("store");
+    let out = scratch.join("pr-result.json");
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&out);
+    std::fs::create_dir_all(&store).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(path)
+        .current_dir(repo)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_LOCAL_STORAGE_DIR", &store)
+        .env("CARRICK_PR_RESULT_OUT", &out)
+        .env("GITHUB_EVENT_NAME", "pull_request")
+        .env("GITHUB_REF", "refs/pull/7/merge");
+    // A runner's own values would name this repo and a base commit the
+    // fixture does not have.
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "CI",
+        "CARRICK_OUTPUT_JSON",
+        "CARRICK_LOCAL_STORAGE_ISOLATE",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let run = cmd.output().expect("failed to spawn carrick");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.status.success(), "{output}");
+    let posted = std::fs::read_to_string(&out)
+        .unwrap_or_else(|error| panic!("the PR run posted no result ({error}):\n{output}"));
+    serde_json::from_str(&posted).unwrap()
+}
+
+/// A PR scan names the functions the PR changed when it runs as the GitHub
+/// Action runs it: the path is `.`, the checkout is the PR's merge commit,
+/// and the config has a service whose directory is `.` beside one in a
+/// subdirectory. The walk of that first service lists `././src/label.ts`,
+/// which is the file git names `src/label.ts`. The block is the same when the
+/// same checkout is scanned by its absolute path.
+#[tokio::test]
+async fn an_action_run_names_the_functions_of_a_service_at_the_repo_root() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let repo = written_repo(
+        tmp.path(),
+        "portal",
+        &[
+            (
+                "carrick.json",
+                r#"{ "services": [
+                    { "name": "web", "directory": "." },
+                    { "name": "edge", "directory": "workers/edge" }
+                ] }"#,
+            ),
+            ("package.json", r#"{ "name": "portal", "private": true }"#),
+            (
+                "src/label.ts",
+                "export function title(name: string): string {\n  return name.trim();\n}\n",
+            ),
+            (
+                "src/old.ts",
+                "export function retired(): number {\n  return 0;\n}\n",
+            ),
+            (
+                "workers/edge/package.json",
+                r#"{ "name": "edge", "private": true }"#,
+            ),
+            (
+                "workers/edge/src/index.ts",
+                "export function route(path: string): string {\n  return path;\n}\n",
+            ),
+        ],
+    );
+    git(&repo, &["branch", "-M", "main"]);
+
+    // The PR: one function appended to a file of the root service, one file
+    // of it deleted, one function of the nested service edited.
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        repo.join("src/label.ts"),
+        "export function title(name: string): string {\n  return name.trim();\n}\n\n\
+         export function minutes(words: number): number {\n  return Math.ceil(words / 200);\n}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(repo.join("src/old.ts")).unwrap();
+    std::fs::write(
+        repo.join("workers/edge/src/index.ts"),
+        "export function route(path: string): string {\n  return path.toLowerCase();\n}\n",
+    )
+    .unwrap();
+    commit(&repo, "pr");
+
+    // Main moves on, and the checkout is the merge of the two, as
+    // `refs/pull/<n>/merge` is.
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("NOTES.md"), "main moved\n").unwrap();
+    commit(&repo, "main moves");
+    let main_at = head(&repo);
+    git(&repo, &["merge", "-q", "--no-ff", "-m", "merge", "feature"]);
+
+    let scratch = tmp.path().join("action");
+    let relative = action_pr_result(&repo, ".", &scratch);
+    assert_eq!(relative["baseline"]["base_sha"], main_at.as_str());
+    let block = &relative["functions"];
+    let mut listed: Vec<(String, String, String)> = block["changed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no functions.changed in {relative:#}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["file"].as_str().unwrap().to_string(),
+                entry["name"].as_str().unwrap().to_string(),
+                entry["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    listed.sort();
+    let entry = |file: &str, name: &str, change: &str| {
+        (file.to_string(), name.to_string(), change.to_string())
+    };
+    assert_eq!(
+        listed,
+        vec![
+            entry("src/label.ts", "minutes", "added"),
+            entry("workers/edge/src/index.ts", "route", "edited"),
+        ],
+        "{block:#}"
+    );
+    assert_eq!(
+        block["removed"],
+        serde_json::json!([{ "file": "src/old.ts", "name": "retired" }]),
+        "{block:#}"
+    );
+
+    let absolute = action_pr_result(&repo, repo.to_str().unwrap(), &scratch);
+    assert_eq!(
+        absolute["functions"], relative["functions"],
+        "the path the scan is given does not change what the PR changed"
+    );
+}
+
 /// Main's side failing in any way costs the run nothing but the comparison:
 /// the findings it posts are byte for byte the ones a run with no prior index
 /// posts, apart from why neither could compare. (The payload's `delta`
@@ -595,6 +1122,36 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
     commit(&consumer, "pr: string count");
     let finding = type_mismatch(&pr_scan_with(&store, &consumer, true).await);
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
+/// carrick#2284, with the real sidecar: the pairs the type check reached are
+/// counted under what it answered, and a type the PR breaks moves its pairs
+/// from compatible to incompatible.
+#[tokio::test]
+async fn a_typed_pr_result_counts_each_compared_pair_under_its_verdict() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan_with(&store, &producer, true).await;
+    scan_with(&store, &consumer, true).await;
+
+    set_consumer_verb(&consumer, "GET", 3);
+    commit(&consumer, "pr: unrelated edit above the call");
+    let agreeing = pr_payload_with(&store, &consumer, true).await["checked"]["pairs"].clone();
+
+    set_consumer_count_type(&consumer, "string");
+    commit(&consumer, "pr: string count");
+    let broken = pr_payload_with(&store, &consumer, true).await["checked"]["pairs"].clone();
+
+    // The consumer's three calls share the response type the PR breaks.
+    assert_eq!(
+        agreeing,
+        serde_json::json!({ "compatible": 3, "unverifiable": 0, "incompatible": 0, "not_compared": 0 })
+    );
+    assert_eq!(
+        broken,
+        serde_json::json!({ "compatible": 0, "unverifiable": 0, "incompatible": 3, "not_compared": 0 })
+    );
 }
 
 /// The two-service repo whose consumer reads a response field off calls that
