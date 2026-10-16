@@ -27,6 +27,7 @@ use crate::{
     },
     call_base::resolve_call_base,
     cloud_storage::{ManifestRole, ManifestTypeKind},
+    compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
     dispatch::Dispatch,
     engine::type_compat_v2::{ReceiverRole, classify_receiver},
@@ -58,7 +59,7 @@ use crate::{
     swc_scanner::{
         CandidateTarget, ControllerRouteBinding, DecoratorRoute, PubsubAnchorOp,
         RouteDescriptorEndpoint, SwcScanner, collect_import_sources, is_producer_route_path,
-        normalize_path_params,
+        normalize_path_params, parse_standalone_module,
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
@@ -442,6 +443,12 @@ pub struct FileCentricAnalysisResult {
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
     pub type_resolution: Option<TypeResolutionResult>,
+    /// The functions a call of which is worth its request's parsed body
+    /// unchanged, by declaring module's canonical path and name
+    /// ([`RequestSummaryIndex::passes_body`], carrick#1601). Read again once
+    /// every service is analysed, where a call into another service's
+    /// function is settled (carrick#1146).
+    pub passes_body: HashSet<(PathBuf, String)>,
 }
 
 /// What a routing convention said about one file: whether it CLAIMED the file
@@ -572,6 +579,12 @@ pub struct ProcessingStats {
     /// route nothing else states. Each is kept at the model's line with no
     /// span, rather than taking that call's span (carrick#1448).
     pub model_routes_kept_without_a_site: usize,
+    /// Model endpoint rows whose `candidate_id` names no listed site, kept at
+    /// the model's own line with no span because the file's source states the
+    /// route's path in a dispatch position: an equality operand, a `case`
+    /// test or a `startsWith` argument (carrick#2382). Also counted in
+    /// `model_only_rows`.
+    pub model_routes_kept_on_a_path_literal: usize,
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
@@ -586,14 +599,24 @@ pub struct ProcessingStats {
     /// kind: not a path argument, not a decorator, not the filename. Each one
     /// is logged with its method, path and file.
     pub model_endpoints_discarded_in_claimed_modules: usize,
+    /// Model endpoint rows dropped because the `candidate_id` they echoed
+    /// names no site the scanner listed and nothing deterministic states the
+    /// route (carrick#2382). Not part of the claimed-module count above: a
+    /// row is in one or the other. A route the model states from a
+    /// hand-written dispatch, with an id it made up, leaves the index here.
+    pub model_endpoints_dropped_unanchored: usize,
+    /// Where those rows were, `file:line METHOD path`, in the order they
+    /// were dropped, so the count can be reconciled against the file.
+    pub model_endpoints_dropped_unanchored_sites: Vec<String>,
     /// Model rows kept as rows of their own: the only record of a shape no
     /// deterministic source reads.
     pub model_only_rows: usize,
-    /// Candidates that carry a route-shaped literal argument and a readable
-    /// verb, and that neither the deterministic layer nor the model produced a
-    /// row for. A bare `x.verb("/lit", arg)` states no producer/consumer role,
-    /// so emitting it would need a classification rule the scanner does not
-    /// have; this counts the gap rather than guessing at it.
+    /// Offered HTTP candidates that carry a route-shaped literal (a request
+    /// verb is not required) and that neither the deterministic layer nor the
+    /// model produced a row for, or a mount on the same line. A bare
+    /// `x.verb("/lit", arg)` states no producer/consumer role, so emitting it
+    /// would need a classification rule the scanner does not have; this counts
+    /// the gap rather than guessing at it.
     pub unemitted_literal_candidates: usize,
     /// Where those sites are, `file:line`, in the order they were counted. A
     /// count of something nobody can point at is a number to argue with, not a
@@ -779,6 +802,80 @@ impl DispatchWitnesses {
             Some(Some(witnesses)) => witnesses.witnessed(value),
             _ => true,
         }
+    }
+}
+
+/// The route paths a file's source states in a dispatch position
+/// (carrick#2382), read by [`compared_route_literals`]: a literal compared by
+/// equality, a `case` test, or a `startsWith` argument, directly or through a
+/// top-level constant.
+///
+/// The join keeps a model route whose echoed id names no listed site when
+/// this witness states its path. It records values, not byte spans, so it has
+/// no span base to agree with the candidate map on.
+#[derive(Debug, Default)]
+struct RouteLiteralWitness {
+    /// Values compared by equality or written as a `case` test.
+    equal: Vec<String>,
+    /// Values passed to `startsWith`.
+    prefixes: Vec<String>,
+}
+
+impl RouteLiteralWitness {
+    /// The witness in `content`, parsed with a source map of its own. `None`
+    /// when it does not parse, which states nothing. `file_path` decides the
+    /// syntax only.
+    fn of_source(file_path: &str, content: &str) -> Option<Self> {
+        let (_, module) = parse_standalone_module(Path::new(file_path), content)?;
+        let mut witness = Self::default();
+        for found in compared_route_literals(&module) {
+            let value = FileOrchestrator::canonicalize_route_path(&found.value);
+            match found.position {
+                ComparisonPosition::Equality | ComparisonPosition::Case => {
+                    witness.equal.push(value)
+                }
+                ComparisonPosition::StartsWith => witness.prefixes.push(value),
+            }
+        }
+        Some(witness)
+    }
+
+    /// Whether the source states `route_path`.
+    ///
+    /// By equality or `case`: the same number of segments, every literal
+    /// segment equal, and a parameter only where the row has one, so
+    /// `"/items"` states `/items` and `"/items/"` does not state `/items/:id`.
+    /// By `startsWith`, and only for a path with a parameter: the literal is
+    /// the path's literal segments before its first parameter, with or
+    /// without the trailing slash, so `"/items/"` states `/items/:id`. A path
+    /// whose first segment is a parameter has no witness.
+    fn states(&self, route_path: &str) -> bool {
+        let canonical = FileOrchestrator::canonicalize_route_path(route_path);
+        let segments: Vec<&str> = canonical.split('/').collect();
+        let is_param = |segment: &str| segment.starts_with(':') || segment.starts_with('*');
+        let Some(first_param) = segments.iter().position(|segment| is_param(segment)) else {
+            return self.equal.contains(&canonical);
+        };
+        if first_param <= 1 {
+            return false;
+        }
+        let equal = self.equal.iter().any(|value| {
+            let theirs: Vec<&str> = value.split('/').collect();
+            theirs.len() == segments.len()
+                && theirs.iter().zip(&segments).all(|(theirs, ours)| {
+                    match (is_param(theirs), is_param(ours)) {
+                        (true, true) => true,
+                        (false, false) => theirs == ours,
+                        _ => false,
+                    }
+                })
+        });
+        let prefix = segments[..first_param].join("/");
+        equal
+            || self
+                .prefixes
+                .iter()
+                .any(|value| value.strip_suffix('/').unwrap_or(value) == prefix)
     }
 }
 
@@ -1756,6 +1853,10 @@ impl FileOrchestrator {
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut unread_prefixes: Vec<crate::registration_scope::UnreadPrefix> = Vec::new();
+        // Registration callbacks holding a registration the model stated no
+        // mount for (carrick#2303), decided once every file's rows are in.
+        let mut unstated_registrations: Vec<crate::registration_scope::UnstatedRegistrations> =
+            Vec::new();
         let mut stats = ProcessingStats::default();
         // Every path that reaches a prompt is reduced against this (see
         // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
@@ -1976,11 +2077,16 @@ impl FileOrchestrator {
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
             dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
             unread_prefixes: &mut Vec<crate::registration_scope::UnreadPrefix>,
+            unstated_registrations: &mut Vec<crate::registration_scope::UnstatedRegistrations>,
         ) {
             // A model row at a site whose callee provably sends nothing is
             // the model reading a request into a name (carrick#1555).
-            stats.summary_rows_withdrawn +=
-                FileOrchestrator::withdraw_silent_sites(adjusted, &pf.silent_sites);
+            stats.summary_rows_withdrawn += FileOrchestrator::withdraw_silent_sites(
+                adjusted,
+                &pf.silent_sites,
+                Path::new(&pf.path_str),
+                &pf.content,
+            );
             // Carry the wrapper's own request shape onto the sites that
             // delegate to it (carrick-cloud#386). Runs first among the
             // passes over the joined rows, because it tells a
@@ -2051,6 +2157,15 @@ impl FileOrchestrator {
             );
             stats.mount_prefixes_unread += unread.len();
             unread_prefixes.extend(unread);
+            // What a callback registers and the model did not state is
+            // decided against the rows of the file that declares it
+            // (carrick#2303), so the sites wait for every file.
+            unstated_registrations.extend(crate::registration_scope::UnstatedRegistrations::of(
+                adjusted,
+                &pf.registration_sites,
+                &pf.path_str,
+                &pf.prompt_path,
+            ));
 
             // Drop LLM-emitted pub/sub ops whose topic has no literal
             // witness in the file's source (carrick#311): the analyzer
@@ -3303,6 +3418,7 @@ impl FileOrchestrator {
                 unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
+                passes_body: HashSet::new(),
             });
         }
 
@@ -3440,7 +3556,50 @@ impl FileOrchestrator {
         // PHASE 1d, second half: the rows the request summaries state, now
         // that they are composed. Waiting here is waiting on the scan's last
         // asks for library semantics, which ran alongside the model's work.
-        let summaries = self.request_summaries.take().await;
+        let mut summaries = self.request_summaries.take().await;
+        // A call the source states as an endpoint registers a route, whatever
+        // else it is shaped like (carrick#2383): the request the summaries
+        // read at it is withdrawn, at the call and at every caller of the
+        // function it sits in. Every source counts: the layout, route data,
+        // decorators, and the model's rows at a site that can register one.
+        let mut registered: HashMap<PathBuf, BTreeSet<u32>> = HashMap::new();
+        for (pf, answer) in &analyzed {
+            let spans = registered.entry(PathBuf::from(&pf.path_str)).or_default();
+            spans.extend(
+                [
+                    &pf.route_endpoints,
+                    &pf.descriptor_endpoints,
+                    &pf.decorator_endpoints,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|endpoint| endpoint.call_expression_span_start),
+            );
+            if let ModelAnswer::Answered(model) = answer {
+                spans.extend(model.endpoints.iter().filter_map(|endpoint| {
+                    pf.candidate_map
+                        .get(&endpoint.candidate_id)
+                        .filter(|candidate| {
+                            Self::candidate_can_register_a_route(candidate, endpoint.line_number)
+                        })
+                        .map(|candidate| candidate.span_start)
+                }));
+            }
+        }
+        for (path, result) in &file_results {
+            registered.entry(PathBuf::from(path)).or_default().extend(
+                result
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.call_expression_span_start),
+            );
+        }
+        let withdrawn = summaries.withdraw_registrations(&registered);
+        if withdrawn > 0 {
+            debug!(
+                "Withdrew {withdrawn} request summary row(s) made by a call the source states as an endpoint"
+            );
+        }
         let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
         for late in late_summary_files {
             let Some(summary_rows) = summaries.rows(&late.file_path) else {
@@ -3520,10 +3679,19 @@ impl FileOrchestrator {
                         std::mem::take(&mut pf.resolved),
                         &mut stats.deterministic_rows_emitted,
                     );
+                    // Read only when an endpoint's id names no listed site,
+                    // the one case the join asks it about (carrick#2382).
+                    let path_literals = model
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| !pf.candidate_map.contains_key(&endpoint.candidate_id))
+                        .then(|| RouteLiteralWitness::of_source(&pf.path_str, &pf.content))
+                        .flatten();
                     Self::join_model_rows(
                         &mut adjusted,
                         model,
                         &pf.candidate_map,
+                        path_literals.as_ref(),
                         &overrules,
                         &pf.path_str,
                         pf.route_module_claimed,
@@ -3540,6 +3708,7 @@ impl FileOrchestrator {
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
                         &mut unread_prefixes,
+                        &mut unstated_registrations,
                     );
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -3621,6 +3790,7 @@ impl FileOrchestrator {
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
                         &mut unread_prefixes,
+                        &mut unstated_registrations,
                     );
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
@@ -3730,6 +3900,10 @@ impl FileOrchestrator {
             stats.model_routes_kept_without_a_site
         );
         debug!(
+            "  - Model routes kept at their own line on a path literal the file compares: {}",
+            stats.model_routes_kept_on_a_path_literal
+        );
+        debug!(
             "  - Model statements discarded as contradictions: {}",
             stats.model_contradictions_discarded
         );
@@ -3740,6 +3914,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model endpoints discarded in convention-claimed modules: {}",
             stats.model_endpoints_discarded_in_claimed_modules
+        );
+        debug!(
+            "  - Model endpoints dropped, their id names no listed site: {}",
+            stats.model_endpoints_dropped_unanchored
         );
         debug!("  - Model-only rows: {}", stats.model_only_rows);
         debug!(
@@ -3914,6 +4092,27 @@ impl FileOrchestrator {
             );
         }
 
+        // PHASE 5f (carrick#2303): the mounts a registration callback makes
+        // and the model did not state, read from the source. Last before the
+        // graph, which reads the scopes and the unread prefixes this adds
+        // exactly as it reads the ones the per-file pass made.
+        let (source_mounts, unread) = crate::registration_scope::mount_unstated_registrations(
+            &mut file_results,
+            &unstated_registrations,
+            Path::new(""),
+        );
+        if source_mounts > 0 {
+            debug!(
+                "  - Mounts read from the source where the model stated none: {} (scopes with an \
+                 unread prefix: {})",
+                source_mounts,
+                unread.len()
+            );
+            stats.total_mounts += source_mounts;
+        }
+        stats.mount_prefixes_unread += unread.len();
+        unread_prefixes.extend(unread);
+
         // STEP 5: Build aggregated mount graph from all file results
         let (mount_graph, corroborated) = self.build_mount_graph_reading_scopes(
             &file_results,
@@ -3936,6 +4135,7 @@ impl FileOrchestrator {
             unread_mount_prefixes: unread_prefixes,
             bundled_types: None,
             type_resolution: None,
+            passes_body: summaries.passes_body_set().clone(),
         })
     }
 
@@ -7608,16 +7808,38 @@ impl FileOrchestrator {
     /// nothing (carrick#1555): the summary composed every call the callee
     /// makes and found no request. A model row there is the model reading a
     /// request into a name.
-    fn withdraw_silent_sites(result: &mut FileAnalysisResult, silent: &BTreeSet<u32>) -> usize {
+    ///
+    /// A model row with no span (its id joined no candidate) is placed by its
+    /// line (carrick#2281): at the one outermost call that opens there, when
+    /// the row's own text writes that call ([`crate::call_through::FileCalls`]).
+    /// `content` is the file the candidates' spans were read from; it is
+    /// parsed only when such a row is in the file.
+    pub(crate) fn withdraw_silent_sites(
+        result: &mut FileAnalysisResult,
+        silent: &BTreeSet<u32>,
+        path: &Path,
+        content: &str,
+    ) -> usize {
         if silent.is_empty() {
             return 0;
         }
+        let is_model =
+            |call: &DataCallResult| call.resolution_source == Some(ResolutionSource::Model);
+        let calls = result
+            .data_calls
+            .iter()
+            .any(|call| is_model(call) && call.call_expression_span_start.is_none())
+            .then(|| crate::call_through::FileCalls::parse(path, content))
+            .flatten();
         let before = result.data_calls.len();
         result.data_calls.retain(|call| {
-            call.resolution_source != Some(ResolutionSource::Model)
-                || !call
-                    .call_expression_span_start
-                    .is_some_and(|start| silent.contains(&start))
+            if !is_model(call) {
+                return true;
+            }
+            let start = call
+                .call_expression_span_start
+                .or_else(|| calls.as_ref().and_then(|calls| calls.written_at(call)));
+            !start.is_some_and(|start| silent.contains(&start))
         });
         before - result.data_calls.len()
     }
@@ -7702,6 +7924,16 @@ impl FileOrchestrator {
         Some(format!("{method} {path}"))
     }
 
+    /// The callee the AST read at a candidate's span: the member invoked, or
+    /// the bare callee when the call is not a member call. This is the only
+    /// text a call row publishes as its client (carrick#2387).
+    fn callee_text(candidate: &CandidateTarget) -> String {
+        candidate
+            .callee_property
+            .clone()
+            .unwrap_or_else(|| candidate.callee_object.clone())
+    }
+
     /// The row shape every candidate-backed deterministic call shares.
     ///
     /// `pattern_matched` is the client the scanner saw, which is what the row
@@ -7722,10 +7954,7 @@ impl FileOrchestrator {
                 "http-client".to_string()
             }
             ResolutionSource::RequestSpec => candidate.callee_object.clone(),
-            _ => candidate
-                .callee_property
-                .clone()
-                .unwrap_or_else(|| candidate.callee_object.clone()),
+            _ => Self::callee_text(candidate),
         };
         DataCallResult {
             candidate_id: candidate.candidate_id.clone(),
@@ -8044,11 +8273,16 @@ impl FileOrchestrator {
     /// is logged and discarded. A model row whose `candidate_id` joins no
     /// candidate keeps no span, exactly as before, and is placed by its line.
     /// A model row with no deterministic twin is kept as its own row.
+    ///
+    /// `path_literals` is what the file's source compares a path against
+    /// (carrick#2382). `None` states nothing: an endpoint whose id names no
+    /// listed site is then dropped and counted.
     #[allow(clippy::too_many_arguments)]
     fn join_model_rows(
         result: &mut FileAnalysisResult,
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
+        path_literals: Option<&RouteLiteralWitness>,
         overrules: &[Resolved],
         file_path: &str,
         route_module_claimed: bool,
@@ -8072,7 +8306,8 @@ impl FileOrchestrator {
         // A dispatch table is a fact about a HANDLER, not about a candidate:
         // there is no deterministic row for it to be joined onto and no
         // candidate id to drop it for. It travels through with the mounts.
-        result.dispatch_tables = dispatch_tables;
+        result.dispatch_tables =
+            Self::tables_with_a_body(dispatch_tables, &endpoints, &result.endpoints, file_path);
 
         // --- the producer side -------------------------------------------
 
@@ -8112,10 +8347,28 @@ impl FileOrchestrator {
         // row with no case that restates a route the model also states as
         // cases is then dropped whichever order the model answered in, rather
         // than taking the route before its cases reach it.
+        //
+        // A `body` case on a method that carries no request body is not a case
+        // (carrick#2110). GET and HEAD send none, so what the handler switched
+        // on was read off the URL, and a query parameter belongs to the path
+        // (`dispatch::DispatchLocation`). The row loses the case before
+        // anything is compared with it, and the readings of one route are
+        // folded into one row first, keeping only the anchors they all state
+        // (`fold_bodyless_cases`), so every path below sees one row.
+        let (endpoints, bodyless_cases_dropped) = Self::fold_bodyless_cases(endpoints);
         let (cases, plain): (Vec<EndpointResult>, Vec<EndpointResult>) = endpoints
             .into_iter()
             .partition(|endpoint| endpoint.dispatch.is_some());
+        if bodyless_cases_dropped > 0 {
+            debug!(
+                "Dropped the body case from {} model endpoint row(s) in {}: the method carries \
+                 no request body",
+                bodyless_cases_dropped, file_path
+            );
+        }
         for mut endpoint in cases.into_iter().chain(plain) {
+            // Kept only on a path literal the file compares (carrick#2382).
+            let mut on_a_path_literal = false;
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
             // call that states a route path, or — for a route whose
@@ -8202,10 +8455,31 @@ impl FileOrchestrator {
                         // at the model's own line with no span, the way an
                         // unjoinable data call is kept.
                         Some(_) => None,
+                        // The id names no listed site, but the file compares
+                        // a path against this route's own path, which is how
+                        // a service with no router states a route
+                        // (carrick#2382). The row is kept the way the arm
+                        // above keeps one, at its own line with no span. The
+                        // method stays the model's reading: a guard on the
+                        // method cannot be tied to one branch. A file the
+                        // scanner listed no candidate for was sent whole
+                        // (carrick#462) and keeps the drop.
+                        None if !candidate_map.is_empty()
+                            && path_literals
+                                .is_some_and(|literals| literals.states(&endpoint.path)) =>
+                        {
+                            on_a_path_literal = true;
+                            None
+                        }
                         None => {
                             dropped.push(format!(
                                 "{} {} (candidate_id '{}')",
                                 endpoint.method, endpoint.path, endpoint.candidate_id
+                            ));
+                            stats.model_endpoints_dropped_unanchored += 1;
+                            stats.model_endpoints_dropped_unanchored_sites.push(format!(
+                                "{file_path}:{} {} {}",
+                                endpoint.line_number, endpoint.method, endpoint.path
                             ));
                             continue;
                         }
@@ -8219,6 +8493,20 @@ impl FileOrchestrator {
                     endpoint.call_expression_span_start = Some(candidate.span_start);
                     endpoint.call_expression_span_end = Some(candidate.span_end);
                     Self::settle_registration_literal(&mut endpoint, candidate, file_path, stats);
+                }
+                None if on_a_path_literal => {
+                    debug!(
+                        "Keeping the model's {} {} in {} at its own line {} with no span: \
+                         the id it echoed ('{}') names no listed site, and the file compares \
+                         a path against this route's path",
+                        endpoint.method,
+                        endpoint.path,
+                        file_path,
+                        endpoint.line_number,
+                        endpoint.candidate_id
+                    );
+                    endpoint.call_expression_span_start = None;
+                    endpoint.call_expression_span_end = None;
                 }
                 None => {
                     debug!(
@@ -8421,7 +8709,12 @@ impl FileOrchestrator {
                     stats.model_endpoints_discarded_in_claimed_modules += 1;
                     continue;
                 }
-                None => stats.model_only_rows += 1,
+                None => {
+                    stats.model_only_rows += 1;
+                    if on_a_path_literal {
+                        stats.model_routes_kept_on_a_path_literal += 1;
+                    }
+                }
             }
             result.endpoints.push(endpoint);
         }
@@ -8482,11 +8775,20 @@ impl FileOrchestrator {
                     call.line_number = candidate.line_number as i32;
                     call.call_expression_span_start = Some(candidate.span_start);
                     call.call_expression_span_end = Some(candidate.span_end);
+                    // The client the row displays is the callee the AST read
+                    // at this span, never the model's `pattern_matched`: the
+                    // model fills that field by copying the framework
+                    // guidance's samples (carrick#2387).
+                    call.pattern_matched = Self::callee_text(candidate);
                 }
                 // Preserved without a span, as before: an inline alias still
                 // resolves, and the row is the only record of a site the
                 // scanner raised no candidate for (a wrapper delegation).
-                None => unjoined += 1,
+                // With no callee read there is no client to name.
+                None => {
+                    unjoined += 1;
+                    call.pattern_matched = String::new();
+                }
             }
             calls.push(Some(call));
         }
@@ -8567,10 +8869,16 @@ impl FileOrchestrator {
             .values()
             .filter(|candidate| candidate.protocol == Protocol::Http)
             .filter(|candidate| {
-                matches!(candidate.request_shape, RequestShapeSignal::Known(_))
-                    && Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-                        .is_some_and(|literal| Self::is_route_shaped(&literal))
+                Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+                    .is_some_and(|literal| Self::is_route_shaped(&literal))
                     && !Self::row_at_span(result, candidate.span_start)
+                    // A mount (`app.use("/api", router)`) the model answered
+                    // has no span; its line is the only thing it shares with
+                    // the candidate.
+                    && !result
+                        .mounts
+                        .iter()
+                        .any(|mount| mount.line_number == candidate.line_number as i32)
             })
             .collect();
         // `candidate_map` is a HashMap, so the sites are ordered here rather
@@ -8684,7 +8992,11 @@ impl FileOrchestrator {
         // Everything determinism does not state.
         deterministic.candidate_id = model.candidate_id;
         deterministic.call_kind = model.call_kind;
-        if !model.pattern_matched.trim().is_empty() {
+        // The client text is the callee the scanner read, which the row
+        // already carries; the model's reading (callee-derived by
+        // `join_model_rows`, or empty) only fills a row that has none
+        // (carrick#2387).
+        if deterministic.pattern_matched.trim().is_empty() {
             deterministic.pattern_matched = model.pattern_matched;
         }
         deterministic.call_expression_text = model.call_expression_text;
@@ -9013,6 +9325,145 @@ impl FileOrchestrator {
             type_import_source: anchors.type_import_source,
             ..route.clone()
         }
+    }
+
+    /// Whether a model row states a `body` dispatch case on a method that
+    /// carries no request body (carrick#2110). GET and HEAD are the two HTTP
+    /// defines that way, so the field such a handler switches on is read off
+    /// the URL. A `header` case is a case on any method.
+    fn states_a_body_case_without_a_body(endpoint: &EndpointResult) -> bool {
+        endpoint
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.location == crate::dispatch::DispatchLocation::Body)
+            && Self::carries_no_body(&endpoint.method)
+    }
+
+    /// Fold the rows that lost a `body` case on a method with no request body
+    /// (carrick#2110) into one row per route, by [`Self::model_row_key`]. Every
+    /// other row passes through untouched and in order; a folded row sits
+    /// where the first of its readings did. Returns how many rows lost a case.
+    ///
+    /// Each branch of such a handler answers its own response, and one row
+    /// carries one type. An anchor is kept only where every folded reading
+    /// states the same one (text and line together, since one text at two
+    /// lines is two expressions); otherwise the row states none and its
+    /// consumers are unverifiable rather than judged against one branch.
+    fn fold_bodyless_cases(endpoints: Vec<EndpointResult>) -> (Vec<EndpointResult>, usize) {
+        let mut out: Vec<EndpointResult> = Vec::with_capacity(endpoints.len());
+        let mut folded: HashMap<String, usize> = HashMap::new();
+        let mut cleared = 0usize;
+        for mut endpoint in endpoints {
+            if !Self::states_a_body_case_without_a_body(&endpoint) {
+                out.push(endpoint);
+                continue;
+            }
+            endpoint.dispatch = None;
+            cleared += 1;
+            match folded.entry(Self::model_row_key(&endpoint)) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    Self::keep_agreeing_anchors(&mut out[*at.get()], &endpoint);
+                }
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(out.len());
+                    out.push(endpoint);
+                }
+            }
+        }
+        (out, cleared)
+    }
+
+    /// Keep each type anchor of `into` only where `other` states the very
+    /// same one; clear it otherwise, so a reading that states none, or a
+    /// different one, leaves the row stating none.
+    fn keep_agreeing_anchors(into: &mut EndpointResult, other: &EndpointResult) {
+        if (&into.payload_expression_text, into.payload_expression_line)
+            != (
+                &other.payload_expression_text,
+                other.payload_expression_line,
+            )
+        {
+            into.payload_expression_text = None;
+            into.payload_expression_line = None;
+        }
+        if (
+            &into.response_expression_text,
+            into.response_expression_line,
+        ) != (
+            &other.response_expression_text,
+            other.response_expression_line,
+        ) {
+            into.response_expression_text = None;
+            into.response_expression_line = None;
+        }
+        if into.emission_style != other.emission_style {
+            into.emission_style = None;
+        }
+        if (&into.primary_type_symbol, &into.type_import_source)
+            != (&other.primary_type_symbol, &other.type_import_source)
+        {
+            into.primary_type_symbol = None;
+            into.type_import_source = None;
+        }
+    }
+
+    /// The dispatch tables a file's answer states, less a `body` table whose
+    /// cases no call can send (carrick#2110). The switch reads the URL when
+    /// the rows that reach it all serve methods with no request body: either
+    /// the table's own handler serves only those, or every row that states a
+    /// body case on the table's field is on one (the switch may sit in a
+    /// helper the route handler calls, which states no row of its own).
+    /// Where no row of this file says either, the table is kept.
+    ///
+    /// The join cannot see which route calls a helper, so it proves this only
+    /// for the whole file: every route the file states, the model's rows and
+    /// the deterministic ones alike, is on GET or HEAD. One route on any
+    /// other method may reach the switch with a body, case stated or not, and
+    /// then every table is kept (fail closed).
+    fn tables_with_a_body(
+        tables: Vec<crate::dispatch::DispatchTable>,
+        model_rows: &[EndpointResult],
+        stated_rows: &[EndpointResult],
+        file_path: &str,
+    ) -> Vec<crate::dispatch::DispatchTable> {
+        let mut routes = model_rows.iter().chain(stated_rows).peekable();
+        let only_bodyless_routes =
+            routes.peek().is_some() && routes.all(|route| Self::carries_no_body(&route.method));
+        if !only_bodyless_routes {
+            return tables;
+        }
+        tables
+            .into_iter()
+            .filter(|table| {
+                if table.location != crate::dispatch::DispatchLocation::Body {
+                    return true;
+                }
+                // A row has to speak for the table: its handler serves a
+                // route here, or a row states a body case on its field.
+                let reached = model_rows.iter().any(|row| {
+                    table.handler_name.as_deref() == Some(row.handler_name.as_str())
+                        || row.dispatch.as_ref().is_some_and(|case| {
+                            case.location == crate::dispatch::DispatchLocation::Body
+                                && case.field == table.field
+                        })
+                });
+                if reached {
+                    debug!(
+                        "Dropped the body dispatch table on '{}' in {}: every route the file \
+                         states is on a method that carries no request body",
+                        table.field, file_path
+                    );
+                }
+                !reached
+            })
+            .collect()
+    }
+
+    /// GET and HEAD: the two HTTP methods that carry no request body.
+    fn carries_no_body(method: &str) -> bool {
+        ["GET", "HEAD"]
+            .iter()
+            .any(|bodyless| method.eq_ignore_ascii_case(bodyless))
     }
 
     /// Whether `endpoint` restates a row the join has already kept for this
@@ -13496,6 +13947,7 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &HashMap::new(),
+            None,
             &[],
             "src/client.ts",
             false,
@@ -13594,6 +14046,75 @@ export * from "./aFetch.js";"#,
             result.data_calls[1].resolution_source,
             Some(ResolutionSource::Model)
         );
+    }
+
+    /// A guidance sample the model copies into `pattern_matched` byte for
+    /// byte, whatever the call is (carrick#2387).
+    const GUIDANCE_SAMPLE: &str = "fetch('https://api.example.com/users')";
+
+    /// The model answers with a guidance sample as its `pattern_matched`. A
+    /// row it states alone publishes the callee the AST read at the span, a
+    /// row at no candidate publishes no client, and a fact row keeps its own
+    /// pattern on the join. Putting the model's text back on any of the three
+    /// fails here.
+    #[test]
+    fn a_published_client_is_the_ast_callee_never_the_models_pattern() {
+        let candidate = candidate_with_snippet("c1", Some("/api/orders"));
+        let candidate_map = HashMap::from([("c1".to_string(), candidate)]);
+        let model_row = |id: &str, target: &str, span: u32| DataCallResult {
+            candidate_id: id.to_string(),
+            pattern_matched: GUIDANCE_SAMPLE.to_string(),
+            ..model_call("GET", target, span, "Order")
+        };
+        let mut fact = stated_call("POST", "/api/links", 500);
+        fact.pattern_matched = "links.create(".to_string();
+        let mut result = FileAnalysisResult {
+            data_calls: vec![fact],
+            ..Default::default()
+        };
+        let mut stats = ProcessingStats::default();
+        FileOrchestrator::join_model_rows(
+            &mut result,
+            FileAnalysisResult {
+                data_calls: vec![
+                    // Joins the candidate: the site's callee is `get`.
+                    model_row("c1", "/api/orders", 0),
+                    // Joins no candidate: no callee was read.
+                    model_row("span:900-940", "/api/orphans", 900),
+                    // Twin of the fact row at span 500.
+                    DataCallResult {
+                        method: Some("POST".to_string()),
+                        ..model_row("span:500-540", "/api/links", 500)
+                    },
+                ],
+                ..Default::default()
+            },
+            &candidate_map,
+            None,
+            &[],
+            "src/client.ts",
+            false,
+            &mut stats,
+        );
+
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &HashMap::from([("src/client.ts".to_string(), result)]),
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let client = |path: &str| {
+            graph
+                .data_calls
+                .iter()
+                .find(|call| call.target_url == path)
+                .unwrap_or_else(|| panic!("no row for {path}"))
+                .client
+                .clone()
+        };
+        assert_eq!(client("/api/orders"), "get");
+        assert_eq!(client("/api/orphans"), "");
+        assert_eq!(client("/api/links"), "links.create(");
     }
 
     /// A data call with no method at all — what extraction emits for a site
@@ -15231,6 +15752,7 @@ export * from "./aFetch.js";"#,
             call_body: at_caller.then_some(crate::forwarded_body::CallBody::Built),
             library_semantics: Vec::new(),
             base_fallbacks: None,
+            request_at: (std::path::PathBuf::from("src/availability.ts"), 40),
         };
         for at_caller in [true, false] {
             let resolved = FileOrchestrator::summary_resolved(
@@ -18261,6 +18783,35 @@ export { routes };
             file_path,
             false,
             &HashMap::new(),
+            None,
+        )
+    }
+
+    /// The same seam with the source a file's path literals are read from
+    /// (carrick#2382).
+    fn emit_and_join_with_source(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        route_endpoints: &[EndpointResult],
+        source: &str,
+        file_path: &str,
+        route_module_claimed: bool,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        let path_literals =
+            RouteLiteralWitness::of_source(file_path, source).expect("the source parses");
+        emit_and_join_core(
+            model,
+            candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &LiteralBaseMap::new(),
+            route_endpoints,
+            file_path,
+            route_module_claimed,
+            &HashMap::new(),
+            Some(&path_literals),
         )
     }
 
@@ -18290,6 +18841,7 @@ export { routes };
             file_path,
             route_module_claimed,
             receiver_roles,
+            None,
         )
     }
 
@@ -18308,6 +18860,7 @@ export { routes };
         file_path: &str,
         route_module_claimed: bool,
         receiver_roles: &HashMap<u32, ReceiverRole>,
+        path_literals: Option<&RouteLiteralWitness>,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
         let resolved = FileOrchestrator::resolve_candidates(
@@ -18335,6 +18888,7 @@ export { routes };
             &mut result,
             model,
             candidate_map,
+            path_literals,
             &overrules,
             file_path,
             route_module_claimed,
@@ -18412,6 +18966,256 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// A GET carries no request body, so a `body` case on one is not a case
+    /// (carrick#2110): two values a handler reads off the query string are one
+    /// route stated twice, folded into one row. Each branch answers its own
+    /// response and one row carries one type, so the row keeps a response
+    /// only where every branch states the same one: two different responses,
+    /// or one stated beside one not, leave it stating none (unverifiable),
+    /// never the first branch's. A `header` case on the same method, and a
+    /// `body` case on a method that carries one, stay cases. A route a method
+    /// with a body states twice keeps the first row as it was: the fold's
+    /// anchor rule is the bodyless fold's alone.
+    #[test]
+    fn a_body_case_on_a_method_with_no_body_is_dropped_and_the_rows_are_one() {
+        let case = |location: crate::dispatch::DispatchLocation, value: &str| {
+            Some(crate::dispatch::Dispatch {
+                location,
+                field: "mode".to_string(),
+                value: value.to_string(),
+            })
+        };
+        let (body, header) = (
+            crate::dispatch::DispatchLocation::Body,
+            crate::dispatch::DispatchLocation::Header,
+        );
+        let mut candidates = HashMap::new();
+        let mut rows = Vec::new();
+        let one_reading = [("simple", None), ("advanced", Some("report"))];
+        for (line, method, path, location, readings) in [
+            (
+                10i32,
+                "GET",
+                "/reports/:id",
+                Some(body),
+                [("simple", Some("summary")), ("advanced", Some("report"))],
+            ),
+            (20, "head", "/reports/:id", Some(body), one_reading),
+            (
+                25,
+                "GET",
+                "/totals",
+                Some(body),
+                [("simple", Some("totals")), ("advanced", Some("totals"))],
+            ),
+            (30, "GET", "/feed", Some(header), one_reading),
+            (40, "POST", "/reports", Some(body), one_reading),
+            (50, "POST", "/orders", None, one_reading),
+        ] {
+            let id = format!("site{line}");
+            let mut candidate = candidate_with_snippet(&id, Some(&format!("'{path}'")));
+            candidate.span_start = line as u32 * 10;
+            candidate.span_end = line as u32 * 10 + 5;
+            candidate.line_number = line as usize;
+            candidate.end_line = line as usize;
+            candidate.callee_object = "app".to_string();
+            candidate.callee_property = Some(method.to_ascii_lowercase());
+            candidates.insert(id.clone(), candidate);
+            for (value, response) in readings {
+                rows.push(EndpointResult {
+                    handler_declaration_line: None,
+                    registration_literal: None,
+                    view_module: false,
+                    candidate_id: id.clone(),
+                    line_number: line,
+                    owner_node: "app".to_string(),
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    handler_name: "<anonymous>".to_string(),
+                    pattern_matched: "app.".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: response.map(str::to_string),
+                    response_expression_line: response.map(|_| line),
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    resolution_source: None,
+                    dispatch: location.and_then(|location| case(location, value)),
+                });
+            }
+        }
+
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            &candidates,
+            "src/reports.ts",
+        );
+
+        let mut kept: Vec<(i32, Option<String>, Option<&str>)> = result
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.line_number,
+                    endpoint.dispatch.as_ref().map(|case| case.key()),
+                    endpoint.response_expression_text.as_deref(),
+                )
+            })
+            .collect();
+        kept.sort();
+        let key = |location, value: &str| case(location, value).map(|case| case.key());
+        assert_eq!(
+            kept,
+            vec![
+                (10, None, None),
+                (20, None, None),
+                (25, None, Some("totals")),
+                (30, key(header, "advanced"), Some("report")),
+                (30, key(header, "simple"), None),
+                (40, key(body, "advanced"), Some("report")),
+                (40, key(body, "simple"), None),
+                (50, None, None),
+            ],
+        );
+    }
+
+    /// A `body` dispatch table whose cases no call can send (carrick#2110) is
+    /// not carried, and that is proven only when every route the file states
+    /// is GET or HEAD. One POST in the file, stated by the model with no case
+    /// or by the file layout, may call the same helper with a body, so every
+    /// table stays. A `header` table, and a body table no row speaks for,
+    /// always stay.
+    #[test]
+    fn a_body_dispatch_table_on_a_handler_with_no_body_is_dropped() {
+        let row = |method: &str, handler: &str, case: Option<&str>| EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: format!("{method}-{handler}"),
+            line_number: 1,
+            owner_node: String::new(),
+            method: method.to_string(),
+            path: format!("/{handler}"),
+            handler_name: handler.to_string(),
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: case.map(|field| crate::dispatch::Dispatch {
+                location: DispatchLocation::Body,
+                field: field.to_string(),
+                value: "a".to_string(),
+            }),
+        };
+        let table = |location: DispatchLocation, handler: Option<&str>, field: &str| {
+            crate::dispatch::DispatchTable {
+                location,
+                field: field.to_string(),
+                values: vec!["a".to_string(), "b".to_string()],
+                handler_name: handler.map(str::to_string),
+                file_path: String::new(),
+                line_number: None,
+                service_name: None,
+                repo_name: None,
+            }
+        };
+        // Each file: its model rows, its deterministic rows, and the tables
+        // that must survive (by handler and field) out of the three offered.
+        let offered = || {
+            vec![
+                table(DispatchLocation::Body, Some("reads"), "view"),
+                table(DispatchLocation::Header, Some("reads"), "view"),
+                table(DispatchLocation::Body, Some("helper"), "mode"),
+                table(DispatchLocation::Body, Some("elsewhere"), "other"),
+            ]
+        };
+        let every = [
+            (DispatchLocation::Body, "reads", "view"),
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "helper", "mode"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let header_and_unspoken = [
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let files: Vec<(&str, Vec<EndpointResult>, Vec<EndpointResult>, &[_])> = vec![
+            // Every route is GET or HEAD: the handler's table and the
+            // helper's table (linked by the body case on `mode`) go.
+            (
+                "only GET and HEAD",
+                vec![
+                    row("GET", "reads", None),
+                    row("HEAD", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![],
+                &header_and_unspoken,
+            ),
+            // A POST in the same file may call the helper, with no case
+            // stated: nothing proves the switch is GET-only.
+            (
+                "a POST with no case",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("POST", "submit", None),
+                ],
+                vec![],
+                &every,
+            ),
+            // The POST is stated by the file layout, not by the model.
+            (
+                "a deterministic POST",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![row("POST", "POST", None)],
+                &every,
+            ),
+        ];
+        for (label, model_rows, stated_rows, survive) in files {
+            let kept: Vec<(DispatchLocation, String, String)> =
+                FileOrchestrator::tables_with_a_body(
+                    offered(),
+                    &model_rows,
+                    &stated_rows,
+                    "src/reports.ts",
+                )
+                .into_iter()
+                .map(|table| {
+                    (
+                        table.location,
+                        table.handler_name.unwrap_or_default(),
+                        table.field,
+                    )
+                })
+                .collect();
+            let survive: Vec<(DispatchLocation, String, String)> = survive
+                .iter()
+                .map(|(location, handler, field)| {
+                    (*location, handler.to_string(), field.to_string())
+                })
+                .collect();
+            assert_eq!(kept, survive, "{label}");
+        }
     }
 
     /// Two routers declared in one file and mounted at different prefixes
@@ -18800,17 +19604,237 @@ export { routes };
         };
         let mut candidate_map = HashMap::new();
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
-        let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints.len(), 1);
         assert_eq!(result.endpoints[0].path, "/known");
+        // carrick#2382: the drop is counted and named, not only logged.
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+        assert_eq!(
+            stats.model_endpoints_dropped_unanchored_sites,
+            vec!["src/app.ts:12 GET /invented".to_string()]
+        );
 
         // Route 2: force-analyzed, no candidates offered at all.
         let forced = FileAnalysisResult {
             endpoints: vec![endpoint_with_candidate("/a", "c1")],
             ..Default::default()
         };
-        let (forced, _) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
+        let (forced, stats) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+    }
+
+    // --- carrick#2382: a made-up id kept on a path literal the file compares -
+
+    /// One listed candidate that states no route path: a call the handler
+    /// makes, so no route row can anchor on it.
+    fn one_listed_call() -> HashMap<String, CandidateTarget> {
+        HashMap::from([("c1".to_string(), candidate_with_snippet("c1", None))])
+    }
+
+    /// A model route at line 3 with an id that names no listed site.
+    fn route_with_a_made_up_id(method: &str, path: &str) -> EndpointResult {
+        let mut row = endpoint_with_candidate(path, "endpoint:made-up");
+        row.method = method.to_string();
+        row.line_number = 3;
+        row
+    }
+
+    fn join_on_source(
+        rows: Vec<EndpointResult>,
+        candidates: &HashMap<String, CandidateTarget>,
+        source: &str,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_with_source(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            candidates,
+            &[],
+            source,
+            "src/worker.ts",
+            false,
+        )
+    }
+
+    /// Each comparison form the language writes a route with keeps the row,
+    /// at the model's own line with no span, as the listed-id arm keeps one.
+    #[test]
+    fn a_made_up_id_route_is_kept_when_the_file_compares_a_path_against_it() {
+        for (source, method, path) in [
+            ("if (pathname === \"/items\") {}", "GET", "/items"),
+            (
+                "switch (pathname) { case \"/health\": break; }",
+                "GET",
+                "/health",
+            ),
+            (
+                "if (pathname.startsWith(\"/items/\")) {}",
+                "DELETE",
+                "/items/:id",
+            ),
+            (
+                "if (pathname.startsWith(ITEM_PREFIX)) {}\nconst ITEM_PREFIX = \"/items/\";",
+                "DELETE",
+                "/items/:id",
+            ),
+            ("if (pathname === `/items`) {}", "POST", "/items"),
+        ] {
+            let (result, stats) = join_on_source(
+                vec![route_with_a_made_up_id(method, path)],
+                &one_listed_call(),
+                source,
+            );
+            assert_eq!(result.endpoints.len(), 1, "{source}");
+            let row = &result.endpoints[0];
+            assert_eq!((row.method.as_str(), row.path.as_str()), (method, path));
+            assert_eq!(row.line_number, 3, "the model's own line: {source}");
+            assert_eq!(row.call_expression_span_start, None, "{source}");
+            assert_eq!(row.call_expression_span_end, None, "{source}");
+            assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+            assert_eq!(stats.model_routes_kept_on_a_path_literal, 1, "{source}");
+            assert_eq!(stats.model_only_rows, 1, "{source}");
+            assert_eq!(stats.model_routes_kept_without_a_site, 0, "{source}");
+            assert_eq!(stats.model_endpoints_dropped_unanchored, 0, "{source}");
+        }
+    }
+
+    /// A path the file states nowhere in a dispatch position is no witness,
+    /// so the row is dropped and counted as before.
+    #[test]
+    fn a_made_up_id_route_with_no_compared_path_literal_is_dropped_and_counted() {
+        for (source, path) in [
+            ("export default {};", "/items"),
+            ("await fetch(\"/items\", { method: \"POST\" });", "/items"),
+            ("const routes = { \"/items\": list };", "/items"),
+            ("if (pathname === \"/items/\") {}", "/items/:id"),
+            ("if (pathname.startsWith(\"/\")) {}", "/:id"),
+            ("if (pathname === \"/:id\") {}", "/:id"),
+            (
+                "const P = \"/items\";\nfunction f(P) { return pathname === P; }",
+                "/items",
+            ),
+        ] {
+            let (result, stats) = join_on_source(
+                vec![route_with_a_made_up_id("GET", path)],
+                &one_listed_call(),
+                source,
+            );
+            assert!(result.endpoints.is_empty(), "{source}");
+            assert_eq!(stats.model_endpoints_dropped_unanchored, 1, "{source}");
+            assert_eq!(
+                stats.model_endpoints_dropped_unanchored_sites,
+                vec![format!("src/worker.ts:3 GET {path}")],
+                "{source}"
+            );
+            assert_eq!(stats.model_routes_kept_on_a_path_literal, 0, "{source}");
+        }
+    }
+
+    /// A force-analyzed file offered no candidate (carrick#462), so a witness
+    /// does not keep its rows: the drop and its count stay.
+    #[test]
+    fn a_force_analyzed_file_keeps_the_drop_whatever_its_source_compares() {
+        let (result, stats) = join_on_source(
+            vec![route_with_a_made_up_id("GET", "/items")],
+            &HashMap::new(),
+            "if (pathname === \"/items\") {}",
+        );
+        assert!(result.endpoints.is_empty());
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
+    }
+
+    /// In a module a routing convention claimed, the witness never admits a
+    /// row the convention's route set excludes (carrick#703): the row is
+    /// discarded there and counted as a claimed-module discard, not a drop.
+    #[test]
+    fn a_witnessed_made_up_id_route_in_a_claimed_module_is_discarded_by_the_convention() {
+        let derived = synthetic_endpoint("GET", "/settings/builds");
+        let (result, stats) = emit_and_join_with_source(
+            FileAnalysisResult {
+                endpoints: vec![route_with_a_made_up_id("POST", "/api/build-settings")],
+                ..Default::default()
+            },
+            &one_listed_call(),
+            std::slice::from_ref(&derived),
+            "if (pathname === \"/api/build-settings\") {}",
+            "app/routes/settings.builds.tsx",
+            true,
+        );
+        assert_eq!(result.endpoints.len(), 1, "{:?}", result.endpoints);
+        assert_eq!(result.endpoints[0].path, "/settings/builds");
+        assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 1);
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 0);
+        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
+        assert_eq!(stats.model_only_rows, 0);
+    }
+
+    /// A case of a body-dispatching handler with a made-up id is kept as a
+    /// model case row, the way the listed-id arm keeps one (carrick#2048).
+    #[test]
+    fn a_witnessed_made_up_id_case_is_kept_as_a_model_case_row() {
+        let mut case = route_with_a_made_up_id("PATCH", "/things");
+        case.dispatch = Some(crate::dispatch::Dispatch {
+            location: crate::dispatch::DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "archive".to_string(),
+        });
+        let (result, stats) = join_on_source(
+            vec![case],
+            &one_listed_call(),
+            "if (url.pathname === \"/things\") {}",
+        );
+        assert_eq!(result.endpoints.len(), 1);
+        let row = &result.endpoints[0];
+        assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+        assert_eq!(
+            row.dispatch.as_ref().map(|d| d.value.as_str()),
+            Some("archive")
+        );
+        assert_eq!(row.call_expression_span_start, None);
+        assert_eq!(stats.model_routes_kept_on_a_path_literal, 1);
+    }
+
+    /// carrick#2382: a candidate that holds a route literal and states no
+    /// readable verb (a redirect, a bare call) is a gap the same as a verb
+    /// call is. A mount the model answered on its line is not a gap.
+    #[test]
+    fn a_route_literal_candidate_without_a_readable_verb_is_counted_unless_a_mount_answers_it() {
+        use crate::wrapper_request_shape::RequestShapeSignal;
+        for shape in [
+            RequestShapeSignal::NotARequest,
+            RequestShapeSignal::Unreadable,
+        ] {
+            let mut candidate = candidate_with_snippet("c1", Some("\"/login\""));
+            candidate.request_shape = shape;
+            let candidates = HashMap::from([("c1".to_string(), candidate)]);
+            let (_, stats) = emit_and_join(FileAnalysisResult::default(), &candidates, "src/a.ts");
+            assert_eq!(stats.unemitted_literal_candidates, 1);
+            assert_eq!(
+                stats.unemitted_literal_sites,
+                vec!["src/a.ts:12".to_string()]
+            );
+        }
+
+        let candidates = HashMap::from([(
+            "c1".to_string(),
+            candidate_with_snippet("c1", Some("\"/api\"")),
+        )]);
+        let mounted = FileAnalysisResult {
+            mounts: vec![crate::agents::file_analyzer_agent::MountResult {
+                line_number: 12,
+                parent_node: "app".to_string(),
+                child_node: "router".to_string(),
+                mount_path: "/api".to_string(),
+                import_source: None,
+                pattern_matched: "app.use".to_string(),
+            }],
+            ..Default::default()
+        };
+        let (_, stats) = emit_and_join(mounted, &candidates, "src/a.ts");
+        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     fn request_spec_candidate(id: &str, method: &str, url: &str) -> CandidateTarget {

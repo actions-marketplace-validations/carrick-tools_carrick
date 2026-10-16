@@ -264,11 +264,11 @@ pub(super) enum TextPiece {
 pub(super) struct NamedRef {
     /// The file's own name for the binding: a module-scope `const` or
     /// function of the file, or an import binding.
-    binding: String,
+    pub(super) binding: String,
     /// The entries walked into it (`["users", "byId"]`).
-    path: Vec<String>,
+    pub(super) path: Vec<String>,
     /// The builder's arguments, each as text pieces, when it is called.
-    args: Option<Vec<Vec<TextPiece>>>,
+    pub(super) args: Option<Vec<Vec<TextPiece>>>,
 }
 
 /// What a module-scope binding holds, as a name reads it (carrick#1562): a
@@ -1578,6 +1578,43 @@ impl<'a> LinkedNames<'a> {
             push_pieces(&mut out, read);
         }
         Some(out)
+    }
+
+    /// Whether the binding `name` in `file` is known to hold no text: the
+    /// module that declares it, followed through the modules that re-export
+    /// it, declares it as something other than a name (a function, a
+    /// builder not called, an instance, a router). A package's binding, a
+    /// namespace's, or one the scan cannot follow may hold anything, so is
+    /// not known (carrick#2386).
+    pub(super) fn holds_no_text(&self, file: &Path, name: &str) -> bool {
+        let mut at = (file.to_path_buf(), name.to_string());
+        for _ in 0..=super::MAX_REEXPORT_HOPS {
+            let Some(ir) = self.files.get(&at.0) else {
+                return false;
+            };
+            match ir.names.get(&at.1) {
+                Some(NameValue::Builder(_)) => return true,
+                Some(_) => return false,
+                None => {}
+            }
+            if !ir.imported.contains_key(&at.1) {
+                return true;
+            }
+            match self.bindings.get(&at.0, &at.1) {
+                Some(super::ImportedBinding::Binding { file, name }) => {
+                    at = (file.clone(), name.clone());
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `pieces`, read in `file`, as one text: `None` unless every named
+    /// piece reads as text ([`Self::resolve`]). What a guard compares a
+    /// value against, when it names a constant (carrick#2386).
+    pub(super) fn text(&self, file: &Path, pieces: &[TextPiece]) -> Option<String> {
+        split_text(self.resolve(file, pieces, 0)).0
     }
 
     /// `arg`, read in `file`, with every named piece read

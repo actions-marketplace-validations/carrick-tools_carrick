@@ -949,7 +949,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let services = resolve_services(repo_path)?;
+    let crate::service_derivation::ScanServices {
+        services,
+        declared,
+        without_source: members_without_source,
+    } = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
         info!("Resolved {} services in {}", services.len(), repo_name);
@@ -1009,6 +1013,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             crate::change_scope::ThisRun {
                 scanner_version: env!("CARGO_PKG_VERSION"),
                 cache_version: CACHE_VERSION,
+                asks_model: !crate::local_mode::no_model(),
             },
         )
     } else {
@@ -1083,6 +1088,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // place, every analysed one's outcome in its.
     let mut outcomes: Vec<Option<ServiceOutcome>> = outcomes.into_iter().map(Some).collect();
     let mut first_failure = None;
+    // Services nobody declared whose walk read no source (carrick#2298).
+    let mut without_source = Vec::new();
     for (index, service) in services.iter().enumerate() {
         let Some(at) = scan_index[index] else {
             // Carried, which only a service with a stored generation is, and
@@ -1098,10 +1105,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .expect("every analysed service has an outcome")
         {
             Ok(run) => runs.push(run),
+            Err(error) if !declared && error.is::<NoSourceFiles>() => {
+                without_source.push((index, error));
+            }
             Err(error) => {
                 first_failure.get_or_insert((index, error));
             }
         }
+    }
+    // No service of the run holds source: the scan target is wrong, which is
+    // the failure it always was.
+    if runs.is_empty() && first_failure.is_none() && !without_source.is_empty() {
+        first_failure = Some(without_source.remove(0));
     }
     if let Some((index, error)) = first_failure {
         // Not a model failure — those defer, they do not reach here — so
@@ -1135,10 +1150,42 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     git_state.dirty,
                     unchanged_at_start.as_ref(),
                 );
+                // The landing is an upload and says so while it runs. The
+                // failure it follows was raised in the analysis, and the
+                // stage the run reports is that one (carrick#2298). With
+                // services analysed side by side it is the last stage any of
+                // them entered, as `scan_stage` keeps it.
+                let failed_in = crate::scan_stage::current();
                 upload_service_payloads(storage, &payloads, no_cache, false, &boundary).await;
+                crate::scan_stage::enter(failed_in);
             }
         }
         return Err(error);
+    }
+    // The services left out take no further part: everything below reads
+    // `services`, `scan_index` and `runs` position for position.
+    let services_without_source: Vec<String> = without_source
+        .iter()
+        .map(|(index, _)| {
+            let service = &services[*index];
+            service
+                .service_name
+                .clone()
+                .or_else(|| service.directory.clone())
+                .unwrap_or_else(|| "(root)".to_string())
+        })
+        .collect();
+    let (services, scan_index): (Vec<Config>, Vec<Option<usize>>) = services
+        .into_iter()
+        .zip(scan_index)
+        .enumerate()
+        .filter(|(index, _)| !without_source.iter().any(|(left_out, _)| left_out == index))
+        .map(|(_, kept)| kept)
+        .unzip();
+    // What the index lacks is not told to a person reading the scan: the
+    // debug log keeps it (carrick#2298).
+    for line in without_source_lines(&members_without_source, &services_without_source) {
+        debug!("{line}");
     }
 
     // 4a. A dispatched run ends here, and this is its whole product: every
@@ -1392,6 +1439,25 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
         }
     }
+    // 4d. A model row at a call through the repository's own code takes the
+    // request that call reaches (carrick#1146). Here, because the request is
+    // usually written in another service: this is the first point at which
+    // every service's rows and definitions are in hand, and the last before
+    // the payloads and the cross-service check are built from them. A
+    // carried or held-back service is read and never written: the generation
+    // the index serves stands in for it.
+    {
+        let mut services: Vec<crate::call_through::ServiceRows<'_>> = runs
+            .iter_mut()
+            .map(|run| crate::call_through::ServiceRows {
+                writable: !run.carried && !run.held_back,
+                data: &mut run.data,
+                sites: &run.call_through,
+            })
+            .collect();
+        crate::call_through::settle(&mut services);
+    }
+
     // Whether this run leaves a service short of a complete index. A missing
     // function description alone does not: it never held an index back.
     let incomplete = runs.iter().any(|run| run.owed.thins_the_index());
@@ -2135,6 +2201,9 @@ struct ServiceRun {
     /// Not analysed: `data` is its stored generation (`--changed-only`,
     /// carrick#2227).
     carried: bool,
+    /// The definitions each of its model call rows goes through, for the
+    /// pass that settles them once every service is read (carrick#1146).
+    call_through: crate::call_through::CallThroughSites,
 }
 
 impl ServiceRun {
@@ -2151,6 +2220,7 @@ impl ServiceRun {
             owed: durability::OwedWork::default(),
             held_back: false,
             carried: true,
+            call_through: Default::default(),
         }
     }
 }
@@ -2244,8 +2314,12 @@ impl ServiceScan {
         .await
         // The one place the error is flattened: what is not the model's to
         // defer ends the run with its words, and nothing downstream reads its
-        // type.
-        .map_err(|error| error.to_string().into())
+        // type. Except a walk that read no source, which the run may leave
+        // out instead (carrick#2298).
+        .map_err(|error| match error.downcast::<NoSourceFiles>() {
+            Ok(no_source) => no_source as Box<dyn std::error::Error + Send + Sync>,
+            Err(error) => error.to_string().into(),
+        })
     }
 
     /// [`Self::analyze`] inside the service's [`crate::current_service`] scope.
@@ -2378,6 +2452,7 @@ impl ServiceScan {
             owed,
             held_back: false,
             carried: false,
+            call_through: analysis.call_through,
         })
     }
 }
@@ -2524,6 +2599,10 @@ fn local_boundaries(
 /// Stdout, beside the report it belongs to. The eval projection mode returns
 /// long before this, so the machine-readable output on stdout is never mixed
 /// with it.
+///
+/// The services left out for holding no source are not named here
+/// ([`without_source_lines`] goes to the debug log): a gap in the index is
+/// told to the agent that reads the results, not to a person.
 fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
     if boundaries.is_empty() {
         return;
@@ -3282,12 +3361,38 @@ fn hash_workspace_package_jsons(
 ) -> Result<String, std::io::Error> {
     let repo_root = Path::new(repo_path);
     let inputs = crate::deno_support::resolution_inputs(repo_root, &packages.source_paths)?;
+    // A manifest's key is part of what every stored blob's hash was computed
+    // from, so it stays what was written for each way of naming the root
+    // (carrick#2314, pinned by `tests/manifest_hash_pin_test.rs`):
+    //
+    // - A manifest under `repo_root` as spelled: its path inside the tree.
+    // - A relative manifest path (the root was named `.` or by a relative
+    //   path, and `repo_root` is its canonical form): the path as written,
+    //   `./apps/api/package.json`. It names no machine, and every blob
+    //   stored by a scan run as `carrick .` was hashed with it. Making it
+    //   agree with the absolute spelling is carrick#1715.
+    // - An absolute manifest path `repo_root` does not prefix (a symlink on
+    //   the way in, resolved in one and not the other): its path inside the
+    //   tree. Written as it stands it would name the directory the checkout
+    //   sits in, and a second checkout of one commit would ask for its setup
+    //   again.
+    let canonical_root = repo_root.canonicalize().ok();
+    let inside = |path: &Path| -> Option<PathBuf> {
+        if let Ok(relative) = path.strip_prefix(repo_root) {
+            return Some(relative.to_path_buf());
+        }
+        if path.is_relative() {
+            return None;
+        }
+        let root = canonical_root.as_ref()?;
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.strip_prefix(root).ok()?.join(path.file_name()?))
+    };
     let mut keyed: Vec<(String, &PathBuf)> = inputs
         .iter()
         .map(|path| {
-            let relative = path
-                .strip_prefix(repo_root)
-                .unwrap_or(path)
+            let relative = inside(path)
+                .unwrap_or_else(|| path.clone())
                 .to_string_lossy()
                 .to_string();
             (relative, path)
@@ -4011,9 +4116,21 @@ async fn analyze_current_repo_incremental(
             // phases add up to `analysis` rather than falling short of it.
             crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
+            let call_through = crate::call_through::read_sites(
+                &merged_results,
+                &request_inputs,
+                repo_path,
+                &cloud_data.function_definitions,
+                &|file, function| {
+                    analysis
+                        .passes_body
+                        .contains(&(file.to_path_buf(), function.to_string()))
+                },
+            );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
                 deferred: setup.deferred,
+                call_through,
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -7434,10 +7551,9 @@ fn discover_files_and_symbols(
                     .join("; ")
             )
         };
-        return Err(format!(
+        return Err(Box::new(NoSourceFiles(format!(
             "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
-        )
-        .into());
+        ))));
     }
     for left_out in &left_out {
         info!("{}", left_out_line(left_out));
@@ -7497,8 +7613,11 @@ fn discover_files_and_symbols(
                 .keys()
                 .cloned()
                 .collect();
-            let request_ir =
+            let mut request_ir =
                 crate::request_summary::extract_file_ir(&module, &cm, &definition_keys);
+            // Which functions the module offers, keyed as the extractor keys
+            // them, for where a guard's chain ends (carrick#2386).
+            request_ir.place_definitions(&func_extractor.function_definitions);
 
             let canonical = file_path
                 .canonicalize()
@@ -7519,6 +7638,7 @@ fn discover_files_and_symbols(
                     computed_requires,
                     field_types: func_extractor.field_types,
                     instances: crate::receiver_type::module_scope_types(&module),
+                    factories: crate::receiver_type::factory_tables(&module),
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
@@ -7847,8 +7967,61 @@ fn semantics_schedule_applies(generation: PreviousGeneration) -> bool {
 /// A config that exists but cannot be parsed, or that declares paths that
 /// don't exist, is a hard error: silently falling back to defaults would
 /// ignore the user's declared service layout and upload a wrong index.
-fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
-    crate::service_derivation::resolve_for_scan(std::path::Path::new(repo_path)).map_err(Into::into)
+///
+/// The list comes with where it came from: a service nobody declared that
+/// holds no source is left out of the run rather than failing it
+/// (carrick#2298).
+fn resolve_services(
+    repo_path: &str,
+) -> Result<crate::service_derivation::ScanServices, Box<dyn std::error::Error>> {
+    crate::service_derivation::scan_services(std::path::Path::new(repo_path)).map_err(Into::into)
+}
+
+/// A service's walk read no source file.
+///
+/// Typed because the run decides on it: for a service somebody declared in
+/// `carrick.json` it is a wrong path and fails the scan; a service nobody
+/// declared is left out and named in the debug log (carrick#2298).
+#[derive(Debug)]
+struct NoSourceFiles(String);
+
+impl std::fmt::Display for NoSourceFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoSourceFiles {}
+
+/// What the debug log says about the services the run left out because they
+/// hold no source (carrick#2298): the workspace members the derivation
+/// dropped, in one line, then one line for each service whose walk read
+/// nothing.
+fn without_source_lines(members: &[String], services: &[String]) -> Vec<String> {
+    /// Directories named before the rest become a count.
+    const NAMED: usize = 5;
+    let mut lines = Vec::new();
+    if !members.is_empty() {
+        let mut named = members
+            .iter()
+            .take(NAMED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if members.len() > NAMED {
+            named.push_str(&format!(" and {} more", members.len() - NAMED));
+        }
+        lines.push(format!(
+            "{} workspace member(s) left out, no JS/TS source: {named}",
+            members.len()
+        ));
+    }
+    lines.extend(
+        services.iter().map(|service| {
+            format!("{service}: left out, the scan read no JS/TS source file in it")
+        }),
+    );
+    lines
 }
 
 /// Build-artifact directories to skip everywhere.
@@ -9528,9 +9701,21 @@ async fn analyze_current_repo(
     ));
     crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
+    let call_through = crate::call_through::read_sites(
+        &analysis_result.file_results,
+        &request_inputs,
+        repo_path,
+        &cloud_data.function_definitions,
+        &|file, function| {
+            analysis_result
+                .passes_body
+                .contains(&(file.to_path_buf(), function.to_string()))
+        },
+    );
     Ok(ServiceAnalysis {
         data: cloud_data,
         deferred: setup.deferred,
+        call_through,
     })
 }
 
@@ -10868,6 +11053,54 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             hash_workspace_package_jsons(&packages, dir.path().to_str().unwrap()).unwrap(),
             hash_file_content("package.json\0{}\0")
         );
+    }
+
+    /// A tree reached through a symlink hashes as the tree itself, whichever
+    /// of the root and the manifest path went through the link: the hash is
+    /// what decides whether a stored setup is replayed, and two checkouts of
+    /// one commit must agree on it.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_hash_does_not_depend_on_how_the_tree_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("apps/api")).unwrap();
+        std::fs::write(real.join("apps/api/package.json"), "{}").unwrap();
+        let link = real.parent().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let expected = hash_file_content("apps/api/package.json\0{}\0");
+        for (root, manifest_root) in [(&real, &link), (&link, &real), (&real, &real)] {
+            let packages =
+                Packages::new(vec![manifest_root.join("apps/api/package.json")]).unwrap();
+            assert_eq!(
+                hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
+                expected,
+                "root {root:?}, manifest under {manifest_root:?}"
+            );
+        }
+    }
+
+    /// carrick#2314: a manifest the scan named by a relative path (the root
+    /// was `.` or a relative path) keeps that spelling as its key, against a
+    /// root that is canonical by then. Every blob stored by a scan run as
+    /// `carrick .` was hashed with it.
+    #[test]
+    fn a_relative_manifest_path_is_keyed_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for written in ["./apps/api/package.json", "tree/apps/api/package.json"] {
+            let packages = Packages {
+                source_paths: vec![PathBuf::from(written)],
+                ..Default::default()
+            };
+            // Nothing is read at a relative path from a test's own directory:
+            // the key is what this pins.
+            assert_eq!(
+                hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
+                hash_file_content(&format!("{written}\0missing\0")),
+                "{written}"
+            );
+        }
     }
 
     #[test]
@@ -14281,7 +14514,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     #[test]
     fn resolve_services_without_config_defaults_to_single_service() {
         let tmp = tempfile::tempdir().unwrap();
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 1);
         assert!(services[0].directory.is_none());
     }
@@ -14347,7 +14582,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         )
         .unwrap();
 
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 3);
         assert!(services[0].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
         assert!(services[1].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
@@ -14399,7 +14636,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         )
         .unwrap();
 
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].directory.as_deref(), Some("svc"));
     }
@@ -14749,6 +14988,269 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             silent.len(),
             1,
             "only `bump()` is proven silent: {silent:?}"
+        );
+    }
+
+    /// The span start a site's call carries ([`crate::request_summary`]'s
+    /// `Site::span_start`): the offset of `needle` in `source`, in SWC
+    /// numbering.
+    fn site_start(source: &str, needle: &str) -> u32 {
+        let offset = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not in the source"));
+        u32::try_from(offset).unwrap() + crate::swc_scanner::SWC_SPAN_BASE
+    }
+
+    /// carrick#2281: a call of a function that binds a name and hands back a
+    /// callable sends nothing where it is written, at module level as inside
+    /// a body. The callable sends later, through a nested function that
+    /// forwards the name, and whether it runs is not the call's to say.
+    /// Holds whether the transport is a package the scan does not read or an
+    /// object of the repository whose method calls `fetch`.
+    #[test]
+    fn a_call_that_binds_a_name_into_a_callable_is_silent_at_module_level() {
+        let handlers = "import { bind } from \"./bind\";\n\nfunction localList() {\n  return [];\n}\n\nexport const listOrders = bind(localList, \"orders.list\", { timeoutMs: 1 });\n\nexport function later() {\n  return bind(localList, \"orders.read\", { timeoutMs: 1 });\n}\n";
+        let bind = |transport: &str| {
+            format!(
+                "import {{ transport }} from \"{transport}\";\n\nexport function bind<T>(local: T, name: string, options: {{ timeoutMs: number }}) {{\n  const timeout = options.timeoutMs;\n  return async (...rest: unknown[]) => {{\n    const send = () => transport.post(name, rest);\n    return send();\n  }};\n}}\n"
+            )
+        };
+        let package = bind("rpc-transport");
+        let own = bind("./transport");
+        let variants: [(&str, Vec<(&str, &str)>); 2] = [
+            (
+                "a package's transport",
+                vec![("src/handlers.ts", handlers), ("src/bind.ts", &package)],
+            ),
+            (
+                "the repository's transport",
+                vec![
+                    ("src/handlers.ts", handlers),
+                    ("src/bind.ts", &own),
+                    (
+                        "src/transport.ts",
+                        "const BASE = process.env.RPC_URL;\n\nexport const transport = {\n  post(name: string, args: unknown) {\n    return fetch(`${BASE}/rpc`, { method: \"POST\", body: JSON.stringify({ name, args }) });\n  },\n};\n",
+                    ),
+                ],
+            ),
+        ];
+        for (variant, files) in variants {
+            let (dir, discovery) = discover_sources(&files);
+            let silent = summaries_of(&discovery)
+                .silent(&dir.path().join("src/handlers.ts"))
+                .cloned()
+                .unwrap_or_default();
+            for needle in [
+                "bind(localList, \"orders.list\"",
+                "bind(localList, \"orders.read\"",
+            ] {
+                assert!(
+                    silent.contains(&site_start(handlers, needle)),
+                    "{variant}: `{needle}` is silent: {silent:?}"
+                );
+            }
+        }
+    }
+
+    /// The silent sites of `file` among `needles`, each named by the text its
+    /// call opens with.
+    fn silent_among<'n>(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+        source: &str,
+        needles: &[&'n str],
+    ) -> Vec<&'n str> {
+        let silent = summaries_of(discovery)
+            .silent(&dir.path().join(file))
+            .cloned()
+            .unwrap_or_default();
+        needles
+            .iter()
+            .copied()
+            .filter(|needle| silent.contains(&site_start(source, needle)))
+            .collect()
+    }
+
+    /// carrick#2281: a call on one of the language's own collections sends
+    /// nothing, so a function that only stores a handler in a `new Map()`
+    /// sends nothing either. A callback handed to such a call is still read,
+    /// and a collection the file cannot vouch for is not one: a binding
+    /// assigned again, or a file that binds the constructor's name itself.
+    #[test]
+    fn a_call_on_a_language_collection_sends_nothing() {
+        let use_source = "import { register, registerNamed, forEach } from \"./registry\";\nimport { swap } from \"./reassigned\";\nimport { own } from \"./own-map\";\nimport { imported } from \"./imported-map\";\n\nfunction listOrders() {\n  return [];\n}\n\nregister(listOrders, \"orders.list\");\nregisterNamed(\"orders.read\", listOrders);\nforEach(\"orders.each\");\nswap(\"orders.swap\", listOrders);\nown(\"orders.own\", listOrders);\nimported(\"orders.imported\", listOrders);\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/registry.ts",
+                "const table = new Map<string, () => unknown>();\n\nexport function register(handler: () => unknown, name: string) {\n  table.set(name, handler);\n}\n\nexport function registerNamed(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n\nexport function forEach(name: string) {\n  table.forEach(() => {\n    fetch(`/api/${name}`);\n  });\n}\n",
+            ),
+            (
+                "src/reassigned.ts",
+                "let table = new Map<string, () => unknown>();\n\nexport function reset() {\n  table = new Map();\n}\n\nexport function swap(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+            (
+                "src/own-map.ts",
+                "class Map {\n  set(name: string, value: unknown) {\n    return send(name, value);\n  }\n}\n\ndeclare function send(name: string, value: unknown): unknown;\n\nconst table = new Map();\n\nexport function own(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+            (
+                "src/imported-map.ts",
+                "import { Map } from \"remote-collections\";\n\nconst table = new Map();\n\nexport function imported(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            silent_among(
+                &dir,
+                &discovery,
+                "src/use.ts",
+                use_source,
+                &[
+                    "register(listOrders",
+                    "registerNamed(",
+                    "forEach(\"orders.each\"",
+                    "swap(",
+                    "own(",
+                    "imported(",
+                ],
+            ),
+            vec!["register(listOrders", "registerNamed("],
+            "only the calls that store into a collection the file builds and \
+             never replaces"
+        );
+    }
+
+    /// carrick#2281: a function that hands out a function that may send is
+    /// not silent at a call that writes a route, at module level or in a
+    /// body: the call may bind that route into what it hands out. A name
+    /// with no `/`, or a factory whose handed-out function is proven silent,
+    /// leaves the call silent.
+    #[test]
+    fn a_call_that_writes_a_route_into_a_handed_out_function_is_not_silent() {
+        let use_source = "import { endpoint, inert, through } from \"./endpoint\";\n\nexport const getOrder = endpoint(\"/orders/:id\");\nexport const nested = endpoint({ path: \"/orders/:id/lines\" });\nexport const named = endpoint(\"orders.read\");\nexport const quiet = inert(\"/orders/:id\");\nexport const relayed = through(\"/orders/:id/relayed\");\n\nexport function later() {\n  return endpoint(\"/orders/:id/later\");\n}\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/endpoint.ts",
+                "import { client } from \"opaque-client\";\n\nexport function endpoint(path: unknown) {\n  return (id: string) => client.call(path, id);\n}\n\nexport function inert(path: string) {\n  return (id: string) => `${path}:${id}`;\n}\n\nexport function through(path: string) {\n  return endpoint(path);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            silent_among(
+                &dir,
+                &discovery,
+                "src/use.ts",
+                use_source,
+                &[
+                    "endpoint(\"/orders/:id\")",
+                    "endpoint({",
+                    "endpoint(\"orders.read\")",
+                    "inert(",
+                    "through(",
+                    "endpoint(\"/orders/:id/later\")",
+                ],
+            ),
+            vec!["endpoint(\"orders.read\")", "inert("],
+        );
+    }
+
+    /// carrick#2281: a model row whose id joined no candidate has no span. It
+    /// is placed by its line, at the one outermost call opening there, and
+    /// withdrawn when that call is silent and the row's text writes it. The
+    /// silent set and the placement count in the same units, so a row at a
+    /// silent call goes. A row on an inner line of a multi-line call, at a
+    /// chain whose outermost call is not silent, with text naming an
+    /// argument's call, or with no text, stays.
+    #[test]
+    fn a_model_row_with_no_span_is_withdrawn_at_the_silent_call_its_line_opens() {
+        use crate::agents::file_analyzer_agent::{
+            DataCallResult, FileAnalysisResult, ResolutionSource,
+        };
+        let use_source = "import { register } from \"./registry\";\n\nfunction listOrders() {\n  return [];\n}\n\nregister(listOrders, \"orders.list\");\nregister(\n  listOrders,\n  \"orders.save\",\n);\nregister(withAudit(listOrders), \"orders.audit\");\nregister(listOrders, \"orders.then\").then(() => undefined);\n\nfunction withAudit<T>(handler: T): T {\n  return handler;\n}\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/registry.ts",
+                "const table = new Map<string, () => unknown>();\n\nexport function register(handler: () => unknown, name: string) {\n  table.set(name, handler);\n}\n",
+            ),
+        ]);
+        let path = dir.path().join("src/use.ts");
+        let silent = summaries_of(&discovery)
+            .silent(&path)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            silent.contains(&site_start(
+                use_source,
+                "register(listOrders, \"orders.list\")"
+            )),
+            "the summaries' span start and the placement's are one unit: {silent:?}"
+        );
+        let row = |line: i32, text: Option<&str>| DataCallResult {
+            candidate_id: format!("@line:{line}"),
+            line_number: line,
+            target: "/stated".to_string(),
+            method: Some("GET".to_string()),
+            call_kind: None,
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: text.map(str::to_string),
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            dispatch: None,
+            resolution_source: Some(ResolutionSource::Model),
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
+        let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                row(7, Some("register(listOrders, \"orders.list\")")),
+                row(8, Some(multi_line)),
+                row(10, Some(multi_line)),
+                row(
+                    12,
+                    Some("register(withAudit(listOrders), \"orders.audit\")"),
+                ),
+                row(12, Some("withAudit(listOrders)")),
+                row(13, Some("register(listOrders, \"orders.then\")")),
+                row(13, Some(chain)),
+                row(7, None),
+            ],
+            ..Default::default()
+        };
+        let withdrawn = crate::agents::file_orchestrator::FileOrchestrator::withdraw_silent_sites(
+            &mut result,
+            &silent,
+            &path,
+            use_source,
+        );
+        let kept: Vec<(i32, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.line_number, call.call_expression_text.as_deref()))
+            .collect();
+        assert_eq!(withdrawn, 3, "kept: {kept:?}");
+        assert_eq!(
+            kept,
+            vec![
+                (10, Some(multi_line)),
+                (12, Some("withAudit(listOrders)")),
+                (13, Some("register(listOrders, \"orders.then\")")),
+                (13, Some(chain)),
+                (7, None),
+            ]
         );
     }
 
@@ -17921,6 +18423,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -17958,6 +18461,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -17995,6 +18499,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         }
     }
 
