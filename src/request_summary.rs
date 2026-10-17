@@ -188,6 +188,25 @@ use alternatives::{Alternation, Alternatives};
 mod guards;
 use guards::{GuardIr, Subject, Tested, WrittenIn};
 
+// What each import binding reaches, read from the compiler's per-position
+// rows when the run walks them (carrick#2413 slice B).
+mod row_links;
+
+// The definition each call reaches, read from the compiler's per-position
+// rows when the run walks them (carrick#2413 slice D).
+mod row_calls;
+
+// Every call that reaches a labelled library export, at any depth, read
+// from the rows (carrick#2431). Record-only: only tests and the offline
+// census read it so far, so the binary sees it as unused.
+#[allow(dead_code)]
+pub(crate) mod discovery;
+
+// One fixture service walked with or without rows, for the tests of what
+// the summaries read through them.
+#[cfg(test)]
+mod fixture_walk;
+
 // What the compiler's per-position rows say at each lookup the summaries
 // make by name today (carrick#2413): an offline census.
 #[cfg(test)]
@@ -810,6 +829,12 @@ struct CallIr {
     /// Each argument as a spread of the callee's parameter puts it in place
     /// (carrick#2411): empty for an element.
     spread_args: Vec<SpreadArg>,
+    /// Each object the callee's member chain is read on, innermost first,
+    /// as its span (discovery numbering) and whether it is a member access
+    /// rather than a name (`this.child` then nothing for
+    /// `this.child.send()`): where a compiler row names the receiver's type
+    /// (carrick#2431). Read by discovery alone.
+    receiver_spans: Vec<(u32, u32, bool)>,
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -898,6 +923,23 @@ struct FnIr {
     /// as a call is, for the chains alone (carrick#2386): the send side never
     /// reads it, so a construction composes into no summary.
     constructions: Vec<CallIr>,
+    /// Each optional call (`socket?.emit(…)`), read as a call is, for
+    /// discovery and the rows' call targets alone (carrick#2431): the
+    /// summaries compose none, so the body stays [`Self::unfollowed`].
+    optional_calls: Vec<CallIr>,
+}
+
+impl FnIr {
+    /// The calls discovery and the rows' call targets read in this body:
+    /// its calls, its constructions and its optional calls, each with
+    /// whether it is a construction.
+    fn read_calls(&self) -> impl Iterator<Item = (&CallIr, bool)> {
+        self.calls
+            .iter()
+            .map(|call| (call, false))
+            .chain(self.constructions.iter().map(|call| (call, true)))
+            .chain(self.optional_calls.iter().map(|call| (call, false)))
+    }
 }
 
 /// What one `return` hands back, read for whether a call of the function is
@@ -1140,6 +1182,30 @@ pub struct FileIr {
     /// [`Self::imported`] is, so a name declared again below lands here too,
     /// and its uses then name more than one declaration.
     import_uses: HashMap<String, Vec<(u32, u32)>>,
+    /// Each module-scope binding [`Self::names`], [`Self::module_clients`]
+    /// and [`Self::getters`] may hold, by the name the compiler gives its
+    /// symbol, with the 1-based line its declaration starts on and the name
+    /// those tables key it by ([`module_declarations`]): where a compiler
+    /// row's declaration joins this file (carrick#2413 slice B).
+    declared_at: HashMap<String, (u32, String)>,
+    /// The file loads a module by a specifier it computes (`require(name)`,
+    /// `import(name)`), which may be any module of the service
+    /// ([`module_loads`]).
+    computed_load: bool,
+    /// The declarations this file holds that no definition the extractor
+    /// keys opens at: an overload's signatures, an interface's members
+    /// (carrick#2413 slice D).
+    declaration_lines: row_calls::DeclarationLines,
+    /// Each line a definition the extractor keyed opens on, or the compiler
+    /// starts it on, with the definitions there ([`Self::place_definitions`]):
+    /// where a compiler row's declaration joins a definition (carrick#2413
+    /// slice D).
+    definition_lines: HashMap<u32, Vec<String>>,
+    /// Each import or `require` binding the file holds as bound, by its
+    /// local name: what the module publishes it as and the specifier, the
+    /// names the library store keys an export by (carrick#2431). A binding
+    /// assigned again or declared again below is left out.
+    bindings: HashMap<String, ImportBinding>,
 }
 
 /// Every expression-position identifier among `names`, by name, with its
@@ -1321,11 +1387,23 @@ pub fn extract_file_ir(
     };
     module.visit_with(&mut idents);
     let import_uses = idents.spans;
+    let (loads, computed_load) = module_loads(module, &bound_requires);
+    let bindings = imports
+        .iter()
+        .filter(|(name, import)| {
+            !import.reassignable && !module_scope.declared_below.declares_name(name)
+        })
+        .map(|(name, import)| (name.clone(), import.clone()))
+        .collect();
     let mut file = FileIr {
+        bindings,
         import_uses,
         imported,
         value_specifiers,
-        loads: module_loads(module, &bound_requires),
+        loads,
+        computed_load,
+        declared_at: module_declarations(module, source_map),
+        declaration_lines: row_calls::DeclarationLines::of(module, source_map),
         names_commonjs_exports: names_commonjs_exports(module),
         source_start: source_map
             .try_lookup_byte_offset(module.span.lo)
@@ -1605,6 +1683,63 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
         Decl::Var(var) => Some(var),
         _ => None,
     }
+}
+
+/// Each module-scope binding a file's names, clients and getters may be
+/// keyed by ([`FileIr::declared_at`]), by the name the compiler gives its
+/// symbol: the line its declaration starts on, as the compiler's `getStart`
+/// reads it, and the name the file's tables key it by.
+///
+/// A declarator starts at its name (`export const X` starts at `X`); a
+/// function declaration and an `export default` start at their first
+/// keyword or modifier. A default export's symbol is `default`: a named
+/// function's table key is its name, an expression's is
+/// [`DEFAULT_EXPORT`], and `export default name` keys it by `name`. The
+/// first declaration of a name wins, as an overload's first signature
+/// does.
+fn module_declarations(
+    module: &Module,
+    source_map: &Lrc<SourceMap>,
+) -> HashMap<String, (u32, String)> {
+    let line = |at: swc_common::BytePos| source_map.lookup_char_pos(at).line as u32;
+    let mut declared: HashMap<String, (u32, String)> = HashMap::new();
+    let mut add = |symbol: &str, at: swc_common::BytePos, key: &str| {
+        declared
+            .entry(symbol.to_string())
+            .or_insert_with(|| (line(at), key.to_string()));
+    };
+    for item in &module.body {
+        if let Some(var) = module_var_decl(item) {
+            for declarator in &var.decls {
+                if let Pat::Ident(ident) = &declarator.name {
+                    add(&ident.id.sym, ident.id.span.lo, &ident.id.sym);
+                }
+            }
+        }
+        if let Some(Decl::Fn(fn_decl)) = module_decl(item) {
+            add(&fn_decl.ident.sym, item.span().lo, &fn_decl.ident.sym);
+        }
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                if let DefaultDecl::Fn(FnExpr {
+                    ident: Some(ident), ..
+                }) = &export.decl
+                {
+                    add(DEFAULT_EXPORT, export.span.lo, &ident.sym);
+                    add(&ident.sym, export.span.lo, &ident.sym);
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                let key = match crate::graphql_document_sites::unwrap_expression(&export.expr) {
+                    Expr::Ident(ident) => ident.sym.to_string(),
+                    _ => DEFAULT_EXPORT.to_string(),
+                };
+                add(DEFAULT_EXPORT, export.span.lo, &key);
+            }
+            _ => {}
+        }
+    }
+    declared
 }
 
 /// What module scope holds for every function in the file: its constants,
@@ -2049,6 +2184,22 @@ impl BindingUse {
                 .entry_reads
                 .iter()
                 .all(|path| !matches!(entries.entry(path), Some(library_sites::NameValue::Map(_))))
+    }
+
+    /// Whether this use may change an object the binding holds, or hand it
+    /// to code that may: written through, handed on (an argument, an
+    /// initialiser, any value use [`Self::other`] counts), returned, spread,
+    /// or called by a key the source does not state. Calling it, calling a
+    /// member, reading, testing and exporting it change nothing
+    /// (carrick#2413 slice B): the use of an import whose declaration no
+    /// row gives that contests every exported object and instance
+    /// ([`row_links::RowLinks::open`]).
+    fn may_change(&self) -> bool {
+        self.written
+            || self.other
+            || self.spread
+            || self.called_computed
+            || !self.returned_at.is_empty()
     }
 
     /// Every member called or constructed through the binding.
@@ -3163,11 +3314,13 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
 /// counts as used in every way.
 ///
 /// A specifier the source computes (`import(name)`, a template with a hole)
-/// names no module and is not here.
-fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<String> {
+/// names no module and is not here: the second value says whether the file
+/// makes such a load with `import()` or `require` (carrick#2413 slice B).
+fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> (BTreeSet<String>, bool) {
     struct Loads<'a> {
         bound_requires: &'a HashSet<u32>,
         found: BTreeSet<String>,
+        computed: bool,
     }
     impl Visit for Loads<'_> {
         fn visit_call_expr(&mut self, call: &CallExpr) {
@@ -3176,9 +3329,12 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
                 .first()
                 .filter(|arg| arg.spread.is_none())
                 .and_then(|arg| literal_specifier(&arg.expr));
+            let require = matches!(&call.callee, Callee::Expr(callee)
+                if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
+            if specifier.is_none() && (require || matches!(call.callee, Callee::Import(_))) {
+                self.computed = true;
+            }
             if let Some(specifier) = specifier {
-                let require = matches!(&call.callee, Callee::Expr(callee)
-                    if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
                 let bound = require && self.bound_requires.contains(&call.span.lo.0);
                 let relative = specifier.starts_with("./") || specifier.starts_with("../");
                 if !bound && (matches!(call.callee, Callee::Import(_)) || require || relative) {
@@ -3191,9 +3347,10 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
     let mut loads = Loads {
         bound_requires,
         found: BTreeSet::new(),
+        computed: false,
     };
     module.visit_with(&mut loads);
-    loads.found
+    (loads.found, loads.computed)
 }
 
 /// Every specifier `module` loads a module by at run time (carrick#1568): a
@@ -5749,6 +5906,10 @@ impl Visit for CallWalker<'_, '_, '_> {
             handed,
             names,
             spread_args,
+            receiver_spans: match &call.callee {
+                Callee::Expr(callee) => discovery::receiver_spans(callee),
+                _ => Vec::new(),
+            },
         });
     }
 
@@ -5812,6 +5973,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 handed: Vec::new(),
                 names: Vec::new(),
                 spread_args: Vec::new(),
+                receiver_spans: Vec::new(),
             });
         }
         element.visit_children_with(self);
@@ -5985,6 +6147,7 @@ impl Visit for CallWalker<'_, '_, '_> {
 
     fn visit_opt_call(&mut self, call: &OptCall) {
         self.ir.unfollowed = true;
+        self.record_optional_call(call);
         call.visit_children_with(self);
     }
 
@@ -6734,8 +6897,19 @@ pub struct RequestSummaryInputs {
     pub bindings: ImportedBindings,
     /// The compiler's rows for the service's positions, bound to the bytes
     /// discovery parsed, when the run walks them (`CARRICK_POSITION_ROWS=1`,
-    /// carrick#2413); `None` otherwise. Nothing reads a row yet.
+    /// carrick#2413); `None` otherwise.
     pub positions: Option<crate::position_rows::PositionIndex>,
+    /// What each import binding reaches, read from [`Self::positions`] by
+    /// [`Self::linked`] (carrick#2413 slice B): where the module-scope
+    /// names, instances and getters another module declares are read from
+    /// when the run walks rows. `None` without rows, and then they are read
+    /// by name through [`Self::bindings`].
+    pub(crate) links: Option<row_links::RowLinks>,
+    /// With rows, the calls that stay on the call graph (carrick#2413 slice
+    /// D), set by [`Self::linked`]: every other call reaches what its row
+    /// names ([`Self::reach`]). `None` without rows, and then every call
+    /// reaches what [`Self::sites`] names.
+    pub(crate) row_calls: Option<row_calls::RowCalls>,
 }
 
 impl RequestSummaryInputs {
@@ -6751,7 +6925,18 @@ impl RequestSummaryInputs {
     /// Reached in the places a request's URL, base and body, a call's
     /// arguments and a client's options are kept. A piece anywhere else
     /// keeps its link unread, which changes nothing.
+    ///
+    /// With rows, what each import reaches is read from them first
+    /// ([`Self::links`]), and the reading follows it.
     pub fn linked(mut self) -> Self {
+        if let Some(positions) = &self.positions {
+            self.links = Some(row_links::RowLinks::of(
+                &self.files,
+                &self.bindings,
+                positions,
+            ));
+            self.row_calls = Some(self.row_calls());
+        }
         let mut wanted: BTreeSet<(PathBuf, library_sites::NamedRef)> = BTreeSet::new();
         for (path, ir) in &mut self.files {
             ir.visit_pieces(path, &mut |scope, pieces| {
@@ -6769,7 +6954,8 @@ impl RequestSummaryInputs {
             return self;
         }
         let resolved: HashMap<(PathBuf, library_sites::NamedRef), String> = {
-            let names = library_sites::LinkedNames::link(&self.files, &self.bindings);
+            let names =
+                library_sites::LinkedNames::link(&self.files, &self.bindings, self.links.as_ref());
             wanted
                 .into_iter()
                 .filter_map(|(file, named)| {
@@ -6938,6 +7124,10 @@ struct LinkedClients {
     /// (importer, local) -> the client it reads, for an import that reaches
     /// one only through modules that publish nothing through `exports`.
     imports: HashMap<(PathBuf, String), (PathBuf, String)>,
+    /// (importer, local) for each import its rows name a declaration of the
+    /// repository for (carrick#2413 slice E): whatever its specifier says,
+    /// it is no package's client.
+    in_repo: HashSet<(PathBuf, String)>,
     /// Some use could not be followed to what it names.
     unfollowable: bool,
 }
@@ -6957,7 +7147,16 @@ enum Declared {
 }
 
 impl LinkedClients {
-    fn link(files: &HashMap<PathBuf, FileIr>, bindings: &ImportedBindings) -> Self {
+    /// With rows (`links`, carrick#2413 slice B), an import is the
+    /// declaration its rows name, and one is read through when the declaring
+    /// module publishes nothing through `exports`; instead of a specifier
+    /// that names nothing, a use no row follows that may change what it
+    /// holds takes every imported instance away ([`RowLinks::open`]).
+    fn link(
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        links: Option<&row_links::RowLinks>,
+    ) -> Self {
         let mut linked = LinkedClients::default();
         for (file, ir) in files {
             for (name, client) in &ir.module_clients {
@@ -6968,6 +7167,30 @@ impl LinkedClients {
         }
         for (file, ir) in files {
             for (local, used) in &ir.imported {
+                if let Some(links) = links {
+                    let link = links.get(file, local);
+                    if link.is_some_and(row_links::RowLink::in_repo) {
+                        linked.in_repo.insert((file.clone(), local.clone()));
+                    }
+                    match link {
+                        Some(row_links::RowLink::Declared(at, name)) => {
+                            if let Some(declaring) = files.get(at)
+                                && declaring.module_clients.contains_key(name)
+                            {
+                                let held = (at.clone(), name.clone());
+                                linked.merge(&held, used);
+                                if !declaring.names_commonjs_exports {
+                                    linked.imports.insert((file.clone(), local.clone()), held);
+                                }
+                            }
+                        }
+                        Some(row_links::RowLink::Module(published)) => {
+                            linked.merge_namespace(files, bindings, published, used);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match bindings.get(file, local) {
                     Some(ImportedBinding::Binding { file: at, name }) => {
                         match declared_client(files, bindings, at, name) {
@@ -7012,7 +7235,12 @@ impl LinkedClients {
         // A module some file loads by a specifier that names nothing the
         // scan can find may be any module of the service, and may do
         // anything to what it publishes, however the file then uses it.
-        linked.unfollowable |= !bindings.unresolved_in().is_empty();
+        // With rows, such a module matters only where a use no row follows
+        // may change what it holds.
+        linked.unfollowable |= match links {
+            Some(links) => links.open(),
+            None => !bindings.unresolved_in().is_empty(),
+        };
         linked
     }
 
@@ -7104,6 +7332,7 @@ impl LinkedClients {
                         .clients
                         .get(held)
                         .map(|client| (client, held.0.as_path())),
+                    None if self.in_repo.contains(&(file.to_path_buf(), local.clone())) => None,
                     None => package.as_ref().map(|client| (client, file)),
                 }
             }
@@ -7264,7 +7493,7 @@ impl RequestSummaryIndex {
 
 struct Composer<'a> {
     files: &'a HashMap<PathBuf, FileIr>,
-    sites: &'a CallSiteTargets,
+    inputs: &'a RequestSummaryInputs,
     semantics: &'a LibrarySemantics,
     clients: LinkedClients,
     memo: HashMap<(PathBuf, String), Summary>,
@@ -7310,20 +7539,52 @@ impl Composer<'_> {
     ///
     /// Anywhere else nothing is stated, and the call is one this pass cannot
     /// read: the body is not complete, so no model row is withdrawn on it.
+    ///
+    /// With rows, a call they cannot say the callee of is still read as the
+    /// request its shape states, as without rows: the rows fail closed on
+    /// composing it ([`Self::target`]), never on the request it makes
+    /// (carrick#2413 slice D). Its body is not complete ([`Self::compose`]).
     fn request_of<'c>(&self, file: &Path, call: &'c CallIr) -> Option<Cow<'c, RequestShape>> {
         shape_of(call, file, self.semantics, &self.clients).filter(|request| {
             !request.init_only
                 || call.waited
                 || self
-                    .sites
-                    .target_at(file, call.site.lo, call.site.hi)
+                    .inputs
+                    .call_target(file, call.site.lo, call.site.hi)
                     .is_some()
         })
     }
 
+    /// The definition a call resolves to. Without rows, the call graph's
+    /// answer for the call's span start, which a chain's outer call shares
+    /// with its inner one (carrick#1695). With rows, the call's own.
+    fn target(&self, file: &Path, call: &CallIr) -> Option<(PathBuf, String)> {
+        if self.inputs.row_calls.is_none() || call.jsx {
+            return self.inputs.sites.target(file, call.site.lo).cloned();
+        }
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            row_calls::Reach::Function(file, key) | row_calls::Reach::OutsideService(file, key) => {
+                Some((file, key))
+            }
+            row_calls::Reach::NoFunction | row_calls::Reach::Unknown(_) => None,
+        }
+    }
+
+    /// Whether the rows cannot say what a call reaches (carrick#2413 slice
+    /// D): it may be any function, so it is not composed, and the body it
+    /// sits in is not complete, whatever request its shape states.
+    fn unknown(&self, file: &Path, call: &CallIr) -> bool {
+        self.inputs.row_calls.is_some()
+            && !call.jsx
+            && matches!(
+                self.inputs.reach(file, call.site.lo, call.site.hi),
+                row_calls::Reach::Unknown(_)
+            )
+    }
+
     /// The callee a call resolves to, when it is a function this pass read.
     fn callee(&mut self, file: &Path, call: &CallIr) -> Option<(PathBuf, Summary)> {
-        let (target_file, key) = self.sites.target(file, call.site.lo)?.clone();
+        let (target_file, key) = self.target(file, call)?;
         let summary = self.summary(&target_file, &key)?;
         Some((target_file, summary))
     }
@@ -7397,6 +7658,9 @@ impl Composer<'_> {
                                 .into_iter()
                                 .map(|effect| ir.settle_forward(effect)),
                         );
+                        if self.unknown(file, call) {
+                            summary.complete = false;
+                        }
                     } else if !call.inert {
                         summary.complete = false;
                     }
@@ -7495,9 +7759,9 @@ pub fn summarize(
     let files = &inputs.files;
     let mut composer = Composer {
         files,
-        sites: &inputs.sites,
+        inputs,
         semantics,
-        clients: LinkedClients::link(files, &inputs.bindings),
+        clients: LinkedClients::link(files, &inputs.bindings, inputs.links.as_ref()),
         memo: HashMap::new(),
         in_progress: HashSet::new(),
     };
@@ -7655,7 +7919,7 @@ fn emit(
     index: &mut RequestSummaryIndex,
     top_level: bool,
 ) {
-    let (files, sites) = (composer.files, composer.sites);
+    let files = composer.files;
     for call in &ir.calls {
         if call.invokes_param.is_some() {
             continue;
@@ -7663,9 +7927,9 @@ fn emit(
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
-                let callee_ir = sites
-                    .target(file, call.site.lo)
-                    .and_then(|(target, key)| files.get(target)?.functions.get(key));
+                let callee_ir = composer
+                    .target(file, call)
+                    .and_then(|(target, key)| files.get(&target)?.functions.get(&key));
                 for effect in &callee.effects {
                     // A JSX element states only what its props fill in
                     // (carrick#1949).
