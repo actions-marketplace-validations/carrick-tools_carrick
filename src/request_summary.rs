@@ -1262,6 +1262,7 @@ pub fn extract_file_ir(
         subclass_fields: subclass_members(&classes, |class| &class.fields),
         subclass_methods: subclass_members(&classes, |class| &class.methods),
         class_this: library_sites::class_this(module),
+        constructions: HashMap::new(),
         declared_below: redeclared_names(module),
         verb_aliases: crate::declared_verbs::TypeAliases::of(module),
         own_collections: {
@@ -1430,6 +1431,7 @@ pub fn extract_file_ir(
     // (carrick#1790), read where a function returns it, once the module's
     // constants are known.
     module_scope.lazy_clients = reader.lazy_clients(module, &module_scope, &reassigned);
+    module_scope.constructions = reader.constructions(module, &module_scope, &jsx, &reassigned);
     let module_scope = &module_scope;
     let none = Captured::default();
 
@@ -1640,6 +1642,11 @@ struct ModuleScope {
     /// Each class the file declares, by its binding -> what the class does
     /// with `this`, for the message-role field rule (carrick#1665).
     class_this: HashMap<BindingKey, ClassThis>,
+    /// Class name -> the value every construction of it in this file passes
+    /// at each constructor position, for a class only this file can
+    /// construct ([`Reader::constructions`], carrick#2452). `None`: the
+    /// constructions disagree there, or one leaves the position out.
+    constructions: HashMap<String, Vec<Option<Value>>>,
     /// Every declaration below module scope ([`redeclared_names`]): what a
     /// function, a block or a parameter binds.
     declared_below: Declarations,
@@ -1777,6 +1784,11 @@ struct BindingUse {
     /// `instanceof`, `typeof` or a comparison is not: it reads the value and
     /// keeps nothing of it (carrick#1568).
     other: bool,
+    /// The span start of each use that sets [`Self::other`] (discovery
+    /// numbering, as [`Self::returned_at`]; a use with no span of its own
+    /// records none). A constant handed to one call is read where that call
+    /// is ([`Self::handed_only_to`], carrick#2451).
+    other_at: BTreeSet<u32>,
     /// Exported by name (`export { api }`, `export default api`,
     /// `module.exports.api = api`). Not a use that changes anything; it says
     /// another module may import the binding (carrick#1568).
@@ -1854,6 +1866,27 @@ impl BindingUse {
         self.written || self.member_read || self.spread || self.other || self.called_computed
     }
 
+    /// Whether the binding is used only as the callee of `new`
+    /// (carrick#2452): not called, read, handed on, stored, spread, returned,
+    /// tested, extended or published. A type position is no use
+    /// ([`BindingUses`]).
+    fn only_constructed(&self) -> bool {
+        !(self.written
+            || self.member_read
+            || self.member_tested
+            || self.spread
+            || self.other
+            || self.tested
+            || self.exported
+            || self.called_computed)
+            && self.called.is_empty()
+            && self.returned_at.is_empty()
+            && self.entry_reads.is_empty()
+            && self.library_calls.iter().all(|made| {
+                made.form == MakerForm::New && made.path.is_empty() && made.member.is_none()
+            })
+    }
+
     /// Every use of `other` added to these (one class's uses of a field and
     /// a related class's, carrick#1665).
     fn merge(&mut self, other: &BindingUse) {
@@ -1868,6 +1901,7 @@ impl BindingUse {
         self.member_read |= other.member_read;
         self.spread |= other.spread;
         self.other |= other.other;
+        self.other_at.extend(other.other_at.iter().copied());
         self.exported |= other.exported;
         self.read |= other.read;
         self.tested |= other.tested;
@@ -1919,8 +1953,13 @@ impl BindingUse {
     /// test before carrick#1665 and a return before carrick#1562; each counts
     /// as one here.
     fn keeps_object(&self) -> bool {
+        !self.other && self.keeps_object_apart_from_other()
+    }
+
+    /// [`Self::keeps_object`] but for [`Self::other`], which it leaves to the
+    /// caller.
+    fn keeps_object_apart_from_other(&self) -> bool {
         !self.written
-            && !self.other
             && !self.tested
             && self.returned_at.is_empty()
             && !self.library_calls.contains(&MemberUse {
@@ -1928,6 +1967,18 @@ impl BindingUse {
                 path: Vec::new(),
                 member: None,
             })
+    }
+}
+
+impl BindingUse {
+    /// An object constant that keeps exactly the keys its literal writes and
+    /// is handed to one call, the one whose argument starts at `at`: its
+    /// only use that sets [`Self::other`] (carrick#2451). A use with no span
+    /// of its own records none, so it is never this one.
+    fn handed_only_to(&self, at: u32) -> bool {
+        self.other_at.len() == 1
+            && self.other_at.contains(&at)
+            && self.keeps_object_apart_from_other()
     }
 }
 
@@ -1946,11 +1997,21 @@ struct EntityAlias {
     alias: String,
     root: String,
     exported: bool,
+    /// The span start of the declaration.
+    at: u32,
 }
 
 impl BindingUses {
     fn mark(&mut self, key: String, record: impl FnOnce(&mut BindingUse)) {
         record(self.uses.entry(key).or_default());
+    }
+
+    /// `key` is used as a value, at `at`.
+    fn mark_other(&mut self, key: String, at: u32) {
+        self.mark(key, |used| {
+            used.other = true;
+            used.other_at.insert(at);
+        });
     }
 
     /// `member` is read and not called: its chain's root is read.
@@ -2165,6 +2226,7 @@ impl Visit for BindingUses {
                     alias: decl.id.sym.to_string(),
                     root: ident.sym.to_string(),
                     exported: decl.is_export,
+                    at: decl.span.lo.0,
                 });
             }
         }
@@ -2172,7 +2234,7 @@ impl Visit for BindingUses {
 
     fn visit_expr(&mut self, expr: &Expr) {
         if let Some(key) = binding_key(expr) {
-            self.mark(key, |used| used.other = true);
+            self.mark_other(key, expr.span().lo.0);
             return;
         }
         if let Expr::Member(member) = expr {
@@ -2362,7 +2424,7 @@ impl Visit for BindingUses {
 
     fn visit_prop(&mut self, prop: &Prop) {
         if let Prop::Shorthand(ident) = prop {
-            self.mark(ident.sym.to_string(), |used| used.other = true);
+            self.mark_other(ident.sym.to_string(), ident.span.lo.0);
             return;
         }
         prop.visit_children_with(self);
@@ -2437,7 +2499,8 @@ impl BindingUses {
             for index in ready {
                 settled.insert(index);
                 let root = self.aliases[index].root.clone();
-                self.mark(root, |used| used.other = true);
+                let at = self.aliases[index].at;
+                self.mark_other(root, at);
             }
         }
     }
@@ -3490,7 +3553,8 @@ impl Reader<'_> {
     ) {
         let name = ident.sym.as_ref();
         let redeclared = module.subclass_fields.get(name);
-        let mut fields = self.class_fields(class, module, redeclared);
+        let passed = module.constructions.get(name).map(Vec::as_slice);
+        let mut fields = self.class_fields(class, module, redeclared, passed);
         fields.query_builders =
             class_query_builders(class, &fields, module.subclass_methods.get(name));
         let none = Captured::default();
@@ -3567,10 +3631,120 @@ impl Reader<'_> {
         }
     }
 
+    /// For each class only this file can construct, the value every
+    /// construction passes at each constructor position (carrick#2452).
+    ///
+    /// A class qualifies when its declaration is not published, and its
+    /// binding is used only as the callee of `new` ([`BindingUse::only_constructed`]),
+    /// is declared nowhere below module scope, is not reassigned and is no
+    /// JSX tag. Every `new C(…)` in the file must be the whole initialiser
+    /// of a module-scope variable or the `export default` expression, with
+    /// no spread argument: a construction anywhere else may pass anything,
+    /// and the class would be read with a value it does not hold.
+    ///
+    /// A position holds a value when every construction passes one there and
+    /// they are equal: text with no parameter, query or unknown piece, or a
+    /// closed object of such values.
+    fn constructions(
+        &self,
+        module: &Module,
+        module_scope: &ModuleScope,
+        jsx: &HashSet<String>,
+        reassigned: &Reassigned,
+    ) -> HashMap<String, Vec<Option<Value>>> {
+        /// Every `new <name>(…)` anywhere in the file.
+        struct Constructed(HashMap<String, usize>);
+        impl Visit for Constructed {
+            fn visit_new_expr(&mut self, new: &NewExpr) {
+                if let Expr::Ident(ident) =
+                    crate::graphql_document_sites::unwrap_expression(&new.callee)
+                {
+                    *self.0.entry(ident.sym.to_string()).or_default() += 1;
+                }
+                new.visit_children_with(self);
+            }
+        }
+        let mut anywhere = Constructed(HashMap::new());
+        module.visit_with(&mut anywhere);
+
+        // Each `new C(…)` that is the whole initialiser of a module-scope
+        // variable, or the default export.
+        let mut at_module_scope: HashMap<String, Vec<&NewExpr>> = HashMap::new();
+        fn note<'m>(expr: &'m Expr, into: &mut HashMap<String, Vec<&'m NewExpr>>) {
+            if let Expr::New(new) = crate::graphql_document_sites::unwrap_expression(expr)
+                && let Expr::Ident(ident) =
+                    crate::graphql_document_sites::unwrap_expression(&new.callee)
+            {
+                into.entry(ident.sym.to_string()).or_default().push(new);
+            }
+        }
+        for item in &module.body {
+            if let Some(var) = module_var_decl(item) {
+                for declarator in &var.decls {
+                    if let Some(init) = &declarator.init {
+                        note(init, &mut at_module_scope);
+                    }
+                }
+            }
+            if let ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) = item {
+                note(&export.expr, &mut at_module_scope);
+            }
+        }
+
+        let scope = Scope::module(module_scope);
+        let mut found = HashMap::new();
+        for item in &module.body {
+            // Not `export class`: another module may construct it.
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Class(class))) = item else {
+                continue;
+            };
+            let name = class.ident.sym.as_ref();
+            let Some(constructions) = at_module_scope.get(name) else {
+                continue;
+            };
+            if anywhere.0.get(name) != Some(&constructions.len())
+                || !module_scope
+                    .uses
+                    .get(name)
+                    .is_some_and(BindingUse::only_constructed)
+                || module_scope.declared_below.declares_name(name)
+                || reassigned.names.contains(name)
+                || jsx.contains(name)
+                || constructions
+                    .iter()
+                    .any(|new| new.args.iter().flatten().any(|arg| arg.spread.is_some()))
+            {
+                continue;
+            }
+            let passed: Vec<Vec<Value>> = constructions
+                .iter()
+                .map(|new| {
+                    new.args
+                        .iter()
+                        .flatten()
+                        .map(|arg| self.eval(&arg.expr, &scope))
+                        .collect()
+                })
+                .collect();
+            let positions = passed.iter().map(Vec::len).max().unwrap_or(0);
+            let agreed = (0..positions)
+                .map(|position| {
+                    let first = passed[0].get(position)?;
+                    (states_a_value(first)
+                        && passed.iter().all(|args| args.get(position) == Some(first)))
+                    .then(|| first.clone())
+                })
+                .collect();
+            found.insert(name.to_string(), agreed);
+        }
+        found
+    }
+
     /// Each field the class assigns exactly once, in its constructor's own
     /// statements or its initialiser, and nowhere else. A constructor
-    /// parameter read into a field is opaque: nothing here follows `new
-    /// ApiClient(config)` back to the value it was built with.
+    /// parameter read into a field is opaque, unless every construction of a
+    /// class only this file can construct passes one value at its position
+    /// (`passed`, [`Reader::constructions`]).
     ///
     /// Anywhere else is anywhere: a method, a branch or a closure inside the
     /// constructor, and a class in this file that extends this one and
@@ -3584,6 +3758,7 @@ impl Reader<'_> {
         class: &Class,
         module: &ModuleScope,
         redeclared: Option<&HashSet<String>>,
+        passed: Option<&[Option<Value>]>,
     ) -> ClassFields {
         let mut fields: HashMap<String, Value> = HashMap::new();
         let mut receivers: HashMap<String, ClientRef> = HashMap::new();
@@ -3634,15 +3809,28 @@ impl Reader<'_> {
                 ClassMember::Constructor(ctor) => {
                     let mut scope = Scope::module(module);
                     let mut fetch_params: HashSet<BindingKey> = HashSet::new();
-                    for param in &ctor.params {
+                    for (position, param) in ctor.params.iter().enumerate() {
+                        // What every construction passes here, when they
+                        // agree (carrick#2452).
+                        let given = passed.and_then(|passed| passed.get(position)?.as_ref());
                         match param {
                             ParamOrTsParamProp::TsParamProp(prop) => match &prop.param {
                                 TsParamPropParam::Ident(ident) => {
                                     let name = ident.id.sym.to_string();
-                                    // A constructor parameter: no position a
-                                    // call of the method fills.
-                                    let value =
-                                        Value::hole(name.clone(), HoleReason::UnreadExpression);
+                                    // A constructor parameter no call of the
+                                    // method fills: the value the
+                                    // constructions pass, else opaque.
+                                    let value = match given {
+                                        Some(given) => {
+                                            scope
+                                                .locals
+                                                .insert(ident_key(&ident.id), given.clone());
+                                            given.clone()
+                                        }
+                                        None => {
+                                            Value::hole(name.clone(), HoleReason::UnreadExpression)
+                                        }
+                                    };
                                     assign(name, value, None, &mut fields);
                                 }
                                 // `private fetchImpl = fetch`.
@@ -3656,14 +3844,18 @@ impl Reader<'_> {
                             },
                             ParamOrTsParamProp::Param(param) => {
                                 fetch_bindings(&param.pat, module, &mut fetch_params);
+                                if let Some(given) = given {
+                                    bind_given(&param.pat, given, &mut scope.locals);
+                                }
                             }
                         }
                     }
                     let Some(body) = &ctor.body else {
                         continue;
                     };
-                    // Constructor parameters stay opaque: they are read by
-                    // name, not as positions a call site could fill.
+                    // A constructor parameter no construction states stays
+                    // opaque: it is read by name, not as a position a call
+                    // site could fill.
                     //
                     // Only a statement of the constructor's own body is a
                     // write the field table reads; one inside a branch, a
@@ -4777,10 +4969,12 @@ impl Reader<'_> {
         if args.iter().any(|arg| arg.spread.is_some()) {
             return None;
         }
-        // An HTTP factory's options: exactly one object literal, as before.
+        // An HTTP factory's options: exactly one object literal, or a
+        // constant that holds one (carrick#2451).
         let options = match args {
             [options] => match crate::graphql_document_sites::unwrap_expression(&options.expr) {
                 Expr::Object(literal) => Some(self.object(literal, scope)),
+                Expr::Ident(ident) => self.options_constant(ident, scope),
                 _ => None,
             },
             _ => None,
@@ -4811,6 +5005,28 @@ impl Reader<'_> {
             returned: client.returned.clone(),
             shared: None,
         })
+    }
+
+    /// The object literal a maker call's one argument names, when it is a
+    /// `const` the file declares once, holds an object literal, and is handed
+    /// to this call and nothing else: never written through, spread, aliased,
+    /// returned or handed to another call (carrick#2451). Anything else
+    /// reads no options, as before.
+    fn options_constant(&self, ident: &Ident, scope: &Scope<'_>) -> Option<ObjValue> {
+        let name = ident.sym.as_ref();
+        if !scope.module.object_consts.contains(name)
+            || !scope
+                .module
+                .uses
+                .get(name)
+                .is_some_and(|used| used.handed_only_to(ident.span.lo.0))
+        {
+            return None;
+        }
+        match self.eval(&Expr::Ident(ident.clone()), scope) {
+            Value::Obj(options) => Some(options),
+            _ => None,
+        }
     }
 
     /// The library client a call is made through, when the syntax names one
@@ -4911,6 +5127,46 @@ fn bound(name: String, value: Value) -> Value {
             let end = end_of(pieces);
             Value::opaque(name, end)
         }
+    }
+}
+
+/// The value a construction passes, bound to the names `pat` introduces: a
+/// plain parameter holds it, a destructured one the keys of a closed object it
+/// states (carrick#2452). A key the object lacks, or a default, binds nothing.
+fn bind_given(pat: &Pat, given: &Value, locals: &mut HashMap<BindingKey, Value>) {
+    match pat {
+        Pat::Ident(ident) => {
+            locals.insert(ident_key(&ident.id), given.clone());
+        }
+        Pat::Assign(assign) => bind_given(&assign.left, given, locals),
+        Pat::Object(object) => {
+            if let Value::Obj(fields) = given {
+                for (binding, key) in keyed_names(object) {
+                    if let Some(value) = fields.fields.get(&key) {
+                        locals.insert(binding, value.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a value states what it holds, for a constructor parameter bound to
+/// it (carrick#2452): text of literals and opaque names (a parameter, a
+/// query or an unknown piece names no value), or a closed object of such
+/// values.
+fn states_a_value(value: &Value) -> bool {
+    match value {
+        Value::Str(pieces) => pieces
+            .iter()
+            .all(|piece| matches!(piece, Piece::Lit(_) | Piece::Opaque { .. })),
+        Value::Obj(object) => {
+            !object.open
+                && object.under_param.is_none()
+                && object.fields.values().all(states_a_value)
+        }
+        Value::Callback(_) => false,
     }
 }
 
@@ -8780,6 +9036,87 @@ function build() { return {}; }
                 Some("${base}/users".to_string())
             )
         );
+    }
+
+    /// carrick#2452: a class only this file constructs reads each constructor
+    /// parameter as the value its one construction passes.
+    #[test]
+    fn a_constructor_parameter_reads_as_the_value_the_construction_passes() {
+        let property = "class Api {\n\
+                        \x20 constructor(private base: string) {}\n\
+                        \x20 users() { return fetch(`${this.base}/users`); }\n\
+                        }\n\
+                        export const api = new Api(\"/api/v1\");\n";
+        assert_eq!(
+            render_target(&request_url(property, "Api.users")).as_deref(),
+            Some("/api/v1/users")
+        );
+
+        let assigned = "class Items {\n\
+                        \x20 private base: string;\n\
+                        \x20 constructor(base: string) { this.base = base; }\n\
+                        \x20 list() { return fetch(this.base + \"/items\"); }\n\
+                        }\n\
+                        export const items = new Items(process.env.ITEMS_URL!);\n";
+        let url = request_url(assigned, "Items.list");
+        assert_eq!(
+            first_end(&url).0,
+            &env("process.env.ITEMS_URL", "ITEMS_URL", None)
+        );
+
+        let options = "class Api {\n\
+                       \x20 private base: string;\n\
+                       \x20 constructor(opts: { baseUrl: string }) { this.base = opts.baseUrl; }\n\
+                       \x20 x() { return fetch(`${this.base}/x`); }\n\
+                       }\n\
+                       const api = new Api({ baseUrl: \"/v3\" });\n";
+        assert_eq!(
+            render_target(&request_url(options, "Api.x")).as_deref(),
+            Some("/v3/x")
+        );
+
+        let destructured = "class Api {\n\
+                            \x20 private base: string;\n\
+                            \x20 constructor({ baseUrl }: { baseUrl: string }) { this.base = baseUrl; }\n\
+                            \x20 x() { return fetch(`${this.base}/x`); }\n\
+                            }\n\
+                            export default new Api({ baseUrl: \"/v4\" });\n";
+        assert_eq!(
+            render_target(&request_url(destructured, "Api.x")).as_deref(),
+            Some("/v4/x")
+        );
+    }
+
+    /// carrick#2452: a construction this pass cannot account for leaves the
+    /// parameter as it was read before, the field's own name.
+    #[test]
+    fn a_class_another_construction_may_reach_keeps_its_field_opaque() {
+        let body = "  constructor(private base: string) {}\n\
+                    \x20 users() { return fetch(`${this.base}/users`); }\n\
+                    }\n";
+        let kept = Some("${this.base}/users");
+        let cases = [
+            // The constructions disagree.
+            format!("class Api {{\n{body}const a = new Api(\"/a\");\nconst b = new Api(\"/b\");\n"),
+            // Published: another module may construct it.
+            format!("export class Api {{\n{body}const a = new Api(\"/a\");\n"),
+            format!("class Api {{\n{body}const a = new Api(\"/a\");\nexport {{ Api }};\n"),
+            // Constructed inside a function.
+            format!("class Api {{\n{body}export function make() {{ return new Api(\"/a\"); }}\n"),
+            // Handed to a call, or extended.
+            format!("class Api {{\n{body}const a = new Api(\"/a\");\nregister(Api);\n"),
+            format!("class Api {{\n{body}const a = new Api(\"/a\");\nclass Sub extends Api {{}}\n"),
+            // A spread argument, or a construction leaving the position out.
+            format!("class Api {{\n{body}const a = new Api(...args);\n"),
+            format!("class Api {{\n{body}const a = new Api();\n"),
+        ];
+        for source in cases {
+            assert_eq!(
+                render_target(&request_url(&source, "Api.users")).as_deref(),
+                kept,
+                "{source}"
+            );
+        }
     }
 
     /// carrick#2406: a key of a parameter under `??` is the caller's to
