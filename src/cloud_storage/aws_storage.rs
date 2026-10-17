@@ -2250,6 +2250,8 @@ impl CloudStorage for AwsStorage {
                     scanner_build: None,
                     boundary: None,
                     dispatch_tables: None,
+                    possible_calls: None,
+                    possible_calls_omitted: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
@@ -4575,13 +4577,13 @@ mod tests {
         );
         assert_eq!(
             partial_acceptance_advice(losses(3, 1)),
-            "Run the scan again to fill in the rest. The cloud's answer for 1 file(s) is final: \
-             a re-run gets the same until the file or Carrick changes."
+            "Run the scan again to fill in the rest. The answer for 1 file(s) is final: \
+             a re-run gives the same result until the file changes or Carrick is updated."
         );
         assert_eq!(
             partial_acceptance_advice(losses(2, 2)),
-            "The cloud's answer for 2 file(s) is final: a re-run gets the same until the file or \
-             Carrick changes."
+            "The answer for 2 file(s) is final: a re-run gives the same result until the file \
+             changes or Carrick is updated."
         );
     }
 
