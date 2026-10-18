@@ -4859,10 +4859,16 @@ async fn site_rows_of(
             .unwrap_or_default();
         *leads_by_reason.entry(reason).or_default() += 1;
     }
+    let no_op_claim = decided
+        .leads
+        .iter()
+        .filter(|lead| lead.reason == crate::request_summary::decided_sites::Undecided::NoOpClaim)
+        .count();
     debug!(
         discovered,
         reached_label,
         decided = decided.sites.len(),
+        no_op_claim,
         rows = rows.rows.len(),
         possible_calls = rows.leads.len(),
         leads_by_reason = ?leads_by_reason,
@@ -5374,6 +5380,16 @@ fn append_deterministic_protocol_operations(
         },
     );
     crate::possible_calls::attach_when(extractions.site.enabled, cloud_data, site.leads.clone());
+    if extractions.site.enabled {
+        debug!(
+            routes = extractions.site.routes.len(),
+            route_kept_reader = site.route_kept_reader,
+            possible_calls = site.leads.len(),
+            stated = site.stated.len(),
+            withdrawn = site.withdrawn.len(),
+            "site questions: fold"
+        );
+    }
     site
 }
 
@@ -21496,6 +21512,23 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
+    /// carrick#2515: with the switch off, an export the store labels with no
+    /// op writes no lead either; the blob is as it was.
+    #[tokio::test]
+    async fn an_export_with_no_op_writes_nothing_with_the_switch_off() {
+        let inputs = crate::engine::discover_request_inputs(
+            &crate::request_summary::decided_sites::tests::decided_fixture(),
+        );
+        let claims: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "gql-thing", "version": "1.0.0", "specifier": "gql-thing",
+                  "export": "Client", "role": "graphql_client", "claims": [] }
+            ]))
+            .unwrap();
+        let off = site_rows_of(false, &inputs, ".", &Config::default(), &claims).await;
+        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
+    }
+
     /// carrick#2439: with the switch off the site pass reads nothing and the
     /// blob is byte for byte the one the scan wrote before it, with no
     /// `possible_calls` and no `inference` on any row.
@@ -21549,6 +21582,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 true,
             )],
             leads: Vec::new(),
+            routes: Vec::new(),
         };
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
@@ -21988,6 +22022,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     below,
                 ],
                 leads: Vec::new(),
+                routes: Vec::new(),
             },
             ..ProtocolExtractions::default()
         };
@@ -22061,6 +22096,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ),
             ],
             leads: Vec::new(),
+            routes: Vec::new(),
         };
         key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
         let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
@@ -22108,6 +22144,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 RowSide::Call,
             )],
             leads: Vec::new(),
+            route_kept_reader: 0,
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
