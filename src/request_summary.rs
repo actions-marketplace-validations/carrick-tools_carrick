@@ -87,7 +87,10 @@
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
-//!   what it returns, with the call's arguments in its parameters.
+//!   what it returns, with the call's arguments in its parameters. Several
+//!   returns that end in one written path, after values the source does not
+//!   write, read as a hole for those values with the path after it
+//!   (carrick#2536).
 //! - **A key of an object parameter is a parameter** (carrick#1950). A
 //!   wrapper that takes its request as one object (`send({ url, body })`)
 //!   reads each key as the caller writes it: through a destructured
@@ -390,6 +393,14 @@ pub struct ObjValue {
     /// `fields` and `open` read as if the spread could hold anything: only
     /// the body a request sends reads this.
     pub under_param: Option<(usize, BTreeMap<String, Value>)>,
+    /// A spread of the rest of a destructured parameter (`const { path,
+    /// ...rest } = config`, carrick#2519), as the first thing the object
+    /// holds: the parameter's position and the keys the destructuring takes
+    /// out, with how many functions out the parameter is (0: this one's;
+    /// a closure reads its enclosing function's, carrick#1949). Only a
+    /// decided site's option key (its method) reads this; the body a request
+    /// sends does not, so no body row moves.
+    pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
 }
 
 impl ObjValue {
@@ -458,6 +469,7 @@ impl Value {
                 open: obj.open,
                 // A closure's object reads as it always did.
                 under_param: None,
+                under_rest: None,
             }),
             Value::Callback(index) => Value::Callback(*index),
         }
@@ -1426,6 +1438,20 @@ pub fn extract_file_ir(
     };
     module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
+    // A function declared at module scope whose body only returns text is a
+    // builder (carrick#1562), unless the module assigns its binding again.
+    // A declaration is hoisted, so every constant below reads it
+    // (carrick#2536).
+    for item in &module.body {
+        if let Some(Decl::Fn(fn_decl)) = module_decl(item)
+            && !reassigned.names.contains(fn_decl.ident.sym.as_ref())
+            && let Some(builder) = Builder::of_function(&fn_decl.function)
+        {
+            module_scope
+                .builders
+                .insert((ident_key(&fn_decl.ident), Vec::new()), builder);
+        }
+    }
     // Module constants first, in source order, so a later one can read an
     // earlier one (`const BASE = ...; const USERS = `${BASE}/users``).
     for item in &module.body {
@@ -1516,22 +1542,16 @@ pub fn extract_file_ir(
                 .insert(DEFAULT_EXPORT.to_string(), client);
         }
     }
-    // A function declared at module scope whose body only returns text is a
-    // builder a name may read through (carrick#1562), unless the module
-    // assigns its binding again. Read once every constant is known, since a
-    // declaration is hoisted.
+    // A name may read through such a builder too. Read once every constant is
+    // known, since the text it builds may name one.
     for item in &module.body {
         if let Some(Decl::Fn(fn_decl)) = module_decl(item)
             && !reassigned.names.contains(fn_decl.ident.sym.as_ref())
             && let Some(builder) = Builder::of_function(&fn_decl.function)
+            && let Some(value) = library_sites::builder(&builder, &module_scope)
         {
-            if let Some(value) = library_sites::builder(&builder, &module_scope) {
-                module_scope.named.insert(ident_key(&fn_decl.ident));
-                file.names.insert(fn_decl.ident.sym.to_string(), value);
-            }
-            module_scope
-                .builders
-                .insert((ident_key(&fn_decl.ident), Vec::new()), builder);
+            module_scope.named.insert(ident_key(&fn_decl.ident));
+            file.names.insert(fn_decl.ident.sym.to_string(), value);
         }
     }
     // A client a getter builds into a module `let` on first use
@@ -1859,7 +1879,9 @@ impl ModuleScope {
 /// reads a call to it (carrick#1562): its parameters and what it returns.
 struct Builder {
     params: Vec<Option<BindingKey>>,
-    returned: Box<Expr>,
+    /// Each different expression a `return` writes, in source order; never
+    /// empty. [`Reader::builder_call`] reads them together (carrick#2536).
+    returned: Vec<Expr>,
 }
 
 impl Builder {
@@ -1869,10 +1891,10 @@ impl Builder {
         match crate::graphql_document_sites::unwrap_expression(expr) {
             Expr::Arrow(arrow) => Some(Builder {
                 params: arrow.params.iter().map(pat_key).collect(),
-                returned: Box::new(match &*arrow.body {
-                    ArrowFunctionBody::Expr(expr) => (**expr).clone(),
-                    ArrowFunctionBody::FunctionBody(block) => returned_value(&block.stmts)?,
-                }),
+                returned: match &*arrow.body {
+                    ArrowFunctionBody::Expr(expr) => vec![(**expr).clone()],
+                    ArrowFunctionBody::FunctionBody(block) => returned_values(&block.stmts)?,
+                },
             }),
             Expr::Fn(function) => Self::of_function(&function.function),
             _ => None,
@@ -1889,7 +1911,7 @@ impl Builder {
                 .iter()
                 .map(|param| pat_key(&param.pat))
                 .collect(),
-            returned: Box::new(returned_value(&function.body.as_ref()?.stmts)?),
+            returned: returned_values(&function.body.as_ref()?.stmts)?,
         })
     }
 
@@ -1923,21 +1945,21 @@ impl Builder {
     }
 }
 
-/// The one expression every `return` of a function body writes
-/// (carrick#2447), with each local `const` it names replaced by its
+/// Each different expression a `return` of a function body writes, in source
+/// order (carrick#2447, carrick#2536), with each local `const` it names replaced by its
 /// initialiser, so the builder reads it as `return root + "/v1"` for
 /// `const root = "/api"; return root + "/v1"`.
 ///
 /// The body may hold only `const name = <expr>` declarations, `return <expr>`,
 /// `throw`, blocks and `if` / `else`, and every path through it must end in a
-/// `return` or a `throw`. Several returns count only when they write the same
-/// expression: a body returning two different values states none (the
-/// call stays a hole), as does any other statement (a loop, a `let`, a call
-/// that may change what a later line reads). A local is replaced by its
+/// `return` or a `throw`. Any other statement (a loop, a `let`, a call that
+/// may change what a later line reads) states no value, and nor does a body
+/// with no `return`. The caller reads several different returns together
+/// ([`shared_written_tail`]). A local is replaced by its
 /// binding ([`ident_key`]), never by name, and a `const` a block or a branch
 /// declares is read only inside it, so a block that declares the name again
 /// keeps its own and the lines after the block read the outer one.
-fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
+fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
     fn ends(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|stmt| match stmt {
             Stmt::Return(_) | Stmt::Throw(_) => true,
@@ -2014,11 +2036,50 @@ fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
     }
     let mut returns = Vec::new();
     walk(stmts, &mut HashMap::new(), &mut returns)?;
-    let first = returns.first()?.clone();
-    returns
-        .iter()
-        .all(|other| swc_common::EqIgnoreSpan::eq_ignore_span(other, &first))
-        .then_some(first)
+    let mut distinct: Vec<Expr> = Vec::new();
+    for value in returns {
+        if !distinct
+            .iter()
+            .any(|seen| swc_common::EqIgnoreSpan::eq_ignore_span(seen, &value))
+        {
+            distinct.push(value);
+        }
+    }
+    (!distinct.is_empty()).then_some(distinct)
+}
+
+/// The written path every value ends in, when what comes before it is only
+/// values the source does not write (carrick#2536): `readMount() + "/svc"`
+/// and `"/svc"` share `/svc`. The tails must be byte-equal, not merely
+/// share a suffix (`/v1/api` and `/v2/api` share none, and `/admin/api` with
+/// `/api` would fold written text into the hole). The tail starts with `/`,
+/// holds a non-empty segment and no `?` or `#`, and every earlier piece of
+/// every value is an unread value.
+fn shared_written_tail(values: &[Value]) -> Option<String> {
+    let mut tail: Option<&str> = None;
+    for value in values {
+        let Value::Str(pieces) = value else {
+            return None;
+        };
+        let (Piece::Lit(last), before) = pieces.split_last()? else {
+            return None;
+        };
+        if !before
+            .iter()
+            .all(|piece| matches!(piece, Piece::Opaque { .. }))
+        {
+            return None;
+        }
+        if tail.is_some_and(|tail| tail != last) {
+            return None;
+        }
+        tail = Some(last);
+    }
+    let tail = tail?;
+    (tail.starts_with('/')
+        && !tail.contains(['?', '#'])
+        && tail.split('/').any(|segment| !segment.is_empty()))
+    .then(|| tail.to_string())
 }
 
 /// How one binding is used beyond its own declaration: an identifier, or a
@@ -3163,6 +3224,8 @@ struct Captured {
     /// as the caller wrote them ([`Scope::key_objects`]), with how many
     /// functions out each is and its position there (carrick#1949).
     objects: HashMap<BindingKey, (u8, usize)>,
+    /// [`Scope::rest_of`], each one function further out.
+    rests: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// Literal text only: a hole is a parameter of the enclosing function,
     /// which the function written inside it is not called with.
     texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
@@ -3606,6 +3669,12 @@ struct Scope<'a> {
     /// nested pattern: each may hold something other than what the caller
     /// wrote under that key.
     keyed: HashMap<BindingKey, (usize, String)>,
+    /// The rest element of a parameter the body unpacks (`const { path,
+    /// ...rest } = config`, or `= init ?? {}`), with the parameter's
+    /// position and every key the pattern takes out (carrick#2519): it holds
+    /// the caller's other keys. Never a binding declared twice or assigned
+    /// again.
+    rest_of: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// The plain parameters whose keys the body may read as the caller wrote
     /// them (`options.url`, `const { url } = options`): never one the body
     /// assigns again, nor one whose name the file writes through.
@@ -3664,6 +3733,7 @@ impl<'a> Scope<'a> {
         Self {
             params: Vec::new(),
             keyed: HashMap::new(),
+            rest_of: HashMap::new(),
             key_objects: HashSet::new(),
             outer_objects: HashMap::new(),
             locals: HashMap::new(),
@@ -4243,6 +4313,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
@@ -4297,6 +4368,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
@@ -4404,6 +4476,18 @@ impl Reader<'_> {
                     // the parameter it is unpacked from (carrick#1950), where
                     // the body declares the name once and never assigns it
                     // again.
+                    // `const { path, ...rest } = config` (or `= init ?? {}`):
+                    // the rest holds the caller's other keys (carrick#2519).
+                    if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
+                        && let Some(source) = param_or_empty(init)
+                        && scope.key_objects.contains(&ident_key(source))
+                        && let Some(index) = scope.param_index(source)
+                        && let Some((rest, taken)) = rest_and_taken(object)
+                        && !reassigned.names.contains(&rest.0)
+                        && declared.binding_count(&rest) == 1
+                    {
+                        scope.rest_of.insert(rest, (0, index, taken));
+                    }
                     if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
                         && let Expr::Ident(source) =
                             crate::graphql_document_sites::unwrap_expression(init)
@@ -4607,6 +4691,7 @@ impl Reader<'_> {
                             fields: BTreeMap::new(),
                             open: true,
                             under_param: None,
+                            under_rest: None,
                         });
                     }
                     return value.clone();
@@ -4832,9 +4917,27 @@ impl Reader<'_> {
             inner.locals.insert(param.clone(), value);
         }
         self.builder_depth.set(depth + 1);
-        let value = self.eval(&builder.returned, &inner);
+        let values: Vec<Value> = builder
+            .returned
+            .iter()
+            .map(|returned| self.eval(returned, &inner))
+            .collect();
         self.builder_depth.set(depth);
-        Some(value)
+        if values.iter().all(|value| *value == values[0]) {
+            return values.into_iter().next();
+        }
+        // Returns that differ: the call stays the hole it was, followed by
+        // the path every return writes (carrick#2536).
+        shared_written_tail(&values).map(|tail| {
+            Value::Str(vec![
+                Piece::Opaque {
+                    text: self.text(call.span),
+                    end: Root::Hole(HoleReason::UnreadExpression),
+                    link: None,
+                },
+                Piece::Lit(tail),
+            ])
+        })
     }
 
     /// `new URL(path, base)`: the base is opaque and leads, the path follows.
@@ -4882,9 +4985,14 @@ impl Reader<'_> {
                 PropOrSpread::Spread(spread) => {
                     // A held object is open, so a second spread takes no hold.
                     value.under_param = None;
+                    let first = !value.open && value.fields.is_empty();
+                    value.under_rest = None;
                     match self.spread_branches(&spread.expr, scope) {
                         Some(branches) => value.spread(&branches),
                         None => {
+                            if first {
+                                value.under_rest = self.rest_of_param(&spread.expr, scope);
+                            }
                             if !value.open {
                                 value.under_param = self
                                     .own_param(&spread.expr, scope)
@@ -4907,6 +5015,7 @@ impl Reader<'_> {
                         value.fields.clear();
                         value.open = true;
                         value.under_param = None;
+                        value.under_rest = None;
                     }
                 },
                 Prop::Shorthand(ident) => {
@@ -4931,10 +5040,24 @@ impl Reader<'_> {
                     }
                     value.open = true;
                     value.under_param = None;
+                    value.under_rest = None;
                 }
             }
         }
         value
+    }
+
+    /// The parameter position and the keys taken out, when `expr` names the
+    /// rest of a destructured parameter ([`Scope::rest_of`], carrick#2519).
+    fn rest_of_param(
+        &self,
+        expr: &Expr,
+        scope: &Scope<'_>,
+    ) -> Option<(u8, usize, BTreeSet<String>)> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Ident(ident) => scope.rest_of.get(&ident_key(ident)).cloned(),
+            _ => None,
+        }
     }
 
     /// The position of the function's own parameter `expr` names, when its
@@ -5609,6 +5732,51 @@ fn method_of(pieces: &[Piece]) -> MethodValue {
     }
 }
 
+/// The parameter `init` names: the identifier itself, or `param ?? {}` /
+/// `param || {}` with an empty object literal on the right.
+fn param_or_empty(init: &Expr) -> Option<&Ident> {
+    match crate::graphql_document_sites::unwrap_expression(init) {
+        Expr::Ident(ident) => Some(ident),
+        Expr::Bin(bin)
+            if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr)
+                && matches!(
+                    crate::graphql_document_sites::unwrap_expression(&bin.right),
+                    Expr::Object(empty) if empty.props.is_empty()
+                ) =>
+        {
+            match crate::graphql_document_sites::unwrap_expression(&bin.left) {
+                Expr::Ident(ident) => Some(ident),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The rest binding of an object pattern whose other properties are all
+/// plain keys, and those keys: `{ path, headers: h, ...rest }` gives `rest`
+/// and `{path, headers}`. `None` with no rest, a computed key, or a rest that
+/// is not a plain name.
+fn rest_and_taken(object: &ObjectPat) -> Option<(BindingKey, BTreeSet<String>)> {
+    let mut taken = BTreeSet::new();
+    let mut rest = None;
+    for prop in &object.props {
+        match prop {
+            ObjectPatProp::Assign(assign) => {
+                taken.insert(assign.key.id.sym.to_string());
+            }
+            ObjectPatProp::KeyValue(kv) => {
+                taken.insert(prop_name(&kv.key)?);
+            }
+            ObjectPatProp::Rest(rest_pat) => match &*rest_pat.arg {
+                Pat::Ident(binding) => rest = Some(ident_key(&binding.id)),
+                _ => return None,
+            },
+        }
+    }
+    Some((rest?, taken))
+}
+
 /// The bindings an object pattern introduces that hold exactly one key of the
 /// object it unpacks, each with its key (carrick#1950): `{ url }` and
 /// `{ url: target }`. Not one with a default (`{ url = "/x" }`), which holds
@@ -6216,9 +6384,21 @@ impl CallWalker<'_, '_, '_> {
                 objects.insert(key.clone(), (1, index));
             }
         }
+        let rests = self
+            .scope
+            .rest_of
+            .iter()
+            .map(|(key, (depth, index, taken))| {
+                (
+                    key.clone(),
+                    (depth.saturating_add(1), *index, taken.clone()),
+                )
+            })
+            .collect();
         Captured {
             values,
             objects,
+            rests,
             texts: self
                 .scope
                 .texts
@@ -7454,6 +7634,22 @@ impl RequestSummaryIndex {
         self.rows.get(file)
     }
 
+    /// Where the rows of each request stand (carrick#2524): the request's
+    /// file and span start ([`SummaryRow::request_at`]) to the file and line
+    /// of every row stated for it.
+    pub fn placements(&self) -> decided_sites::SummaryPlacements {
+        let mut placed = decided_sites::SummaryPlacements::new();
+        for (file, sites) in &self.rows {
+            for row in sites.values().flatten() {
+                placed
+                    .entry(row.request_at.clone())
+                    .or_default()
+                    .insert((file.clone(), row.line));
+            }
+        }
+        placed
+    }
+
     /// Withdraw every row whose request is made by a call the source states
     /// as an endpoint (carrick#2383). `registered` holds, per file, the span
     /// starts of the calls an endpoint row sits at, from whatever source
@@ -8464,6 +8660,8 @@ fn is_absolute_url(text: &str) -> bool {
 /// service's own functions builds may end it (carrick#1950), and is not
 /// written: it may be nothing, and it is no part of the route.
 fn render_target(url: &[Piece]) -> Option<String> {
+    let url = route_of(url);
+    let url = url.as_ref();
     if url.iter().enumerate().any(|(position, piece)| match piece {
         Piece::Unknown => true,
         Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..) => {
@@ -8522,6 +8720,38 @@ fn render_target(url: &[Piece]) -> Option<String> {
     })
 }
 
+/// The route part of a URL whose query holds a value the source does not
+/// write (carrick#2519): `/groups/${id}?workspace=${workspace}` or
+/// `/items?${params}`. Text from the first literal `?` on is the query, not
+/// the route, so a value there is no path parameter: the URL is cut before
+/// the `?`. A query written all in literal text is kept as it was, so no
+/// target the source states whole changes.
+fn route_of(url: &[Piece]) -> Cow<'_, [Piece]> {
+    let Some((index, at)) = url
+        .iter()
+        .enumerate()
+        .find_map(|(index, piece)| match piece {
+            Piece::Lit(text) => text.find('?').map(|at| (index, at)),
+            _ => None,
+        })
+    else {
+        return Cow::Borrowed(url);
+    };
+    if url[index + 1..]
+        .iter()
+        .all(|piece| matches!(piece, Piece::Lit(_)))
+    {
+        return Cow::Borrowed(url);
+    }
+    let mut route = url[..index].to_vec();
+    if let Piece::Lit(text) = &url[index]
+        && at > 0
+    {
+        route.push(Piece::Lit(text[..at].to_string()));
+    }
+    Cow::Owned(route)
+}
+
 /// Whether the piece at `position` stands for a whole path segment: it
 /// follows a literal ending in `/`, and ends at the next `/`, `?`, `#`, a
 /// built query ([`Piece::Query`]) or the end of the URL.
@@ -8566,6 +8796,37 @@ mod tests {
             render_target(&[lit("/users/"), opaque("id"), lit("/orders")]).as_deref(),
             Some("/users/${id}/orders")
         );
+    }
+
+    /// carrick#2519: a value written in the query is no path parameter; the
+    /// route is the path before the `?`. A query all in literal text is kept.
+    #[test]
+    fn a_value_in_the_query_is_cut_from_the_route() {
+        assert_eq!(
+            render_target(&[
+                lit("/groups/"),
+                Piece::Param(0, "id".to_string()),
+                lit("?workspace="),
+                Piece::Param(1, "workspace".to_string()),
+            ])
+            .as_deref(),
+            Some("/groups/${id}")
+        );
+        assert_eq!(
+            render_target(&[opaque("base"), lit("/items?"), opaque("params.toString()")])
+                .as_deref(),
+            Some("${base}/items")
+        );
+        assert_eq!(
+            render_target(&[lit("/items?limit=10")]).as_deref(),
+            Some("/items?limit=10")
+        );
+        // A value before the `?` still has to be a whole segment.
+        assert_eq!(
+            render_target(&[lit("/v"), opaque("version"), lit("?x="), opaque("y")]),
+            None
+        );
+        assert_eq!(render_target(&[lit("?q="), opaque("q")]), None);
     }
 
     #[test]
@@ -8634,6 +8895,7 @@ mod tests {
                 .collect(),
             open,
             under_param: None,
+            under_rest: None,
         })
     }
 
@@ -8787,6 +9049,7 @@ mod tests {
             fields: BTreeMap::from([("url".to_string(), object(&[], false))]),
             open: false,
             under_param: None,
+            under_rest: None,
         });
         assert_eq!(
             wrapper.instantiate(&[nested], &[]).url,
@@ -9544,9 +9807,9 @@ function build() { return {}; }
         let Some(ModuleItem::Stmt(Stmt::Decl(Decl::Fn(base)))) = module.body.first() else {
             panic!("the module declares base first");
         };
-        let returned = returned_value(&base.function.body.as_ref().expect("body").stmts);
+        let returned = returned_values(&base.function.body.as_ref().expect("body").stmts);
         assert!(
-            matches!(&returned, Some(Expr::Lit(Lit::Str(text))) if text.value.to_string_lossy() == "/x"),
+            matches!(returned.as_deref(), Some([Expr::Lit(Lit::Str(text))]) if text.value.to_string_lossy() == "/x"),
             "{returned:?}"
         );
     }
@@ -9572,6 +9835,123 @@ function build() { return {}; }
             assert!(
                 matches!(url.first(), Some(Piece::Opaque { text, .. }) if text == "base()"),
                 "{body}: {url:?}"
+            );
+        }
+    }
+
+    /// carrick#2536: a module constant set to a call of a function the
+    /// module declares is what the function returns. A declaration is
+    /// hoisted, so a constant written above it reads it too.
+    #[test]
+    fn a_constant_set_by_a_declared_function_reads_what_it_returns() {
+        for (source, target) in [
+            (
+                "function base() { return \"/api/v1\"; }\n\
+                 const API = base();\n\
+                 export function f() { return fetch(API + \"/x\"); }\n",
+                "/api/v1/x",
+            ),
+            (
+                "const API = base();\n\
+                 function base() { return process.env.ORIGIN + \"/api/v1\"; }\n\
+                 export function f() { return fetch(API + \"/x\"); }\n",
+                "${process.env.ORIGIN}/api/v1/x",
+            ),
+        ] {
+            let url = request_url(source, "f");
+            assert_eq!(render_target(&url).as_deref(), Some(target), "{source}");
+        }
+    }
+
+    /// carrick#2536: returns that differ only in a value the source does not
+    /// write, before one literal path every return ends in, read as a hole
+    /// for that value with the path after it. The hole is the call, as it
+    /// was before; only the path is added.
+    #[test]
+    fn returns_that_end_in_one_written_path_keep_it_after_a_hole() {
+        for source in [
+            "function base() { const m = readMount(); if (m) { return m + \"/svc/v2\"; } return \"/svc/v2\"; }\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "function base() { if (flag()) { return process.env.ROOT + \"/svc/v2\"; } return `${origin()}/svc/v2`; }\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "const base = () => { if (flag()) { return readMount() + \"/svc/v2\"; } return \"/svc/v2\"; };\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "function base() { if (flag()) { return readMount() + \"/svc/v2\"; } return \"/svc/v2\"; }\n\
+             const ROOT = base();\n\
+             export function f() { return fetch(ROOT + \"/x\"); }\n",
+        ] {
+            let url = request_url(source, "f");
+            assert_eq!(
+                first_end(&url),
+                (
+                    &Root::Hole(HoleReason::UnreadExpression),
+                    Some("${base()}/svc/v2/x".to_string())
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    /// carrick#2536, must not verify: no path is claimed that every return
+    /// does not write whole after only values the source does not write.
+    /// Returns ending in different text (even with a common tail, `/api`),
+    /// a varying part the source writes (`/admin`, `/t/`), a path with no
+    /// leading slash or no segment, text the call hands the function, and a
+    /// parameter a caller may fill with text all leave the call the one hole
+    /// it was before.
+    #[test]
+    fn returns_that_do_not_end_in_one_written_path_stay_a_hole() {
+        for (declaration, params, call) in [
+            (
+                "function base() { if (flag()) { return \"/api/v1\"; } return \"/api/v2\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return \"/v1/api\"; } return \"/v2/api\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"/admin/api\"; } return \"/api\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return `/t/${tenant()}/api`; } return \"/api\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"api/v1\"; } return \"api/v1\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"/\"; } return \"/\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base(p: string) { if (p) { return p + \"/api\"; } return \"/api\"; }",
+                "",
+                "base(\"/admin\")",
+            ),
+            (
+                "function base(p: string) { if (p) { return p + \"/api\"; } return \"/api\"; }",
+                "prefix: string",
+                "base(prefix)",
+            ),
+        ] {
+            let url = request_url(
+                &format!(
+                    "{declaration}\nexport function f({params}) {{ return fetch({call} + \"/x\"); }}\n"
+                ),
+                "f",
+            );
+            assert!(
+                matches!(url.as_slice(), [Piece::Opaque { text, .. }, Piece::Lit(rest)] if text == call && rest == "/x"),
+                "{declaration}: {url:?}"
             );
         }
     }
