@@ -14,7 +14,9 @@ use crate::request_summary::decided_sites::{
 use crate::request_summary::site_record::{
     AnchorAt, Basis, Bucket, HandlerAnchor, SiteRecord, TypeAnchors,
 };
-use crate::site_questions::{SiteAnswer, SiteAnswers, SiteState, Slot, parse_response};
+use crate::site_questions::{
+    Answered, SiteAnswer, SiteAnswers, SiteState, Slot, SlotAnswer, SlotValue, parse_response,
+};
 
 const LINE: u32 = 7;
 
@@ -271,6 +273,78 @@ fn each_kind_names_its_key_and_scope() {
             .map(|scope| scope.scope.as_str()),
         Some(carrick_match::SERVICE_SCOPE)
     );
+}
+
+/// One row for a site labelled `role` whose model answered `kind` at 0.95
+/// with the orders agreeing, the role and name stated.
+fn row_for_kind(role: &str, kind: &str) -> SiteRow {
+    let site = site("src/ipc.ts", role, "receive", "ChildProcess");
+    let record = record(
+        &site,
+        &[(Slot::Role, "handles"), (Slot::Name, "message")],
+        &[Slot::Kind],
+    );
+    let mut answers = SiteAnswers::default();
+    answers.answered.insert(
+        site_id(&record.anchors),
+        Answered {
+            kind: Some(SlotAnswer {
+                value: Some(SlotValue::Text(kind.to_string())),
+                confidence: 0.95,
+                orders_agree: true,
+            }),
+            ..Answered::default()
+        },
+    );
+    let decided = Decided {
+        sites: vec![site],
+        ..Decided::default()
+    };
+    let mut rows = of(&decided, &[record], &[], &answers).rows;
+    assert_eq!(rows.len(), 1, "{role} {kind}");
+    rows.remove(0)
+}
+
+/// A site whose labelled end is an in-process bus stays in its service
+/// whatever kind the model names (carrick#2538), as library-claim rows do
+/// (ruling D4); a broker keeps the scope its kind gives.
+#[test]
+fn an_in_process_site_stays_in_its_service_whatever_its_kind() {
+    let service = carrick_match::NameScope {
+        scope: carrick_match::SERVICE_SCOPE.to_string(),
+        namespace: None,
+    };
+    for kind in ["topic", "message", "event", "socket_event"] {
+        let row = row_for_kind("in_process_bus", kind);
+        assert_eq!(row.side, RowSide::Endpoint, "{kind}");
+        assert_eq!(row.name_scope, Some(service.clone()), "{kind}");
+    }
+    let global = carrick_match::NameScope {
+        scope: carrick_match::GLOBAL_SCOPE.to_string(),
+        namespace: None,
+    };
+    assert_eq!(
+        row_for_kind("broker", "message").name_scope,
+        Some(global.clone())
+    );
+    assert_eq!(row_for_kind("broker", "topic").name_scope, None);
+
+    let scoped = |service, name_scope| carrick_match::ScopedRow {
+        service,
+        name_scope,
+    };
+    let row = row_for_kind("in_process_bus", "message");
+    let publisher = scoped("billing", Some(&global));
+    let listener = scoped("worker", row.name_scope.as_ref());
+    assert!(!carrick_match::names_pair(publisher, listener));
+    assert!(!carrick_match::names_pair(
+        scoped("billing", None),
+        scoped("worker", row.name_scope.as_ref())
+    ));
+    assert!(carrick_match::names_pair(
+        scoped("worker", None),
+        scoped("worker", row.name_scope.as_ref())
+    ));
 }
 
 /// A send on a server's socket goes server to client, a send on a
@@ -604,6 +678,64 @@ fn the_fold_keeps_to_its_side() {
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0].inference, None);
     assert_eq!(calls.len(), 1);
+}
+
+fn lead_at(file: &str, line: u32, role: Option<&str>) -> PossibleCall {
+    PossibleCall {
+        file_path: file.to_string(),
+        line_number: line,
+        span_start: 0,
+        span_end: 0,
+        kind: None,
+        role: role.map(str::to_string),
+        labelled_end: None,
+        unread: crate::possible_calls::Unread {
+            slot: "path".to_string(),
+            reason: UnreadReason::NoOpClaim,
+        },
+        trace_depth: 0,
+    }
+}
+
+/// A lead on a line the blob already holds a row at is dropped, by side:
+/// a consumer lead matches a call row, a producer lead an endpoint row, a
+/// lead with no role either (carrick#2539).
+#[test]
+fn a_lead_on_a_line_with_a_row_is_dropped() {
+    let mut calls = vec![blob_row(
+        OperationKey::http("GET", "/a"),
+        "src/a.ts",
+        10,
+        None,
+    )];
+    let mut endpoints = vec![blob_row(
+        OperationKey::http("GET", "/b"),
+        "src/b.ts",
+        5,
+        None,
+    )];
+    let site = SiteRows {
+        enabled: true,
+        rows: Vec::new(),
+        leads: vec![
+            lead_at("src/a.ts", 10, None),
+            lead_at("src/a.ts", 20, None),
+            lead_at("src/b.ts", 5, Some("consumer")),
+            lead_at("src/b.ts", 5, Some("producer")),
+        ],
+        routes: Vec::new(),
+    };
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    let kept: Vec<(&str, u32, Option<&str>)> = fold
+        .leads
+        .iter()
+        .map(|l| (l.file_path.as_str(), l.line_number, l.role.as_deref()))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![("src/a.ts", 20, None), ("src/b.ts", 5, Some("consumer"))]
+    );
+    assert_eq!(fold.lead_on_row_line, 2);
 }
 
 /// Off, nothing folds and nothing is written: the rows are byte for byte

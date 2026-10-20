@@ -9,7 +9,9 @@
 //!
 //! - **Kind to key.** `http` is an HTTP key; `topic` a pub/sub key with no
 //!   name scope; `message` and `event` pub/sub keys scoped `global` and
-//!   `service`, as library-claim rows are; `socket_event` a socket key whose
+//!   `service`, as library-claim rows are; a site labelled `in_process_bus`
+//!   is `service`-scoped whatever its kind, as library-claim rows are
+//!   (`topic` and `socket_event` included); `socket_event` a socket key whose
 //!   direction is read from the label's side: a send on a server's socket
 //!   goes server to client, a send on a client's client to server, and a
 //!   handler the other way. A side the label does not state (`both`, or one
@@ -276,6 +278,26 @@ fn key_of(
     })
 }
 
+/// The name scope of a non-HTTP row at a site whose labelled end has the role
+/// `in_process_bus`: `service`, whatever kind the answer names, with the
+/// answered namespace kept. An in-process name never leaves its service, as
+/// the library-claim writer (`library_claims.rs`, `scoped`, ruling D4 on
+/// carrick#1564) already holds. Every other role keeps the scope its kind
+/// gave, and HTTP keys carry none.
+fn in_process_scope(
+    role: &str,
+    key: &OperationKey,
+    scope: Option<carrick_match::NameScope>,
+) -> Option<carrick_match::NameScope> {
+    if role != "in_process_bus" || matches!(key, OperationKey::Http { .. }) {
+        return scope;
+    }
+    Some(carrick_match::NameScope {
+        scope: carrick_match::SERVICE_SCOPE.to_string(),
+        namespace: scope.and_then(|scope| scope.namespace),
+    })
+}
+
 /// Why an HTTP route a site answer states cannot be written as an endpoint
 /// (carrick#2517), or `None` for any other row.
 ///
@@ -441,6 +463,7 @@ pub fn of(
             out.leads.push(lead(UnreadReason::BelowBand));
             continue;
         };
+        let name_scope = in_process_scope(&site.end.role, &key, name_scope);
         let fact = record.bucket == Bucket::Forced;
         // Every slot the model answered that feeds the key or the side:
         // forced slots are 1.0 and agreeing, so only asked ones can lower it.
@@ -496,6 +519,9 @@ pub struct SiteFold {
     /// Route sites ([`SiteRows::routes`]) where a row already stands at the
     /// line: the index holds the route, so the site is no possible call.
     pub route_kept_reader: usize,
+    /// Leads dropped because the blob already holds a row at their line
+    /// (carrick#2539): the index states that site, so it is no possible call.
+    pub lead_on_row_line: usize,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -534,7 +560,27 @@ pub fn fold_rows(
     if !site.enabled {
         return out;
     }
-    out.leads = site.leads.clone();
+    // A lead on a line the blob already holds a row at is that row's site.
+    // A consumer lead matches a call row, a producer lead an endpoint row,
+    // and a lead with no role either.
+    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
+        rows.iter()
+            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+    };
+    for lead in &site.leads {
+        let on_call = held_at(calls, &lead.file_path, lead.line_number);
+        let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number);
+        let held = match lead.role.as_deref() {
+            Some("consumer") => on_call,
+            Some("producer") => on_endpoint,
+            _ => on_call || on_endpoint,
+        };
+        if held {
+            out.lead_on_row_line += 1;
+        } else {
+            out.leads.push(lead.clone());
+        }
+    }
     // The same file:line match as the rows below, on the endpoint side.
     for route in &site.routes {
         let held = endpoints.iter().any(|existing| {

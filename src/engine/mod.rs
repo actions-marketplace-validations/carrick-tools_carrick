@@ -5413,6 +5413,7 @@ fn append_deterministic_protocol_operations(
         debug!(
             routes = extractions.site.routes.len(),
             route_kept_reader = site.route_kept_reader,
+            lead_on_row_line = site.lead_on_row_line,
             possible_calls = site.leads.len(),
             stated = site.stated.len(),
             withdrawn = site.withdrawn.len(),
@@ -22044,6 +22045,100 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(of.decided.sites.len(), 1, "decided sites");
     }
 
+    /// carrick#2538: a message listener on a forked child process is an
+    /// in-process end. The row it writes stays in its service, so it never
+    /// pairs with a publisher of the same name in another service, whatever
+    /// kind the model named for it.
+    #[tokio::test]
+    async fn a_forked_child_s_message_listener_stays_in_its_service() {
+        use crate::site_questions::{Answered, SiteAnswers, Slot, SlotAnswer, SlotValue};
+        let edit = [
+            (
+                "node_modules/@types/node/child_process.d.ts",
+                "declare module \"node:child_process\" {\n  export interface ChildProcess {\n    send(message: unknown): boolean;\n    on(event: string, listener: (...args: unknown[]) => void): this;\n  }\n  export function fork(modulePath: string): ChildProcess;\n}\n",
+            ),
+            (
+                "src/worker-link.ts",
+                "import { fork } from \"node:child_process\";\n\nconst child = fork(\"./worker.js\");\n\nchild.on(\"message\", (message: unknown) => {\n  void message;\n});\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"node:child_process","version":"22.0.0","status":"answered",
+            "exports":[{"specifier":"node:child_process","export":"ChildProcess","role":"in_process_bus","side":"client",
+            "makes":[],"scopes":[],
+            "ops":[{"op":"receive","member":"on","on":"instance","name":{"arg":0},"handler":{"arg":1}}],
+            "reserved":[],"calls":[],"patterns":[]},
+            {"specifier":"node:child_process","export":"fork","role":"none","makes":[],"scopes":[],"ops":[],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        let file = "services/web/src/worker-link.ts";
+        let record = of
+            .records
+            .iter()
+            .find(|record| record.anchors.call.file == file && record.anchors.call.line == 5)
+            .expect("the listener is a decided site");
+        let said = |text: &str| {
+            Some(SlotAnswer {
+                value: Some(SlotValue::Text(text.to_string())),
+                confidence: 0.95,
+                orders_agree: true,
+            })
+        };
+        let mut answered = Answered::default();
+        for slot in &record.state.asked {
+            match slot {
+                Slot::Kind => answered.kind = said("message"),
+                Slot::Role => answered.role = said("handles"),
+                Slot::Name => answered.name = said("message"),
+                other => panic!("an unexpected asked slot {other:?}"),
+            }
+        }
+        let mut answers = SiteAnswers::default();
+        answers
+            .answered
+            .insert(crate::site_rows::site_id(&record.anchors), answered);
+        let rows = crate::site_rows::of(&of.decided, &of.records, &of.labels, &answers);
+        let at: Vec<_> = rows
+            .rows
+            .iter()
+            .filter(|row| row.file == file && row.line == 5)
+            .collect();
+        assert_eq!(at.len(), 1, "one row at the listener");
+        let row = at[0];
+        assert_eq!(row.key, crate::operation::OperationKey::pubsub("message"));
+        assert_eq!(row.side, crate::site_rows::RowSide::Endpoint);
+        let scope = row.name_scope.as_ref().expect("the row is scoped");
+        assert_eq!(scope.scope, carrick_match::SERVICE_SCOPE);
+        let global = carrick_match::NameScope {
+            scope: carrick_match::GLOBAL_SCOPE.to_string(),
+            namespace: None,
+        };
+        assert!(!carrick_match::names_pair(
+            carrick_match::ScopedRow {
+                service: "billing",
+                name_scope: Some(&global),
+            },
+            carrick_match::ScopedRow {
+                service: "web",
+                name_scope: Some(scope),
+            },
+        ));
+    }
+
     /// carrick#2439: on, an answer in the band replaces the model's pub/sub
     /// row at its site and carries its answer, and the sites that state no
     /// row are written as possible calls.
@@ -22215,6 +22310,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )],
             leads: Vec::new(),
             route_kept_reader: 0,
+            lead_on_row_line: 0,
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
@@ -25708,6 +25804,190 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(
             rows.iter().all(|(target, _)| !target.contains("/svc/")),
             "{rows:#?}"
+        );
+    }
+
+    /// `src/orders.ts` imports `import` from `src/config.ts` and leads a
+    /// wrapper's URL with `head`; a caller in the module fills the wrapper's
+    /// query (carrick#2540). `files` holds config.ts and any module it
+    /// imports. The rows orders.ts states: each target and its path.
+    fn importer_rows(files: &[(&str, &str)], import: &str, head: &str) -> Vec<(String, String)> {
+        let orders = format!(
+            "import {{ {import} }} from \"./config\";\n\
+             \n\
+             async function fetchLines(order: string, page: string) {{\n\
+             \x20 const res = await fetch(`${{{head}}}/orders/${{encodeURIComponent(order)}}/lines?page=${{page}}`);\n\
+             \x20 return res.json();\n\
+             }}\n\
+             \n\
+             export function firstPage() {{\n\
+             \x20 return fetchLines(currentOrder(), \"1\");\n\
+             }}\n"
+        );
+        let mut all: Vec<(&str, &str)> = files.to_vec();
+        all.push(("src/orders.ts", orders.as_str()));
+        let (dir, discovery) = discover_sources(&all);
+        let normalizer = crate::url_normalizer::UrlNormalizer::new(&Config::default());
+        summary_rows_of(&dir, &discovery, "src/orders.ts")
+            .into_iter()
+            .map(|row| {
+                let path = normalizer.normalize(&row.target).path;
+                (row.target, path)
+            })
+            .collect()
+    }
+
+    /// carrick#2540: an imported constant set by a call to a function the
+    /// declaring module declares reads what the function returns: above or
+    /// below the constant, and when its return reads another constant.
+    #[test]
+    fn an_imported_constant_a_declared_function_sets_reads_what_it_returns() {
+        for config in [
+            "function base() { return \"/svc/v2\"; }\nexport const ROOT = base();\n",
+            "export const ROOT = base();\nfunction base() { return \"/svc/v2\"; }\n",
+            "const PREFIX = \"/svc\";\nfunction base() { return PREFIX + \"/v2\"; }\nexport const ROOT = base();\n",
+        ] {
+            assert_eq!(
+                importer_rows(&[("src/config.ts", config)], "ROOT", "ROOT"),
+                vec![(
+                    "/svc/v2/orders/${encodeURIComponent(order)}/lines?page=1".to_string(),
+                    "/svc/v2/orders/:order/lines".to_string()
+                )],
+                "{config}"
+            );
+        }
+    }
+
+    /// carrick#2540: an imported constant or builder whose value is a value
+    /// no module writes, then one written path, hands the importer that
+    /// path after its own piece.
+    #[test]
+    fn an_imported_value_keeps_the_path_after_a_value_no_module_writes() {
+        let tail = |head: &str| {
+            vec![(
+                format!("${{{head}}}/svc/v2/orders/${{encodeURIComponent(order)}}/lines?page=1"),
+                "/svc/v2/orders/:order/lines".to_string(),
+            )]
+        };
+        let two_returns = "function serviceRoot() {\n  const m = readMount();\n  if (m) {\n    return m + \"/svc/v2\";\n  }\n  return \"/svc/v2\";\n}\n";
+        for (config, import, head) in [
+            (format!("{two_returns}export const ROOT = serviceRoot();\n"), "ROOT", "ROOT"),
+            ("export const ROOT = process.env.ORDERS_ORIGIN + \"/svc/v2\";\n".to_string(), "ROOT", "ROOT"),
+            ("export const ROOT = `${process.env.ORDERS_ORIGIN}/svc/v2`;\n".to_string(), "ROOT", "ROOT"),
+            (format!("export {two_returns}"), "serviceRoot", "serviceRoot()"),
+            ("export function serviceRoot() { return process.env.ORDERS_ORIGIN + \"/svc/v2\"; }\n".to_string(), "serviceRoot", "serviceRoot()"),
+        ] {
+            assert_eq!(
+                importer_rows(&[("src/config.ts", &config)], import, head),
+                tail(head),
+                "{config}"
+            );
+        }
+    }
+
+    /// carrick#2540, must not verify: no path crosses where the exporter
+    /// does not hold it after only values no module writes: a lead that is
+    /// another module's binding, a `let`, a builder whose prefix the caller
+    /// hands it (`/admin/svc` is the real path), and returns that end in
+    /// different paths.
+    #[test]
+    fn an_imported_value_claims_no_path_it_does_not_hold() {
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+        let cases: [Case; 4] = [
+            (
+                &[
+                    ("src/mount.ts", "export const MOUNT = \"/mnt\";\n"),
+                    (
+                        "src/config.ts",
+                        "import { MOUNT } from \"./mount\";\nexport const ROOT = MOUNT + readSuffix() + \"/svc\";\n",
+                    ),
+                ],
+                "ROOT",
+                "ROOT",
+            ),
+            (
+                &[(
+                    "src/config.ts",
+                    "export let ROOT = process.env.ORDERS_ORIGIN + \"/svc\";\n",
+                )],
+                "ROOT",
+                "ROOT",
+            ),
+            (
+                &[(
+                    "src/config.ts",
+                    "export function serviceRoot(prefix: string) {\n  if (prefix) {\n    return prefix + \"/svc\";\n  }\n  return \"/svc\";\n}\n",
+                )],
+                "serviceRoot",
+                "serviceRoot(\"/admin\")",
+            ),
+            (
+                &[(
+                    "src/config.ts",
+                    "function serviceRoot() {\n  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n}\nexport const ROOT = serviceRoot();\n",
+                )],
+                "ROOT",
+                "ROOT",
+            ),
+        ];
+        for (files, import, head) in cases {
+            let rows = importer_rows(files, import, head);
+            assert!(
+                rows.iter().all(|(target, _)| !target.contains("/svc")),
+                "{files:?}: {rows:#?}"
+            );
+        }
+    }
+
+    /// carrick#2541: a wrapper whose URL leads with a base that reads as
+    /// several written paths states no row.
+    #[test]
+    fn a_wrapper_states_no_row_for_a_base_that_reads_as_several_paths() {
+        for returns in [
+            "  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n",
+            "  if (legacy()) {\n    return readMount();\n  }\n  return \"/svc/v2\";\n",
+        ] {
+            let rows = orders_rows(&orders_source(returns));
+            assert!(rows.is_empty(), "{returns}: {rows:#?}");
+        }
+    }
+
+    /// carrick#2541: a caller that hands a wrapper a URL reading as several
+    /// paths, through a builder or a conditional, states no row.
+    #[test]
+    fn a_caller_states_no_row_for_an_argument_that_reads_as_several_paths() {
+        let source = "const apiFetch = (url: string) => fetch(url);\n\
+                      function pick(flag: boolean) {\n  if (flag) {\n    return \"/a\";\n  }\n  return \"/b\";\n}\n\
+                      export function two(flag: boolean) {\n  return apiFetch(pick(flag) + \"/two\");\n}\n\
+                      export function chosen(flag: boolean) {\n  return apiFetch((flag ? \"/a\" : \"/b\") + \"/two\");\n}\n";
+        let (dir, discovery) = discover_sources(&[("src/local.ts", source)]);
+        let rows = summary_rows_of(&dir, &discovery, "src/local.ts");
+        assert!(rows.is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#2541 across modules: an imported constant or builder that
+    /// reads as several paths states no row in the importer; an imported
+    /// builder whose returns are origins keeps its row.
+    #[test]
+    fn an_imported_value_that_reads_as_several_paths_states_no_row() {
+        let config = "export function serviceRoot() {\n  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n}\n\
+                      export const ROOT = serviceRoot();\n\
+                      export const PICKED = legacy() ? \"/svc/v1\" : \"/svc/v2\";\n\
+                      export function host() {\n  if (legacy()) {\n    return \"https://a.example\";\n  }\n  return \"http://localhost:3000\";\n}\n";
+        for (import, head) in [
+            ("ROOT", "ROOT"),
+            ("PICKED", "PICKED"),
+            ("serviceRoot", "serviceRoot()"),
+        ] {
+            let rows = importer_rows(&[("src/config.ts", config)], import, head);
+            assert!(rows.is_empty(), "{head}: {rows:#?}");
+        }
+        assert_eq!(
+            importer_rows(&[("src/config.ts", config)], "host", "host()"),
+            vec![(
+                "${host()}/orders/${encodeURIComponent(order)}/lines?page=1".to_string(),
+                "/orders/:order/lines".to_string()
+            )]
         );
     }
 }
