@@ -430,6 +430,16 @@ const YieldsSchema = z
   })
   .strict();
 
+/** Route fields (#2474 R0): member paths read off a handler's request parameter. */
+const RequestAtSchema = z
+  .object({
+    param: z.number().int().nonnegative(),
+    path: z.array(z.string().min(1)).optional(),
+    url: z.array(z.string().min(1)).optional(),
+    method: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
+
 const ClaimOnSchema = z.enum(['export', 'instance', 'both']);
 const MemberPathSchema = z.array(z.string().min(1));
 const KeyLabelsSchema = z.record(z.string().min(1), z.enum(['name', 'not_name']));
@@ -471,6 +481,9 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       key_labels: KeyLabelsSchema.optional(),
       name_scope: NameScopeSchema.optional(),
       picker: z.string().optional(),
+      runs: ClaimSlotSchema.optional(),
+      yields: YieldsSchema.optional(),
+      mounts: ClaimSlotSchema.optional(),
     })
     .strict(),
   z
@@ -495,6 +508,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       base: ClaimSlotSchema.optional(),
       runs: RunsSlotSchema.optional(),
       yields: YieldsSchema.optional(),
+      request: RequestAtSchema.optional(),
     })
     .strict(),
   z
@@ -533,6 +547,7 @@ const LibraryCheckSchema = z
 export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('verify_library_claims'),
   from_dir: z.string().min(1),
+  scan_root: z.string().min(1).optional(),
   checks: z.array(LibraryCheckSchema),
   // The contract's sample sends `null` for "no budget of the request's own".
   budget_ms: z.number().int().nonnegative().nullable().optional(),

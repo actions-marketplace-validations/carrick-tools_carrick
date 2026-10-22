@@ -63,6 +63,15 @@ pub struct TypeEvidence {
     pub span_start: Option<u32>,
     /// End byte offset in the source file
     pub span_end: Option<u32>,
+    /// The call's text as the inference located it, when it was located by
+    /// text rather than by span. With `span_start`/`span_end` this is the
+    /// locator a later run retypes a carried consumer's call by
+    /// (carrick#2567), so it names the node the type came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_text: Option<String>,
+    /// The line `expression_text` starts on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_line: Option<u32>,
     /// Line number in the source file
     pub line_number: u32,
     /// Kind of inference performed for this type
@@ -852,6 +861,19 @@ pub struct CloudRepoData {
     /// How many possible calls were left out past the cap. Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possible_calls_omitted: Option<u32>,
+    /// What the call-through pass reads of this service from another one
+    /// (carrick#2378): its model rows at calls through its own code, its
+    /// definitions that hand back a request's parsed body, and its calls
+    /// whose value is not handed back. Written for an analysed service and
+    /// read back when `--changed-only` carries it, so the rows of the
+    /// services analysed beside it settle as a full scan settles them.
+    ///
+    /// Scanner-only: the cloud stores it and hands it back. Absent on a
+    /// service with none, and on blobs written before the field existed,
+    /// which read as a service with none: what a carried service stated
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_through: Option<crate::call_through::StoredCallThrough>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -1047,6 +1069,7 @@ impl CloudRepoData {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 }
@@ -2167,6 +2190,8 @@ mod tests {
                 file_path: "src/routes.ts".to_string(),
                 span_start: None,
                 span_end: None,
+                expression_text: None,
+                expression_line: None,
                 line_number: 12,
                 infer_kind: InferKind::ResponseBody,
                 is_explicit: false,
@@ -2614,6 +2639,7 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 

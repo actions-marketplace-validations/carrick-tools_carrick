@@ -732,6 +732,17 @@ pub struct SemanticsResult {
     /// Absent exactly when `verified`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A verified op's member as declared on its receiver. Nothing reads it yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<SemanticsDeclaration>,
+}
+
+/// Where a member is declared, spelled as a position row's `decl_file` and
+/// `decl_line`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticsDeclaration {
+    pub decl_file: String,
+    pub decl_line: u32,
 }
 
 /// The reason a semantics or library-claim check comes back `unchecked`
@@ -833,6 +844,22 @@ pub struct Yields {
     pub param: u32,
     pub export: String,
     pub side: String,
+}
+
+/// Where a route handler's request holds its path and method (#2474 R0,
+/// contract amendment of 2026-10-22 on carrick#2434): the handler's parameter
+/// `param` is the request, and each of the others is a member path read off
+/// it, relative to that parameter (`["path"]`, `["raw", "url"]`). The
+/// verifier judges that `path` or `url` is present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestAt {
+    pub param: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<Vec<String>>,
 }
 
 /// What an `op` claim does on the wire.
@@ -943,6 +970,16 @@ pub enum LibraryClaim {
         name_scope: Option<NameScope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         picker: Option<String>,
+        /// Route fields (#2474 R0): the member runs the function here and
+        /// hands it, as `yields` says, an instance bound under `name`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runs: Option<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yields: Option<Box<Yields>>,
+        /// Route fields (#2474 R0): the instance handed here is served under
+        /// `name`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mounts: Option<ClaimSlot>,
     },
     /// A member that acts on the wire; `member: None` is the object `path`
     /// reaches (the receiver itself when `path` is empty).
@@ -997,6 +1034,10 @@ pub enum LibraryClaim {
         /// Label v2, `receive` only: what the handler is handed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         yields: Option<Box<Yields>>,
+        /// Route fields (#2474 R0), `receive` only: where the handler's
+        /// request holds its path and method.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<Box<RequestAt>>,
     },
     /// A name the library emits itself, spelled in one of `member`'s
     /// parameters.
@@ -1181,6 +1222,10 @@ enum SidecarRequest {
         checks: Vec<LibraryCheck>,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
+        /// The scanned repo's root: a verdict's `declarations` are named
+        /// from it, as position rows are.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_root: Option<String>,
     },
     #[serde(rename = "list_program_files")]
     ListProgramFiles { request_id: String },
@@ -3148,6 +3193,7 @@ impl TypeSidecar {
             from_dir: from_dir.to_string_lossy().into_owned(),
             checks: checks.to_vec(),
             budget_ms: None,
+            scan_root: self.scan_root_arg(),
         };
         self.send_request(&request)?;
         let response = self.operation_response()?;
@@ -5000,6 +5046,13 @@ mod tests {
                         key_labels: key_labels(),
                         name_scope: Some(name_scope()),
                         picker: Some("model/q1".into()),
+                        runs: Some(slot()),
+                        yields: Some(Box::new(Yields {
+                            param: 0,
+                            export: "App".into(),
+                            side: "server".into(),
+                        })),
+                        mounts: Some(slot()),
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Send,
@@ -5029,6 +5082,12 @@ mod tests {
                             export: "Socket".into(),
                             side: "server".into(),
                         })),
+                        request: Some(Box::new(RequestAt {
+                            param: 0,
+                            path: Some(vec!["path".into()]),
+                            url: Some(vec!["raw".into(), "url".into()]),
+                            method: Some(vec!["method".into()]),
+                        })),
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Receive,
@@ -5052,6 +5111,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     }),
                     library(LibraryClaim::Reserved {
                         member: "on".into(),
@@ -5063,6 +5123,7 @@ mod tests {
                     }),
                 ],
                 budget_ms: Some(500),
+                scan_root: Some("/repo".into()),
             },
             SidecarRequest::ListProgramFiles { request_id: id() },
             SidecarRequest::AddProgramFiles {
@@ -5351,6 +5412,30 @@ mod tests {
         assert_eq!(value["budget_ms"], 250);
     }
 
+    /// carrick#2474: a verified op verdict names where its member is declared.
+    #[test]
+    fn a_verified_op_verdict_parses_its_declarations() {
+        let json = r#"{"claim_id":"o","receiver":"instance:()","verdict":"verified",
+            "declarations":[{"decl_file":"pkg:x/index.d.ts","decl_line":7}]}"#;
+        let result: SemanticsResult = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.declarations,
+            vec![SemanticsDeclaration {
+                decl_file: "pkg:x/index.d.ts".into(),
+                decl_line: 7
+            }]
+        );
+        let bare: SemanticsResult =
+            serde_json::from_str(r#"{"claim_id":"o","receiver":"export","verdict":"verified"}"#)
+                .unwrap();
+        assert!(bare.declarations.is_empty());
+        assert!(
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("declarations")
+        );
+    }
+
     /// A response carries one verdict per check; `reason` is absent exactly
     /// when verified, and a response with no `semantics` key reads as empty.
     #[test]
@@ -5380,6 +5465,7 @@ mod tests {
                 receiver: "export".into(),
                 verdict: SemanticsVerdict::Verified,
                 reason: None,
+                declarations: Vec::new(),
             }
         );
         assert_eq!(semantics[1].verdict, SemanticsVerdict::Failed);
@@ -5484,6 +5570,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     },
                 ),
                 check(
@@ -5513,6 +5600,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     },
                 ),
                 check(
@@ -5528,6 +5616,9 @@ mod tests {
                         key_labels: BTreeMap::new(),
                         name_scope: None,
                         picker: None,
+                        runs: None,
+                        yields: None,
+                        mounts: None,
                     },
                 ),
                 check(
@@ -5584,14 +5675,17 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     },
                 ),
             ],
             budget_ms: Some(500),
+            scan_root: Some("/repo".into()),
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["action"], "verify_library_claims");
         assert_eq!(value["budget_ms"], 500);
+        assert_eq!(value["scan_root"], "/repo");
         let checks = value["checks"].as_array().unwrap();
         assert_eq!(
             checks[0],

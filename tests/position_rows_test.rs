@@ -364,6 +364,17 @@ fn stand_in_recipe(script: &Path, timeout: Duration) -> SidecarRecipe {
         .expect("spawn the stand-in")
         .with_operation_timeout(timeout);
     let recipe = sidecar.recipe();
+    // The count of processes starts at this one. Dropping it before node has
+    // run its first line would kill it unrecorded and the count would be short.
+    let pids = script.with_file_name("pids");
+    let started = std::time::Instant::now();
+    while fs::read_to_string(&pids).unwrap_or_default().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the stand-in never recorded its start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     drop(sidecar);
     recipe
 }
@@ -500,6 +511,9 @@ struct Scan {
     /// `start <pid> <earlier pids alive>` and `action <pid> <action> <out>`
     /// lines, in order.
     events: Vec<String>,
+    /// What each service read its rows as, from the fallbacks lines the scan
+    /// states for a parent that reads them.
+    rows: BTreeSet<(Option<String>, String)>,
 }
 
 /// One scan of `repo`. With no `store` the blobs go to the mock store and
@@ -529,6 +543,7 @@ fn scan(
         .env("CARRICK_NO_MODEL", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
         .env("CARRICK_FAIL_ON_TYPE_MEMORY", "1")
+        .env("CARRICK_PROGRESS", "1")
         .env("CARRICK_SIDECAR_DIR", &shim);
     if rows_on {
         cmd.env("CARRICK_POSITION_ROWS", "1");
@@ -584,6 +599,14 @@ fn scan(
         starts: read("starts").lines().count(),
         actions: read("actions").lines().map(str::to_string).collect(),
         events: read("events").lines().map(str::to_string).collect(),
+        rows: String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(carrick::fallback_tally::parse)
+            .map(|fallbacks| {
+                let rows = serde_json::to_value(fallbacks.rows).unwrap();
+                (fallbacks.service, rows.as_str().unwrap().to_string())
+            })
+            .collect(),
     }
 }
 
@@ -766,7 +789,8 @@ fn without_a_store_the_walk_writes_to_the_temp_dir_and_cleans_up() {
 
 /// Off means off; on writes the rows and the same blob; a walk that dies of
 /// memory under `CARRICK_FAIL_ON_TYPE_MEMORY=1` leaves the scan to finish,
-/// with the same blob and no rows.
+/// with the same blob and no rows. Each scan states, for a parent reading
+/// its stderr, what its service read the rows as (`off`, `read`, `missing`).
 #[test]
 fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     if !sidecar_available() {
@@ -786,6 +810,10 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
         "a scan without the flag asked for a walk"
     );
     assert!(!off.blobs.is_empty(), "the scan stored no blob");
+    let read_as = |scan: &Scan| -> BTreeSet<String> {
+        scan.rows.iter().map(|(_, rows)| rows.clone()).collect()
+    };
+    assert_eq!(read_as(&off), BTreeSet::from(["off".to_string()]));
 
     let on_store = tempfile::tempdir().unwrap();
     let on = scan(&repo, true, false, Some(on_store.path()), None);
@@ -806,6 +834,18 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     );
     assert_walk_first(&on.events);
     assert_eq!(on.blobs, off.blobs, "writing rows moved the blob");
+    assert_eq!(read_as(&on), BTreeSet::from(["read".to_string()]));
+    assert_eq!(
+        on.rows
+            .iter()
+            .map(|(service, _)| service)
+            .collect::<Vec<_>>(),
+        off.rows
+            .iter()
+            .map(|(service, _)| service)
+            .collect::<Vec<_>>(),
+        "one line a service"
+    );
 
     let died_store = tempfile::tempdir().unwrap();
     let died = scan(&repo, true, true, Some(died_store.path()), None);
@@ -820,6 +860,94 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
         .collect();
     assert!(left.is_empty(), "a walk that died left files: {left:?}");
     assert_eq!(died.blobs, off.blobs, "a walk that died moved the blob");
+    assert_eq!(read_as(&died), BTreeSet::from(["missing".to_string()]));
+}
+
+/// carrick#1604: a service with no config at its root, scanned with rows on,
+/// types each file under the nearest `tsconfig.json` or `jsconfig.json` on its
+/// way up. Every use of an imported name then has a row whose declaration is
+/// the repo file that exports it, and no row is the error type.
+#[test]
+fn imports_resolve_through_the_nearest_config_of_a_service_with_none_at_its_root() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    // (fixture, caller, declared name, declaring file, calls the caller makes)
+    let uses: [(&str, &str, &str, &str, usize); 3] = [
+        (
+            "configs-below-root",
+            "web/src/api/accounts.ts",
+            "getJson",
+            "web/src/lib/http.ts",
+            3,
+        ),
+        (
+            "configs-below-root",
+            "cli/src/main.ts",
+            "fetchStatus",
+            "cli/src/util.ts",
+            1,
+        ),
+        (
+            "jsconfig-root",
+            "src/page.js",
+            "request",
+            "src/utils/http.js",
+            2,
+        ),
+    ];
+    for fixture_name in ["configs-below-root", "jsconfig-root"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture_name)
+                .join("repo"),
+            &repo,
+        );
+        let store = tempfile::tempdir().unwrap();
+        let on = scan(&repo, true, false, Some(store.path()), None);
+        let rows_file = on
+            .positions
+            .as_ref()
+            .expect("a scan with the flag wrote rows")
+            .join(format!(
+                "{}.jsonl.gz",
+                on.blobs.keys().next().unwrap().trim_end_matches(".json")
+            ));
+        let rows = read_rows_file(&rows_file).expect("the scan's rows file reads");
+        for file in &rows.files {
+            assert!(file.skip.is_none(), "{} is not in a program", file.f);
+            for row in &file.r {
+                assert_eq!(
+                    row.flags() & FLAG_ERROR_TYPE,
+                    0,
+                    "{}: a row is the error type: {row:?}",
+                    file.f
+                );
+            }
+        }
+        for (_, file, name, declared_in, calls) in
+            uses.iter().filter(|u| u.0 == fixture_name && u.4 > 0)
+        {
+            let rows_of = rows.files.iter().find(|f| f.f == *file).unwrap();
+            let found = rows_of
+                .r
+                .iter()
+                .filter(|row| {
+                    row.kind() == Kind::Call
+                        && row.symbol() == Some(*name)
+                        && row.decl_file() == Some(*declared_in)
+                })
+                .count();
+            assert_eq!(
+                found, *calls,
+                "{file}: calls of {name} declared in {declared_in}"
+            );
+        }
+    }
 }
 
 /// The census (`#[ignore]`): for each `<repo>:<rows file>` in

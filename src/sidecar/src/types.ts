@@ -456,6 +456,19 @@ export interface Yields {
   side: string;
 }
 
+/**
+ * Where a route handler's request holds its path and method (#2474 R0): the
+ * handler's parameter `param` is the request, and each of the others is a
+ * member path read off it, relative to that parameter (`['path']`,
+ * `['raw', 'url']`). At least one of `path` or `url`.
+ */
+export interface RequestAt {
+  param: number;
+  path?: string[];
+  url?: string[];
+  method?: string[];
+}
+
 /** The closed role list; the role alone picks the checks a claim needs. */
 export type LibraryRole =
   | 'http_client'
@@ -526,6 +539,15 @@ export type LibraryClaim =
       key_labels?: Record<string, KeyLabel>;
       name_scope?: NameScope;
       picker?: string;
+      /**
+       * Route fields (#2474 R0): the member runs the function here and hands
+       * it, as `yields` says, an instance bound under `name`. Comes with
+       * `yields`.
+       */
+      runs?: ClaimSlot;
+      yields?: Yields;
+      /** Route fields (#2474 R0): the instance handed here is served under `name`. */
+      mounts?: ClaimSlot;
     }
   | {
       kind: 'op';
@@ -562,6 +584,8 @@ export type LibraryClaim =
       runs?: RunsSlot;
       /** Label v2, `receive` only: what the handler is handed. */
       yields?: Yields;
+      /** Route fields (#2474 R0), `receive` only: where the handler's request holds its path and method. */
+      request?: RequestAt;
     }
   | {
       /** A name the library emits itself, spelled in one of `member`'s parameters. */
@@ -601,6 +625,8 @@ export interface LibraryCheck {
 export interface VerifyLibraryClaimsRequest extends BaseRequest {
   action: 'verify_library_claims';
   from_dir: string;
+  /** The scanned repo's root, as on `init`: a verdict's `declarations` are named from it, as position rows are. */
+  scan_root?: string;
   checks: LibraryCheck[];
   /** Checks not reached in time come back `unchecked` with reason `budget`; null or absent is the default. */
   budget_ms?: number | null;
@@ -931,6 +957,12 @@ export interface RetypeCheckResponse extends BaseResponse {
   errors?: string[];
 }
 
+/** Where a verified op's member is declared on its receiver, as a position row's `decl_file` and `decl_line`. */
+export interface SemanticsDeclaration {
+  decl_file: string;
+  decl_line: number;
+}
+
 /**
  * The verdict on one `(claim_id, receiver)` pair.
  *
@@ -944,6 +976,8 @@ export interface SemanticsResult {
   verdict: 'verified' | 'failed' | 'unchecked';
   /** Absent exactly when verified. */
   reason?: string;
+  /** Verified op verdicts only: the declarations its member resolves to on the receiver. */
+  declarations?: SemanticsDeclaration[];
 }
 
 /** How one package of the request resolved, for logs. */

@@ -63,9 +63,17 @@ pub(crate) fn contains_disqualifying_top_type(text: &str) -> bool {
 /// [`contains_disqualifying_top_type`] for one of the two keywords, over text
 /// whose string literals are already emptied.
 fn scrubbed_text_uses_keyword_as_type(scrubbed: &str, keyword: &str) -> bool {
+    count_keyword_as_type(scrubbed, keyword) > 0
+}
+
+/// How many times `keyword` is written as a TYPE token in text whose string
+/// literals are already emptied (see [`contains_disqualifying_top_type`] for
+/// what counts).
+fn count_keyword_as_type(scrubbed: &str, keyword: &str) -> usize {
     let bytes = scrubbed.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     let mut search_from = 0;
+    let mut count = 0;
     while let Some(pos) = scrubbed[search_from..].find(keyword) {
         let begin = search_from + pos;
         let end = begin + keyword.len();
@@ -88,9 +96,9 @@ fn scrubbed_text_uses_keyword_as_type(scrubbed: &str, keyword: &str) -> bool {
         if rest.first() == Some(&b':') {
             continue;
         }
-        return true;
+        count += 1;
     }
-    false
+    count
 }
 
 // ===========================================================================
@@ -115,6 +123,12 @@ pub(crate) enum ReceiverRole {
     Client,
 }
 
+// FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+// fixes only. Fixes for wrong or missing rows go in library claims (the
+// store's role) and compiler rows (`decl_package`). Delete when the
+// server-framework pick (carrick-cloud#2378) and the store rebuild
+// (carrick-cloud#2379) are in, with discovery on by default and a clean
+// four-repo replay (carrick#2474, R7).
 /// Map a receiver type, as the sidecar resolved it, onto a role.
 ///
 /// Three facts, in order, and no shape rule anywhere:
@@ -381,7 +395,7 @@ pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
 pub(crate) const CAPTURE_FINDINGS_CAP: usize = 32;
 
 /// True when every top type in a capture answer is a member the SOURCE
-/// declares `unknown` (carrick#1752): the answer is a typed contract with open
+/// declares `unknown` or `any` (carrick#1752, carrick#2591): the answer is a typed contract with open
 /// fields, not a type no layer could see.
 ///
 /// [`contains_disqualifying_top_type`] cannot ask this. It reads text, and in
@@ -391,39 +405,49 @@ pub(crate) const CAPTURE_FINDINGS_CAP: usize = 32;
 /// names every position a top type sits at, with a cause. So the answer
 /// qualifies only when all of these hold:
 ///
-///  - the text carries no `any`. `any` is bidirectionally assignable, and the
-///    walk does not read parameter positions, so the text is the one place a
-///    parameter `any` shows;
+///  - the text writes exactly as many `any` tokens as the findings name as
+///    `any` (carrick#2591). `any` is bidirectionally assignable and the walk
+///    does not read parameter positions, so the text is the one place a
+///    parameter `any` shows: it adds a token no finding accounts for. A
+///    finding that names an `any` the text does not print disagrees with the
+///    answer it describes, so it vouches for nothing;
 ///  - the record names at least one finding and fewer than the walk lists
 ///    before it stops ([`CAPTURE_FINDINGS_CAP`]), so every position the text
 ///    holds is accounted for. A root that is itself a top type has no members
 ///    to walk, so it names none;
 ///  - every finding, the record's and any other layer's on the entry, is an
-///    `unknown` the capture attributes to the declaration (`declared`), at a
+///    `unknown` or `any` the capture attributes to the declaration
+///    (`declared`), at a
 ///    position under a named member. `unknown[]` or `Record<string, unknown>`
 ///    at the root has no named member, and says nothing about the payload.
 ///
-/// This decides the entry's state only. What the compatibility check makes of
-/// an open member is the check phase's own walk, which reads the same record
-/// and is unchanged.
+/// This decides the entry's state only. The compatibility check reads the same
+/// record and judges an open `any` member as the sidecar's `onlyDeclaredOpenAny`
+/// states: never a mismatch, the closed members judged as for a typed pair.
 pub(crate) fn top_types_are_declared_open_members(
     expanded: &str,
     record: &CaptureAliasRecord,
     published: &[crate::services::type_sidecar::TypeProvenance],
 ) -> bool {
-    !scrubbed_text_uses_keyword_as_type(&strip_string_literal_contents(expanded), "any")
+    let findings = || record.any_provenance.iter().chain(published);
+    let named_any = record
+        .any_provenance
+        .iter()
+        .filter(|finding| finding.kind == "any")
+        .count();
+    count_keyword_as_type(&strip_string_literal_contents(expanded), "any") == named_any
         && !record.any_provenance.is_empty()
         && record.any_provenance.len() < CAPTURE_FINDINGS_CAP
-        && record
-            .any_provenance
-            .iter()
-            .chain(published)
-            .all(is_declared_open_member)
+        && findings().all(is_declared_open_member)
 }
 
-/// An `unknown` the declaration states, under a named member.
+/// An `unknown` or `any` the declaration states, under a named member.
 fn is_declared_open_member(finding: &crate::services::type_sidecar::TypeProvenance) -> bool {
-    finding.kind == "unknown" && finding.reason == "declared" && path_names_a_member(&finding.path)
+    // A callable's return is no data member: an `any` there stays refused
+    // (carrick#2591), as the sidecar's `onlyDeclaredOpenAny` has it.
+    let kind_is_open =
+        finding.kind == "unknown" || (finding.kind == "any" && !finding.path.contains("()"));
+    kind_is_open && finding.reason == "declared" && path_names_a_member(&finding.path)
 }
 
 /// True when a deep-walk path passes through a named member. The walk writes
@@ -2414,6 +2438,67 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
     calls
 }
 
+/// The manifest entries a consumer call locator belongs to: consumer
+/// response types inferred from a call's result.
+fn is_consumer_call_result(entry: &TypeManifestEntry) -> bool {
+    entry.role == ManifestRole::Consumer
+        && entry.type_kind == ManifestTypeKind::Response
+        && entry.evidence.infer_kind == InferKind::CallResult
+}
+
+/// Write each consumer response locator into its manifest entry's evidence,
+/// so a later `--changed-only` run that carries this service can retype the
+/// same call from the stored blob (carrick#2567). The locator is stored as
+/// the inference had it: a span, or the call's text and line.
+pub(crate) fn store_call_locators(
+    manifest: &mut [TypeManifestEntry],
+    calls: &HashMap<String, CallLocator>,
+) {
+    for entry in manifest.iter_mut().filter(|e| is_consumer_call_result(e)) {
+        let Some(call) = calls.get(&entry.type_alias) else {
+            continue;
+        };
+        entry.evidence.span_start = call.span_start;
+        entry.evidence.span_end = call.span_end;
+        entry.evidence.expression_text = call.expression_text.clone();
+        entry.evidence.expression_line = call.expression_line;
+    }
+}
+
+/// A carried service's consumer calls, read back from its stored manifest
+/// (carrick#2567). A carried service's files are byte-identical to its
+/// stored commit, so a stored locator names the call the run that stored it
+/// located. `repo_root` is the clone's root, which the stored paths are
+/// relative to. An entry stored without a span or a call text cannot be
+/// located, and is left out.
+pub(crate) fn stored_call_locators(
+    manifest: &[TypeManifestEntry],
+    repo_root: &Path,
+) -> HashMap<String, CallLocator> {
+    let mut calls = HashMap::new();
+    for entry in manifest.iter().filter(|e| is_consumer_call_result(e)) {
+        let evidence = &entry.evidence;
+        let has_span = evidence.span_start.is_some() && evidence.span_end.is_some();
+        if !has_span && evidence.expression_text.is_none() {
+            continue;
+        }
+        calls
+            .entry(entry.type_alias.clone())
+            .or_insert_with(|| CallLocator {
+                file_path: repo_root
+                    .join(&evidence.file_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                line_number: evidence.line_number,
+                span_start: evidence.span_start,
+                span_end: evidence.span_end,
+                expression_text: evidence.expression_text.clone(),
+                expression_line: evidence.expression_line,
+            });
+    }
+    calls
+}
+
 /// Whether the CONSUMER's type is what left this verdict unresolved, in a way
 /// a retype of its call could settle. A consumer that states no contract at
 /// all (it reads no body, sends a form body, reads or sends bytes,
@@ -3128,6 +3213,8 @@ mod tests {
                 file_path: file_path.to_string(),
                 span_start: None,
                 span_end: None,
+                expression_text: None,
+                expression_line: None,
                 line_number,
                 infer_kind: InferKind::ResponseBody,
                 is_explicit: false,
@@ -3193,6 +3280,7 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 
@@ -4265,6 +4353,93 @@ mod tests {
         assert_eq!(calls.len(), 1, "only call results are retyped: {calls:?}");
         assert_eq!(calls["C"].line_number, 8);
         assert_eq!(calls["C"].span_start, Some(80));
+    }
+
+    /// carrick#2567: a consumer's call locators survive the stored blob, as
+    /// the inference had them (by text or by span), at the clone's root.
+    #[test]
+    fn stored_call_locators_read_back_what_the_capture_stored() {
+        let consumer = |alias: &str, line: u32| {
+            let mut e = entry(
+                OperationKey::http("GET", "/orders"),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                alias,
+                "web/src/client.ts",
+                line,
+                ManifestTypeState::Unknown,
+            );
+            e.evidence.infer_kind = InferKind::CallResult;
+            e
+        };
+        let mut producer = consumer("P", 3);
+        producer.role = ManifestRole::Producer;
+        let mut manifest = vec![
+            consumer("ByText", 8),
+            consumer("BySpan", 12),
+            consumer("Unlocated", 16),
+            producer,
+        ];
+        let at = |line: u32| CallLocator {
+            file_path: "/scan/web/src/client.ts".to_string(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+        };
+        let calls = HashMap::from([
+            (
+                "ByText".to_string(),
+                CallLocator {
+                    expression_text: Some("api.get(\"/orders\")".to_string()),
+                    expression_line: Some(8),
+                    ..at(8)
+                },
+            ),
+            (
+                "BySpan".to_string(),
+                CallLocator {
+                    span_start: Some(120),
+                    span_end: Some(140),
+                    ..at(12)
+                },
+            ),
+            (
+                "P".to_string(),
+                CallLocator {
+                    span_start: Some(1),
+                    span_end: Some(2),
+                    ..at(3)
+                },
+            ),
+        ]);
+        store_call_locators(&mut manifest, &calls);
+        assert_eq!(
+            manifest[3].evidence.span_start, None,
+            "a producer entry carries no consumer locator"
+        );
+
+        let read = stored_call_locators(&manifest, Path::new("/clone"));
+        assert_eq!(read.len(), 2, "an unlocated call is left out: {read:?}");
+        assert_eq!(
+            read["ByText"],
+            CallLocator {
+                file_path: "/clone/web/src/client.ts".to_string(),
+                expression_text: Some("api.get(\"/orders\")".to_string()),
+                expression_line: Some(8),
+                ..at(8)
+            }
+        );
+        assert_eq!(
+            read["BySpan"],
+            CallLocator {
+                file_path: "/clone/web/src/client.ts".to_string(),
+                span_start: Some(120),
+                span_end: Some(140),
+                ..at(12)
+            }
+        );
     }
 
     // ---- derive_capture_anchors -------------------------------------------
@@ -7578,15 +7753,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     /// carrick#1833: a failed install leaves standing every verdict the
     /// capture had already decided. The sidecar still answers one verdict per
     /// pair when its install fails; a pair whose consumer type carries a deep
-    /// `any` keeps `gate_caught_baked_any`, while the pair the check would
-    /// have probed says the install stopped it.
+    /// `any` the pre-gate still refuses (a callable's return, not a declared
+    /// open member: carrick#2591) keeps `gate_caught_baked_any`, while the
+    /// pair the check would have probed says the install stopped it.
     #[test]
     #[serial(v2_capture_sidecar)]
     fn a_failed_install_keeps_the_verdicts_the_capture_decided() {
         let Some((sidecar, _key, mut all_repo_data)) = corpus_pair_with(&[LiteralPair {
             key: OperationKey::http("GET", "/orders/summary"),
             producer_type: "{ id: string; total: number }",
-            consumer_type: "{ id: string; total: any }",
+            consumer_type: "{ id: string; total: () => any }",
         }]) else {
             return;
         };

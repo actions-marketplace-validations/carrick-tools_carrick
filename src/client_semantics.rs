@@ -1,3 +1,9 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in the library store's `http_client` claims
+// (carrick-cloud#2363 S4). Delete the path that reads client verbs from the
+// detection answer when the store answers `http_client` with zero HTTP row
+// changes on the golden repos and S3 to S5 have shipped (carrick-cloud#2363 S8).
+
 //! Client-library semantics: how a data-fetching package builds its requests,
 //! as framework detection states it and as the package's own type
 //! declarations confirm it (carrick#1564).
@@ -1352,6 +1358,7 @@ mod tests {
             receiver: receiver.to_string(),
             verdict,
             reason: None,
+            declarations: Vec::new(),
         };
         let results = vec![
             verdict(
@@ -1429,6 +1436,7 @@ mod tests {
             receiver: check.receiver.clone(),
             verdict: SemanticsVerdict::Verified,
             reason: None,
+            declarations: Vec::new(),
         };
         let exact: Vec<SemanticsResult> = checks.iter().map(verified).collect();
         assert!(!surface_from(&derived, &checks, &exact).is_empty());

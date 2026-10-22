@@ -1031,6 +1031,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         crate::change_scope::plan(
             repo_path,
             &services,
+            &previous_generations
+                .iter()
+                .filter(|generation| generation.repo_name == repo_name)
+                .map(|generation| generation.service_name.clone())
+                .collect::<Vec<_>>(),
             |service| previous_generation(previous_generations, &repo_name, service),
             crate::change_scope::ThisRun {
                 scanner_version: env!("CARGO_PKG_VERSION"),
@@ -1147,6 +1152,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             let stored = previous_generation(previous_generations, &repo_name, service)
                 .cloned()
                 .expect("a carried service has a stored generation");
+            record_carried_consumer(repo_path, service, &stored);
             runs.push(ServiceRun::carried(service, stored));
             continue;
         };
@@ -2267,8 +2273,14 @@ struct ServiceRun {
 
 impl ServiceRun {
     /// A service `--changed-only` carries: its stored generation stands in
-    /// for it, and it owes nothing.
+    /// for it, with the call-through facts it stored (carrick#2378), and it
+    /// owes nothing.
     fn carried(service: &Config, stored: CloudRepoData) -> Self {
+        let call_through = stored
+            .call_through
+            .as_ref()
+            .map(crate::call_through::StoredCallThrough::sites)
+            .unwrap_or_default();
         Self {
             label: service
                 .service_name
@@ -2279,7 +2291,7 @@ impl ServiceRun {
             owed: durability::OwedWork::default(),
             held_back: false,
             carried: true,
-            call_through: Default::default(),
+            call_through,
         }
     }
 }
@@ -2292,6 +2304,39 @@ const _: fn() = || {
     sendable::<ServiceRun>();
     shared::<ServiceScan>();
 };
+
+/// Register a carried service as a local consumer, as its capture would
+/// have, so the check retypes its calls as a full scan does (carrick#2567).
+/// Its files are the ones its stored generation was scanned from, at the
+/// same root, so the locators its stored manifest carries name the same
+/// calls.
+fn record_carried_consumer(repo_path: &str, service: &Config, stored: &CloudRepoData) {
+    let Some(manifest) = stored.type_manifest.as_deref() else {
+        return;
+    };
+    let absolute_repo = Path::new(repo_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(repo_path));
+    let calls = type_compat_v2::stored_call_locators(manifest, &absolute_repo);
+    if calls.is_empty() {
+        return;
+    }
+    let service_id = stored
+        .service_name
+        .clone()
+        .unwrap_or_else(|| stored.repo_name.clone());
+    type_compat_v2::record_local_consumer(
+        &service_id,
+        type_compat_v2::LocalConsumer {
+            root: match &service.directory {
+                Some(dir) => absolute_repo.join(dir),
+                None => absolute_repo.clone(),
+            },
+            tsconfig: service.tsconfig.clone(),
+            calls,
+        },
+    );
+}
 
 /// One service's analysis to run: which, over what, and with what before it.
 struct ServiceJob {
@@ -2500,7 +2545,7 @@ impl ServiceScan {
         );
         drop(sidecar);
 
-        let data = analysis.data;
+        let mut data = analysis.data;
         if data.bundled_types.is_some() {
             debug!(
                 "Type resolution ({}): {} bundled types, {} manifest entries",
@@ -2518,6 +2563,9 @@ impl ServiceScan {
             losses: crate::scan_health::service_losses(service.service_name.as_deref()),
             retry_error: None,
         };
+        // Stored with the blob, for a later run that carries this service
+        // (carrick#2378).
+        data.call_through = crate::call_through::StoredCallThrough::of(&analysis.call_through);
         Ok(ServiceRun {
             label: label.to_string(),
             data,
@@ -3958,6 +4006,16 @@ async fn analyze_current_repo_incremental(
                 },
             )
             .await;
+            let site_payloads = site_payloads_of(
+                crate::site_payloads::enabled(),
+                &request_inputs,
+                repo_path,
+                &claims,
+                SiteContext {
+                    placements: Some(&placements),
+                    library: library_ask.as_ref().map(|ask| &ask.sites),
+                },
+            );
             let withdrawn = withdraw_model_routes_at_definitions(
                 &mut mount_graph,
                 &merged_results,
@@ -4138,6 +4196,10 @@ async fn analyze_current_repo_incremental(
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
             protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
+            let payload_infer = site_payloads.requests(
+                cloud_data.type_manifest.as_deref().unwrap_or_default(),
+                repo_path,
+            );
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -4153,6 +4215,7 @@ async fn analyze_current_repo_incremental(
                 &service_modules,
                 &protocol_requests,
                 &protocol_infer,
+                &payload_infer,
                 &mut cloud_data,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Types);
@@ -4886,6 +4949,30 @@ async fn site_rows_of(
         "site questions: rows"
     );
     rows
+}
+
+/// Where the service's decided sites place their payloads (phase 3 step 1,
+/// [`crate::site_payloads`]). Built only when `enabled`
+/// (`CARRICK_SITE_PAYLOADS=1`), from the same records the site questions
+/// read; with no compiler rows (`CARRICK_POSITION_ROWS=1`) discovery finds
+/// no site and nothing moves.
+fn site_payloads_of(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    repo_path: &str,
+    claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'_>,
+) -> crate::site_payloads::SitePayloads {
+    if !enabled {
+        return crate::site_payloads::SitePayloads::default();
+    }
+    let records = site_records_of(inputs, Path::new(repo_path), claims, context).records;
+    let payloads = crate::site_payloads::SitePayloads::of(&records);
+    debug!(
+        records = records.len(),
+        "site payloads: records whose slots the type capture may read"
+    );
+    payloads
 }
 
 /// What the site pass reads from the rest of the scan (carrick#2524): where
@@ -6524,6 +6611,8 @@ fn add_graphql_request_entry(
             file_path,
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number: op.line,
             infer_kind: infer_kind_for_manifest(role, type_kind),
             is_explicit: true,
@@ -6634,19 +6723,42 @@ fn site_infer_requests(
     use crate::services::type_sidecar::InferRequestItem;
     use crate::site_rows::RowSide;
     let root = Path::new(repo_path);
+    // The anchors' spans are SWC's (bytes from `SWC_SPAN_BASE`); the sidecar
+    // locates in TypeScript positions (UTF-16 units from 0), as
+    // `collect_type_requests` converts them (carrick#806, carrick#2604). One
+    // offset table per file; an unreadable file is read as ASCII, as the
+    // base subtraction alone.
+    let tables: std::cell::RefCell<HashMap<String, Option<crate::utils::Utf16Offsets>>> =
+        std::cell::RefCell::new(HashMap::new());
     let at = |anchor: &crate::request_summary::site_record::AnchorAt,
               infer_kind: InferKind,
               alias: String,
-              param_name: Option<String>| InferRequestItem {
-        file_path: root.join(&anchor.file).to_string_lossy().into_owned(),
-        line_number: anchor.line,
-        span_start: Some(anchor.span_start),
-        span_end: Some(anchor.span_end),
-        expression_text: None,
-        expression_line: None,
-        infer_kind,
-        alias: Some(alias),
-        param_name,
+              param_name: Option<String>| {
+        let path = root.join(&anchor.file);
+        let mut tables = tables.borrow_mut();
+        let table = tables
+            .entry(anchor.file.clone())
+            .or_insert_with(|| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| crate::utils::Utf16Offsets::new(&text))
+            })
+            .as_ref();
+        let position = |span: u32| match table {
+            Some(table) => table.position(span),
+            None => span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE),
+        };
+        InferRequestItem {
+            file_path: path.to_string_lossy().into_owned(),
+            line_number: anchor.line,
+            span_start: Some(position(anchor.span_start)),
+            span_end: Some(position(anchor.span_end)),
+            expression_text: None,
+            expression_line: None,
+            infer_kind,
+            alias: Some(alias),
+            param_name,
+        }
     };
     let mut requests = Vec::new();
     for row in &fold.stated {
@@ -6736,6 +6848,8 @@ fn add_protocol_manifest_entry(
         file_path: file_path.to_string(),
         span_start: None,
         span_end: None,
+        expression_text: None,
+        expression_line: None,
         line_number,
         infer_kind,
         is_explicit: false,
@@ -7203,6 +7317,7 @@ fn build_cloud_data_from_mount_graph(
         dispatch_tables: None,
         possible_calls: None,
         possible_calls_omitted: None,
+        call_through: None,
     }
 }
 
@@ -7323,6 +7438,7 @@ fn resolve_types_if_available(
     modules: &crate::workspace_resolver::WorkspaceIndex,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
@@ -7357,6 +7473,7 @@ fn resolve_types_if_available(
                 modules,
                 extra_explicit,
                 extra_infer,
+                payload_infer,
             ) {
                 Ok(type_resolution) => {
                     debug!(
@@ -7430,6 +7547,7 @@ fn resolve_types_if_available(
                         modules,
                         extra_explicit,
                         extra_infer,
+                        payload_infer,
                         &type_resolution,
                         cloud_data,
                     );
@@ -7488,6 +7606,7 @@ fn run_capture_for_service(
     modules: &crate::workspace_resolver::WorkspaceIndex,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     type_resolution: &TypeResolutionResult,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
@@ -7501,6 +7620,7 @@ fn run_capture_for_service(
     );
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
+    crate::site_payloads::take_over(&mut infer, payload_infer);
     // Mirror resolve_all_types' post-processing exactly: the #413 two-anchor
     // arbitration re-aims witnessed-borrowed pub/sub anchors at the
     // tsc-witnessed payload root BEFORE depths apply, so v2 capture anchors
@@ -7548,6 +7668,12 @@ fn run_capture_for_service(
         .service_name
         .clone()
         .unwrap_or_else(|| cloud_data.repo_name.clone());
+    let calls = type_compat_v2::consumer_call_locators(&infer);
+    // Stored with the blob, so a run that carries this service retypes the
+    // same calls (carrick#2567).
+    if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+        type_compat_v2::store_call_locators(manifest, &calls);
+    }
     type_compat_v2::record_local_consumer(
         &service_id,
         type_compat_v2::LocalConsumer {
@@ -7556,7 +7682,7 @@ fn run_capture_for_service(
                 None => absolute_repo.clone(),
             },
             tsconfig: config.tsconfig.clone(),
-            calls: type_compat_v2::consumer_call_locators(&infer),
+            calls,
         },
     );
     // Every alias the check phase will import from this service's surface. The
@@ -8213,6 +8339,7 @@ fn discover_with_positions(
         positions,
         links: None,
         row_calls: None,
+        rows_ran_out: false,
     }
     .linked(
         service.service_name.as_deref().unwrap_or("(root)"),
@@ -8329,6 +8456,11 @@ fn summarize_requests(
         summaries.unfollowed_count(),
         serde_json::to_string(summaries.unfollowed()).unwrap_or_default()
     );
+    crate::fallback_tally::report(&crate::fallback_tally::ServiceFallbacks::of(
+        crate::current_service::name(),
+        inputs,
+        &summaries,
+    ));
     summaries
 }
 
@@ -9640,6 +9772,8 @@ fn add_manifest_pair(
             file_path: file_path.to_string(),
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number,
             infer_kind,
             is_explicit: false,
@@ -10064,6 +10198,16 @@ async fn analyze_current_repo(
         },
     )
     .await;
+    let site_payloads = site_payloads_of(
+        crate::site_payloads::enabled(),
+        &request_inputs,
+        repo_path,
+        &claims,
+        SiteContext {
+            placements: Some(&placements),
+            library: library_ask.as_ref().map(|ask| &ask.sites),
+        },
+    );
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -10205,6 +10349,10 @@ async fn analyze_current_repo(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
     protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
+    let payload_infer = site_payloads.requests(
+        cloud_data.type_manifest.as_deref().unwrap_or_default(),
+        repo_path,
+    );
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -10219,6 +10367,7 @@ async fn analyze_current_repo(
         &service_modules,
         &protocol_requests,
         &protocol_infer,
+        &payload_infer,
         &mut cloud_data,
     );
 
@@ -11292,6 +11441,7 @@ mod tests {
             &service_module_index(root.to_str().unwrap(), &member),
             &explicit,
             &[],
+            &[],
             &resolution,
             &mut data,
         );
@@ -11305,6 +11455,7 @@ mod tests {
             &Config::default(),
             &service_module_index(root.to_str().unwrap(), &Config::default()),
             &explicit,
+            &[],
             &[],
             &resolution,
             &mut data,
@@ -11482,6 +11633,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     payload_borrow_witness: false,
                     consumer_response: false,
                 }],
+                &[],
                 &[],
                 &TypeResolutionResult {
                     dts_content: None,
@@ -12260,6 +12412,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 
@@ -13122,6 +13275,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     file_path: abs("src/routes/orders.ts"),
                     span_start: None,
                     span_end: None,
+                    expression_text: None,
+                    expression_line: None,
                     line_number: 18,
                     infer_kind: InferKind::Expression,
                     is_explicit: true,
@@ -13228,6 +13383,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         relativize_cloud_paths(
@@ -13446,6 +13602,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -13500,6 +13657,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }];
 
         // Test Config merging
@@ -13599,6 +13757,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -14339,6 +14498,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -14398,6 +14558,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -14470,6 +14631,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 dispatch_tables: None,
                 possible_calls: None,
                 possible_calls_omitted: None,
+                call_through: None,
             }
         }
 
@@ -14551,6 +14713,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -14774,6 +14937,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -14924,6 +15088,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         attach_external_call_candidates(
@@ -15051,6 +15216,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         attach_external_call_candidates(
@@ -15172,6 +15338,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -18946,6 +19113,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     crate::services::type_sidecar::SemanticsVerdict::Verified
                 },
                 reason: None,
+                declarations: Vec::new(),
                 claim_id: check.claim_id,
                 receiver: check.receiver,
             })
@@ -19008,6 +19176,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             file_path: "lib/api.ts".to_string(),
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number: 5,
             infer_kind: InferKind::CallResult,
             is_explicit: false,
@@ -20725,6 +20895,34 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// carrick#2591: a member the source declares `any` is an open member as
+    /// well. The entry keeps the state the source gave it, and the finding
+    /// still names the open field.
+    #[test]
+    fn an_any_member_the_source_declares_leaves_the_contract_v1_stated() {
+        let shape = "{ id: string; notes: any; }";
+        let mut manifest = enriched_explicit(shape);
+        let records = stamp_findings(
+            &mut manifest,
+            "OrderView",
+            vec![finding("notes", "any", "declared")],
+        );
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", shape)], &records);
+
+        assert_eq!(manifest[0].expanded_definition.as_deref(), Some(shape));
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Explicit);
+        assert!(manifest[0].is_explicit, "the source cast the call to it");
+        assert_eq!(
+            manifest[0]
+                .any_provenance
+                .iter()
+                .map(|p| (p.path.as_str(), p.kind.as_str(), p.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("notes", "any", "declared")],
+            "the open field is still named"
+        );
+    }
+
     /// The same answer for an entry no v1 layer stated settles it as the
     /// capture's own reading, the way a clean answer does.
     #[test]
@@ -20744,9 +20942,11 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     }
 
     /// Everything else that puts a top type in the answer still leaves the
-    /// entry `Unknown`: a pipeline artefact, an `any`, a position that is not
-    /// a member of a typed shape, a list the walk may have cut short, or no
-    /// record to read at all. The answer is still published in every case.
+    /// entry `Unknown`: a pipeline artefact, an `any` no declared member
+    /// accounts for (a parameter, a callable return, one the text does not
+    /// print), a position that is not a member of a typed shape, a list the
+    /// walk may have cut short, or no record to read at all. The answer is
+    /// still published in every case.
     #[test]
     fn a_top_type_the_source_did_not_declare_on_a_member_still_leaves_the_entry_unknown() {
         let open = finding("notes", "unknown", "declared");
@@ -20768,9 +20968,14 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 vec![open.clone(), finding("row", "unknown", "unresolved_import")],
             ),
             (
-                "a member the source declares `any`",
-                "{ id: string; notes: any; }".to_string(),
+                "a declared `any` member beside an `any` in a parameter",
+                "{ notes: any; run: (input: any) => void; }".to_string(),
                 vec![finding("notes", "any", "declared")],
+            ),
+            (
+                "an `any` callable return the source declares",
+                "{ id: string; load: () => any; }".to_string(),
+                vec![finding("load()", "any", "declared")],
             ),
             (
                 "an `any` the walk does not read, in a parameter",
@@ -22420,33 +22625,30 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 )
             })
             .collect();
+        // The files are not on disk, so each span is read as ASCII: the SWC
+        // span less its base (carrick#2604).
         assert_eq!(
             asked,
             vec![
                 (
                     "/repo/src/orders.ts",
                     InferKind::Expression,
-                    Some(112),
+                    Some(111),
                     None
                 ),
                 (
                     "/repo/src/jobs.ts",
                     InferKind::FunctionParam,
-                    Some(120),
+                    Some(119),
                     Some("message")
                 ),
                 (
                     "/repo/src/client.ts",
                     InferKind::Expression,
-                    Some(112),
+                    Some(111),
                     None
                 ),
-                (
-                    "/repo/src/client.ts",
-                    InferKind::CallResult,
-                    Some(100),
-                    None
-                ),
+                ("/repo/src/client.ts", InferKind::CallResult, Some(99), None),
             ]
         );
     }
@@ -25780,6 +25982,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 
