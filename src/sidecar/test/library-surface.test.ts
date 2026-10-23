@@ -281,6 +281,37 @@ export declare function open(): Client;
 export declare function open(raw: true): any;
 `;
 
+// A server package whose default export is a callable that makes the app,
+// with a namespace merged onto it (carrick#2617): as an ES default, and as a
+// whole-module value (\`export =\`).
+const DEFAULT_MAKER = `export interface App {
+  get(path: string, handler: (req: unknown, res: unknown) => void): this;
+  post(path: string, handler: (req: unknown, res: unknown) => void): this;
+}
+export interface SecureApp extends App {
+  secure: true;
+}
+declare function createApp(options?: { name?: string }): App;
+declare function createApp(options: { secure: true }): SecureApp;
+declare namespace createApp {
+  const version: string;
+}
+export default createApp;
+export { createApp as makeApp };
+export declare function named(): App;
+export declare function named(options: { secure: true }): SecureApp;
+`;
+const DEFAULT_MAKER_WHOLE = `interface App {
+  get(path: string, handler: (req: unknown, res: unknown) => void): this;
+  post(path: string, handler: (req: unknown, res: unknown) => void): this;
+}
+declare function createApp(): App;
+declare namespace createApp {
+  const version: string;
+}
+export = createApp;
+`;
+
 function writeTree(root: string, files: Record<string, string>): void {
   for (const [rel, text] of Object.entries(files)) {
     const file = path.join(root, rel);
@@ -331,6 +362,10 @@ function installed(socket = SOCKET): Record<string, string> {
     'node_modules/fixture-keyed-client/index.d.ts': KEYED_CLIENT,
     'node_modules/@fixture/mapped-core/package.json': packageJson('@fixture/mapped-core', '2.0.0'),
     'node_modules/@fixture/mapped-core/index.d.ts': MAPPED_CORE,
+    'node_modules/fixture-default-maker/package.json': packageJson('fixture-default-maker', '1.0.0'),
+    'node_modules/fixture-default-maker/index.d.ts': DEFAULT_MAKER,
+    'node_modules/fixture-default-whole/package.json': packageJson('fixture-default-whole', '1.0.0'),
+    'node_modules/fixture-default-whole/index.d.ts': DEFAULT_MAKER_WHOLE,
     'node_modules/fixture-mapped/package.json': packageJson('fixture-mapped', '2.0.0'),
     'node_modules/fixture-mapped/index.d.ts': "export * from '@fixture/mapped-core';\n",
   };
@@ -454,6 +489,29 @@ describe('list_library_surface (carrick#1660)', () => {
   after(async () => {
     for (const each of clients) await each.stop();
     for (const dir of roots) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('lists the app a default-export maker returns, as a named maker is listed (carrick#2617)', async () => {
+    const [es, whole] = (await surface(['fixture-default-maker', 'fixture-default-whole'])).surfaces;
+    for (const listed of [es, whole]) {
+      const entry = listed.exports.find(e => e.export === 'default')!;
+      assert.ok(entry, `${listed.package} lists default`);
+      const instance = entry.receivers.find(r => r.receiver === 'instance:()')!;
+      assert.ok(instance, `${listed.package} lists instance:()`);
+      assert.deepStrictEqual(instance.members.map(m => m.name), ['get', 'post']);
+      const post = instance.members.find(m => m.name === 'post')!;
+      assert.deepStrictEqual(post.signatures[0].params.map(p => p.name), ['path', 'handler']);
+    }
+    // A different overloaded maker exported by name returns several types: it still lists no instance.
+    assert.deepStrictEqual(es.exports.find(e => e.export === 'named')!.receivers.map(r => r.receiver), ['export']);
+  });
+
+  it('lists the instance of an overloaded maker exported by name as its default export lists it (carrick#2640)', async () => {
+    const [es] = (await surface(['fixture-default-maker'])).surfaces;
+    const members = (name: string) =>
+      es.exports.find(e => e.export === name)!.receivers.find(r => r.receiver === 'instance:()')?.members.map(m => m.name);
+    assert.deepStrictEqual(members('default'), ['get', 'post']);
+    assert.deepStrictEqual(members('makeApp'), ['get', 'post']);
   });
 
   it('lists each export, its receivers and members with the verifier predicates', async () => {

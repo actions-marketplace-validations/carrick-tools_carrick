@@ -36,6 +36,11 @@
 //!   `CACHE_VERSION` pairing: a question change moves `question_set` and the
 //!   next scan asks again by itself.
 //!
+//! - **Handler records (R4b, #2386).** A site may instead be
+//!   `{ site_id, handler }` ([`HandlerRecord`]), answered `{ site_id, ok, routes }`
+//!   ([`RoutesAnswered`]); one variant per request. Pinned in the contract's
+//!   top-level `handler` example.
+//!
 //! Both repos test against one example: `tests/fixtures/site_questions/contract.json`
 //! here, vendored byte for byte as carrick-cloud's
 //! `lambdas/site-questions/fixtures/contract.json`.
@@ -59,6 +64,10 @@ pub const SWITCH: &str = "CARRICK_SITE_QUESTIONS";
 
 /// The offline answer's key: `<CARRICK_MOCK_FIXTURE_DIR>/site-questions/default.json`.
 pub const MOCK_SEED: &str = "default";
+
+/// The offline answer's key for handler records (R4b):
+/// `<CARRICK_MOCK_FIXTURE_DIR>/site-questions/handler.json`.
+pub const HANDLER_MOCK_SEED: &str = "handler";
 
 /// The most sites one request carries (the cloud refuses more).
 pub const MAX_SITES_PER_REQUEST: usize = 50;
@@ -200,13 +209,229 @@ pub struct SiteQuestion {
     pub state: SiteState,
 }
 
-/// One request's body.
+/// One request's body: sites of one variant ([`Question`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SiteQuestionsRequest {
+pub struct QuestionsRequest<Q> {
     pub repo: String,
     pub service: Option<String>,
     pub question_set: Option<String>,
-    pub sites: Vec<SiteQuestion>,
+    pub sites: Vec<Q>,
+}
+
+/// A request of site records.
+pub type SiteQuestionsRequest = QuestionsRequest<SiteQuestion>;
+
+/// A site of one variant on the wire, and how its answer reads.
+pub trait Question: Serialize + Clone {
+    type Answer;
+    /// The scanner's handle for the site, unique in a run.
+    fn site_id(&self) -> &str;
+    /// One element of a response's `answers`, or `None` when it is neither
+    /// the answered nor the failed shape.
+    fn read_answer(element: &Value) -> Option<Result<Self::Answer, Unanswered>>;
+}
+
+impl Question for SiteQuestion {
+    type Answer = Answered;
+    fn site_id(&self) -> &str {
+        &self.site_id
+    }
+    fn read_answer(element: &Value) -> Option<Result<Answered, Unanswered>> {
+        parse_answer(element).map(|answer| match answer {
+            SiteAnswer::Answered(answered) => Ok(*answered),
+            SiteAnswer::Failed(failed) => Err(failed),
+        })
+    }
+}
+
+impl Question for HandlerQuestion {
+    type Answer = RoutesAnswered;
+    fn site_id(&self) -> &str {
+        &self.site_id
+    }
+    fn read_answer(element: &Value) -> Option<Result<RoutesAnswered, Unanswered>> {
+        parse_routes_answer(element)
+    }
+}
+
+/// The most comparisons one handler record asks in a request (R4b, #2386).
+pub const MAX_ASKED_COMPARISONS: usize = 16;
+/// The most handlers a shared record lists.
+pub const MAX_SHARED_HANDLERS: usize = 8;
+
+/// What a handler record is about (R4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectKind {
+    Entry,
+    Label,
+    Shared,
+}
+
+/// A labelled `receive` the subject is the handler of.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubjectLabel {
+    pub package: String,
+    pub export: String,
+    pub member: Option<String>,
+}
+
+/// A handler a shared record's function is reached from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerRef {
+    pub at: String,
+    pub key: String,
+}
+
+/// The function the record is about: its body numbered as `point.code` is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerSubject {
+    pub at: String,
+    pub kind: SubjectKind,
+    pub key: String,
+    pub params: Vec<String>,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<SubjectLabel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handlers: Option<Vec<HandlerRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_count: Option<u32>,
+}
+
+/// Code of a comparison written in another function.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeWindow {
+    pub at: String,
+    pub code: String,
+}
+
+/// Where a compared literal stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonPosition {
+    Equality,
+    Case,
+    TableKey,
+}
+
+/// The read of the request's path a comparison was proven to make.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonRead {
+    pub param: String,
+    pub steps: Vec<String>,
+}
+
+/// Where the chain from the request to a comparison stopped. `text` is the
+/// expression it stopped at; `null` (always written) when the hole has none
+/// (a `handed_to` or a missing caller argument).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonHole {
+    pub reason: String,
+    pub text: Option<String>,
+}
+
+/// One path or method comparison. `read` and `hole` are always written; at
+/// most one is not null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerComparison {
+    pub id: u32,
+    pub at: String,
+    pub literal: String,
+    pub position: ComparisonPosition,
+    pub expression: String,
+    pub read: Option<ComparisonRead>,
+    pub hole: Option<ComparisonHole>,
+}
+
+/// A request-method literal the record states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodLiteral {
+    pub literal: String,
+    pub at: String,
+}
+
+/// A `startsWith` prefix the record states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopePrefix {
+    pub prefix: String,
+    pub at: String,
+    pub delegates: Vec<String>,
+}
+
+/// What the code already decides for a comparison; an absent member is asked.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForcedRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// The handler record (R4b, #2386): one request handler and every path and
+/// method comparison inside it. No question text, no absolute path. Which
+/// comparisons are asked is part of the record, so part of the cache key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerRecord {
+    pub subject: HandlerSubject,
+    pub code: Vec<CodeWindow>,
+    pub comparisons: Vec<HandlerComparison>,
+    pub methods: Vec<MethodLiteral>,
+    pub scopes: Vec<ScopePrefix>,
+    pub asked: Vec<u32>,
+    pub forced: BTreeMap<String, ForcedRoute>,
+}
+
+/// One handler to ask about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerQuestion {
+    pub site_id: String,
+    pub handler: HandlerRecord,
+}
+
+/// A request of handler records. A request holds one variant of site, never
+/// a mix of `state` and `handler` sites.
+pub type HandlerQuestionsRequest = QuestionsRequest<HandlerQuestion>;
+
+/// What the model chose for one comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteChoice {
+    Route,
+    None,
+    CantTell,
+}
+
+/// The answer to one asked comparison. `method` is null for the "no method
+/// chosen" option; both are null for `none` and `cant_tell`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteAnswer {
+    pub id: u32,
+    pub choice: RouteChoice,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub confidence: f64,
+    pub orders_agree: bool,
+}
+
+/// An answered handler record: one [`RouteAnswer`] per asked id, in order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutesAnswered {
+    pub routes: Vec<RouteAnswer>,
+}
+
+/// One element of a handler request's `answers`, or `None` when it is neither
+/// shape.
+pub fn parse_routes_answer(element: &Value) -> Option<Result<RoutesAnswered, Unanswered>> {
+    match element.get("ok")?.as_bool()? {
+        true => serde_json::from_value::<RoutesAnswered>(element.clone())
+            .ok()
+            .map(Ok),
+        false => Some(Err(Unanswered {
+            code: element.get("code")?.as_str()?.to_string(),
+            retriable: element.get("retriable")?.as_bool()?,
+        })),
+    }
 }
 
 /// An answered slot's value: a stated value's text (name, method,
@@ -257,16 +482,33 @@ pub enum SiteAnswer {
     Failed(Unanswered),
 }
 
-/// What a scan's site questions came to.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SiteAnswers {
+/// What a scan's questions of one variant came to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answers<A> {
     /// The cloud's question-set id, from the last response read.
     pub question_set: Option<String>,
-    pub answered: BTreeMap<String, Answered>,
+    pub answered: BTreeMap<String, A>,
     pub unanswered: BTreeMap<String, Unanswered>,
     /// Requests sent.
     pub requests: usize,
 }
+
+impl<A> Default for Answers<A> {
+    fn default() -> Self {
+        Self {
+            question_set: None,
+            answered: BTreeMap::new(),
+            unanswered: BTreeMap::new(),
+            requests: 0,
+        }
+    }
+}
+
+/// What a scan's site questions came to.
+pub type SiteAnswers = Answers<Answered>;
+
+/// What a scan's handler questions came to (R4b).
+pub type HandlerAnswers = Answers<RoutesAnswered>;
 
 /// A site the scanner did not send: its own request would be over
 /// [`MAX_REQUEST_BYTES`].
@@ -285,10 +527,14 @@ struct RawResponse {
     answers: Vec<Value>,
 }
 
-/// The answers a response body holds, by site id, and its question-set id.
-/// An element that cannot be read is skipped, and its site reads as
-/// unanswered. A body that is not the response's shape holds none.
-pub fn parse_response(text: &str) -> (Option<String>, BTreeMap<String, SiteAnswer>) {
+/// Each site's answer or failure, by site id.
+pub type ReadAnswers<A> = BTreeMap<String, Result<A, Unanswered>>;
+
+/// The answers a response body for sites of variant `Q` holds, by site id,
+/// and its question-set id. An element that cannot be read is skipped, and
+/// its site reads as unanswered. A body that is not the response's shape
+/// holds none.
+pub fn read_response<Q: Question>(text: &str) -> (Option<String>, ReadAnswers<Q::Answer>) {
     let Ok(raw) = serde_json::from_str::<RawResponse>(text) else {
         return (None, BTreeMap::new());
     };
@@ -297,7 +543,7 @@ pub fn parse_response(text: &str) -> (Option<String>, BTreeMap<String, SiteAnswe
         .iter()
         .filter_map(|element| {
             let site_id = element.get("site_id")?.as_str()?.to_string();
-            Some((site_id, parse_answer(element)?))
+            Some((site_id, Q::read_answer(element)?))
         })
         .collect();
     (raw.question_set, answers)
@@ -317,7 +563,7 @@ pub fn parse_answer(element: &Value) -> Option<SiteAnswer> {
 }
 
 /// The bytes `site` adds to a request's body.
-fn site_bytes(site: &SiteQuestion) -> usize {
+fn site_bytes<Q: Question>(site: &Q) -> usize {
     serde_json::to_vec(site)
         .map(|b| b.len())
         .unwrap_or(usize::MAX)
@@ -326,20 +572,20 @@ fn site_bytes(site: &SiteQuestion) -> usize {
 /// Split `sites` into requests of at most [`MAX_SITES_PER_REQUEST`] sites and
 /// [`MAX_REQUEST_BYTES`] of body, in order. A site whose own request would be
 /// over the byte ceiling is returned apart and never sent.
-pub fn batches(
+pub fn batches<Q: Question>(
     repo: &str,
     service: Option<&str>,
     question_set: Option<&str>,
-    sites: Vec<SiteQuestion>,
-) -> (Vec<SiteQuestionsRequest>, Vec<SiteQuestion>) {
-    let empty = SiteQuestionsRequest {
+    sites: Vec<Q>,
+) -> (Vec<QuestionsRequest<Q>>, Vec<Q>) {
+    let empty = QuestionsRequest {
         repo: repo.to_string(),
         service: service.map(str::to_string),
         question_set: question_set.map(str::to_string),
         sites: Vec::new(),
     };
     let envelope = serde_json::to_vec(&empty).map(|b| b.len()).unwrap_or(0);
-    let mut out: Vec<SiteQuestionsRequest> = Vec::new();
+    let mut out: Vec<QuestionsRequest<Q>> = Vec::new();
     let mut too_large = Vec::new();
     let mut current = empty.clone();
     let mut bytes = envelope;
@@ -366,22 +612,23 @@ pub fn batches(
 
 /// One round: every request through `send`, [`IN_FLIGHT`] at a time. The
 /// sites each request carried, with what came back for each.
-async fn round<S, Fut>(
-    requests: Vec<SiteQuestionsRequest>,
-    send: &S,
-) -> Vec<(
-    Vec<SiteQuestion>,
-    Result<(Option<String>, BTreeMap<String, SiteAnswer>), Unanswered>,
-)>
+/// One request's sites, with what came back for them.
+type RoundResult<Q> = (
+    Vec<Q>,
+    Result<(Option<String>, ReadAnswers<<Q as Question>::Answer>), Unanswered>,
+);
+
+async fn round<Q, S, Fut>(requests: Vec<QuestionsRequest<Q>>, send: &S) -> Vec<RoundResult<Q>>
 where
-    S: Fn(SiteQuestionsRequest) -> Fut,
+    Q: Question,
+    S: Fn(QuestionsRequest<Q>) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
     stream::iter(requests)
         .map(|request| async move {
             let sites = request.sites.clone();
             let result = match tokio::time::timeout(ASK_TIMEOUT, send(request)).await {
-                Ok(Ok(text)) => Ok(parse_response(&text)),
+                Ok(Ok(text)) => Ok(read_response::<Q>(&text)),
                 // The transport has already retried what it could.
                 Ok(Err(error)) => Err(Unanswered {
                     code: error.code,
@@ -407,14 +654,15 @@ where
 /// those sites; still failing, it is unanswered. Two sites with one id: the
 /// first is asked, the second is dropped. This reads no switch; the caller
 /// checks [`enabled`] ([`ask_service`] does).
-pub async fn ask<S, Fut>(
+pub async fn ask<Q, S, Fut>(
     repo: &str,
     service: Option<&str>,
-    sites: Vec<SiteQuestion>,
+    sites: Vec<Q>,
     send: S,
-) -> SiteAnswers
+) -> Answers<Q::Answer>
 where
-    S: Fn(SiteQuestionsRequest) -> Fut,
+    Q: Question,
+    S: Fn(QuestionsRequest<Q>) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
     ask_within(repo, service, sites, send, || {
@@ -427,23 +675,24 @@ where
 /// (carrick#2439): the round of retriable sites draws on the run's retry
 /// budget ([`crate::retry_budget`]), the one a scan's patient calls share,
 /// so a run that has spent it asks each site once.
-pub async fn ask_within<S, Fut, R>(
+pub async fn ask_within<Q, S, Fut, R>(
     repo: &str,
     service: Option<&str>,
-    sites: Vec<SiteQuestion>,
+    sites: Vec<Q>,
     send: S,
     may_retry: R,
-) -> SiteAnswers
+) -> Answers<Q::Answer>
 where
-    S: Fn(SiteQuestionsRequest) -> Fut,
+    Q: Question,
+    S: Fn(QuestionsRequest<Q>) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
     R: Fn() -> bool,
 {
-    let mut out = SiteAnswers::default();
+    let mut out = Answers::default();
     let mut seen = BTreeSet::new();
-    let mut pending: Vec<SiteQuestion> = sites
+    let mut pending: Vec<Q> = sites
         .into_iter()
-        .filter(|site| seen.insert(site.site_id.clone()))
+        .filter(|site| seen.insert(site.site_id().to_string()))
         .collect();
     for attempt in 0..2 {
         if pending.is_empty() || (attempt > 0 && !may_retry()) {
@@ -452,7 +701,7 @@ where
         let (requests, too_large) = batches(repo, service, out.question_set.as_deref(), pending);
         for site in too_large {
             out.unanswered.insert(
-                site.site_id,
+                site.site_id().to_string(),
                 Unanswered {
                     code: TOO_LARGE_CODE.to_string(),
                     retriable: false,
@@ -466,7 +715,8 @@ where
                 Ok(read) => read,
                 Err(unanswered) => {
                     for site in sites {
-                        out.unanswered.insert(site.site_id, unanswered.clone());
+                        out.unanswered
+                            .insert(site.site_id().to_string(), unanswered.clone());
                     }
                     continue;
                 }
@@ -475,21 +725,22 @@ where
                 out.question_set = question_set;
             }
             for site in sites {
-                match answers.remove(&site.site_id) {
-                    Some(SiteAnswer::Answered(answered)) => {
-                        out.unanswered.remove(&site.site_id);
-                        out.answered.insert(site.site_id, *answered);
+                let site_id = site.site_id().to_string();
+                match answers.remove(&site_id) {
+                    Some(Ok(answered)) => {
+                        out.unanswered.remove(&site_id);
+                        out.answered.insert(site_id, answered);
                     }
-                    Some(SiteAnswer::Failed(failed)) if failed.retriable && attempt == 0 => {
-                        out.unanswered.insert(site.site_id.clone(), failed);
+                    Some(Err(failed)) if failed.retriable && attempt == 0 => {
+                        out.unanswered.insert(site_id, failed);
                         again.push(site);
                     }
-                    Some(SiteAnswer::Failed(failed)) => {
-                        out.unanswered.insert(site.site_id, failed);
+                    Some(Err(failed)) => {
+                        out.unanswered.insert(site_id, failed);
                     }
                     None => {
                         out.unanswered.insert(
-                            site.site_id,
+                            site_id,
                             Unanswered {
                                 code: NO_ANSWER_CODE.to_string(),
                                 retriable: false,
@@ -520,11 +771,33 @@ pub async fn ask_service(
     service: Option<&str>,
     sites: Vec<SiteQuestion>,
 ) -> SiteAnswers {
+    ask_service_seeded(agent, repo, service, sites, MOCK_SEED).await
+}
+
+/// [`ask_service`] for handler records (R4b): their own requests, never
+/// mixed with site records, answered offline from
+/// `<CARRICK_MOCK_FIXTURE_DIR>/site-questions/handler.json`.
+pub async fn ask_handlers_service(
+    agent: &AgentService,
+    repo: &str,
+    service: Option<&str>,
+    sites: Vec<HandlerQuestion>,
+) -> HandlerAnswers {
+    ask_service_seeded(agent, repo, service, sites, HANDLER_MOCK_SEED).await
+}
+
+async fn ask_service_seeded<Q: Question>(
+    agent: &AgentService,
+    repo: &str,
+    service: Option<&str>,
+    sites: Vec<Q>,
+    seed: &str,
+) -> Answers<Q::Answer> {
     if !enabled() || sites.is_empty() {
-        return SiteAnswers::default();
+        return Answers::default();
     }
     ask(repo, service, sites, |request| async move {
-        agent.post_to_lambda(ROUTE, &request, MOCK_SEED).await
+        agent.post_to_lambda(ROUTE, &request, seed).await
     })
     .await
 }

@@ -164,6 +164,13 @@ pub struct TypeManifestEntry {
     /// `None` unless it differs from `expanded_definition`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_definition: Option<String>,
+    /// carrick#2100, a producer response only: the response was owed an
+    /// unwidened reading and the sidecar ran out of time before making it, so
+    /// `unwidened_definition` is absent for want of time. A pair judged
+    /// incompatible against `expanded_definition` alone is then published
+    /// unverifiable: the mismatch may be a literal the compiler widened.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unwidened_out_of_budget: bool,
     /// A producer response whose union the handler chooses by a field of the
     /// incoming message (carrick#2054): which fields it reads, and the type
     /// each stated value of one placed field receives. The published type is
@@ -531,7 +538,11 @@ pub struct SdkUnresolved {
 /// Sent with the write actions so the cloud can apply its first-scan partial
 /// rule: a service with no hosted rows accepts the partial index and echoes
 /// this list back, and a service that already has rows refuses it. `reason` is
-/// [`crate::agent_service::AgentCallError::code`] verbatim.
+/// [`crate::agent_service::AgentCallError::code`] verbatim, or the scanner's
+/// own code for a file it never sent (`file_too_large`).
+///
+/// The same shape names a file lost for good (`final_losses`, carrick#2488),
+/// which the partial rule never counts.
 ///
 /// A file a budget refused is never in this list (carrick#555): nothing failed
 /// there, so there is nothing for the cloud to decide about.
@@ -1286,36 +1297,42 @@ pub fn mount_graph_to_api_details(
     let calls: Vec<ApiEndpointDetails> = mount_graph
         .get_data_calls()
         .iter()
-        .map(|call| ApiEndpointDetails {
-            owner: None,
-            key: OperationKey::http(&call.method, call.canonical_path.clone()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: Some(call.client.clone()),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&call.file_location),
-            repo_name: None,
-            service_name: None,
-            // Provenance is producer-side metadata; calls keep the default.
-            provenance: Default::default(),
-            resolution_source: call.resolution_source,
-            // Likewise: a view module is a property of a route's module.
-            view_module: false,
-            // The value this call sends for the field its target dispatches
-            // on (carrick#831): the consumer half of the same identity.
-            dispatch: call.dispatch.clone(),
-            schema_binding: None,
-            // A call has no handler.
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        })
+        .map(call_details)
         .collect();
 
     (endpoints, calls)
+}
+
+/// One consumer call of a `MountGraph` as the cloud index keys it: on its
+/// pre-computed `canonical_path` ([`mount_graph_to_api_details`]).
+pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointDetails {
+    ApiEndpointDetails {
+        owner: None,
+        key: OperationKey::http(&call.method, call.canonical_path.clone()),
+        params: vec![],
+        request_body: None,
+        response_body: None,
+        handler_name: Some(call.client.clone()),
+        request_type: None,
+        response_type: None,
+        file_path: PathBuf::from(&call.file_location),
+        repo_name: None,
+        service_name: None,
+        // Provenance is producer-side metadata; calls keep the default.
+        provenance: Default::default(),
+        resolution_source: call.resolution_source,
+        // Likewise: a view module is a property of a route's module.
+        view_module: false,
+        // The value this call sends for the field its target dispatches
+        // on (carrick#831): the consumer half of the same identity.
+        dispatch: call.dispatch.clone(),
+        schema_binding: None,
+        // A call has no handler.
+        handler_span: None,
+        name_scope: None,
+        library_semantics: Vec::new(),
+        inference: None,
+    }
 }
 
 /// A write action that failed AFTER an attempt whose outcome nobody saw, so
@@ -2203,6 +2220,7 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
             v1_state_before_demotion: None,

@@ -40,7 +40,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
-import { PathNames, declaringFileName } from './position-rows.js';
+import { PathNames, declaringFileName, type PackageDirectoryOf } from './position-rows.js';
 import type {
   ClaimSlot,
   KeyLabel,
@@ -61,6 +61,7 @@ import type {
   SurfaceReceiver,
   SurfaceSignature,
 } from './types.js';
+import { memberDeclaration } from './declaration-attribution.js';
 
 /** The methods a `verb` claim may name, and a method key may accept. */
 const HTTP_METHODS: ReadonlySet<string> = new Set([
@@ -266,10 +267,22 @@ type Read<T> = { value: T } | { reason: string };
 
 /** The callee's signatures, or the verdict when there is nothing to call. */
 /** A callee's signatures, and the type its member was read from. */
-type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type } | { failure: Outcome };
+/** A member a path reaches and the type it is read on. */
+interface NamedMember {
+  property: ts.Symbol;
+  holder: ts.Type;
+}
+
+/** `named` is unset when the callee is the receiver itself. */
+type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type; named?: NamedMember } | { failure: Outcome };
 
 interface ModuleRead {
   entry: SemanticsModule;
+  /**
+   * A `node:` key that names a file of the runtime's types package, not a
+   * module (carrick#2445): the file whose globals the key's exports are.
+   */
+  globalFile?: ts.SourceFile;
   /** The reason every check on this package is unchecked, when there is one. */
   reason?: string;
 }
@@ -301,6 +314,12 @@ interface MessageReceiver extends Holder {
   scoped: boolean;
   /** The maker overloads this instance is read through: what `runs: { bound: 'maker' }` reads. */
   makerHolding?: readonly ts.Signature[];
+  /**
+   * The export whose own call or construction made this instance
+   * (`instance:()`, `instance:new`, with no scope step): a `yields` naming it
+   * names this instance (carrick#2663).
+   */
+  madeBy?: string;
 }
 
 /** A check's outcome, and for a maker or scope claim the overloads it holds on. */
@@ -402,8 +421,27 @@ function sortedDeclarations(declarations: readonly DeclaredAt[]): DeclaredAt[] {
 
 let probeSequence = 0;
 
+/**
+ * What a project's module graph says, where it resolved through one rather
+ * than through `node_modules` (carrick#2599). Such a resolver serves a package
+ * from a cache whose path has no `node_modules` segment, so neither the path
+ * nor a Node resolution of the package name finds the files the program
+ * loaded.
+ */
+export interface ModuleGraph {
+  /** The installed package directory a file lies in, and its name. */
+  packageDirectoryOf: PackageDirectoryOf;
+  /** How the program resolves `name` from `from`; `undefined` where there is no graph, and Node resolution answers. */
+  resolveModule(name: string, from: string, options: ts.CompilerOptions): ts.ResolvedModuleFull | undefined;
+}
+
+const NO_MODULE_GRAPH: ModuleGraph = { packageDirectoryOf: () => undefined, resolveModule: () => undefined };
+
 export class LibraryClaimsVerifier {
-  constructor(private readonly project: Project) {}
+  constructor(
+    private readonly project: Project,
+    private readonly graph: ModuleGraph = NO_MODULE_GRAPH
+  ) {}
 
   /**
    * Judge every check, in request order, spending at most `budgetMs`. Checks
@@ -485,7 +523,18 @@ export class LibraryClaimsVerifier {
       builtIndex.set(key, importLines.length + builtLines.length);
       builtLines.push(`${expression};`);
     }
-    const probeText = [...importLines, ...builtLines].join('\n');
+    // A `node:` key may name a file of the runtime's types, whose exports are
+    // globals (`runtimeGlobalFile`): the probe reads each as `globalThis` holds
+    // it, beside its import, and the reader takes the one the key resolves to.
+    const globalIndex = new Map<string, number>();
+    const globalLines: string[] = [];
+    importKeys.forEach((key, i) => {
+      const [pkg, name] = JSON.parse(key) as [string, string];
+      if (!RUNTIME_MODULE.test(pkg)) return;
+      globalIndex.set(key, importLines.length + builtLines.length + globalLines.length);
+      globalLines.push(globalRead(name, `__carrick_g${i}`));
+    });
+    const probeText = [...importLines, ...builtLines, ...globalLines].join('\n');
 
     const probePath = path.join(fromDir, `__carrick_claims_probe_${process.pid}_${probeSequence++}.ts`);
     const probe = this.project.createSourceFile(probePath, `${probeText}\n`, { overwrite: true });
@@ -494,7 +543,14 @@ export class LibraryClaimsVerifier {
       const checker = program.getTypeChecker();
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir, scanRoot);
+      const reader = new DeclarationReader(
+        program,
+        file,
+        this.project.getModuleResolutionHost(),
+        fromDir,
+        scanRoot,
+        this.graph
+      );
       const localRanges = readLocalRanges(fromDir);
 
       const moduleReads = new Map<string, ModuleRead>();
@@ -504,6 +560,7 @@ export class LibraryClaimsVerifier {
 
       /** The probe's import of the check's export, or its read of a global (`probeLine`). */
       const statementOf = (check: LibraryCheck) => file.statements[importIndex.get(exportKey(check))!];
+      const globalStatementOf = (check: LibraryCheck) => file.statements[globalIndex.get(exportKey(check)) ?? -1];
 
       /** The probe's no-argument build of `receiver` on the check's export, resolved. */
       const atDefaults = (check: LibraryCheck, receiver: string): ts.Signature | undefined => {
@@ -528,9 +585,12 @@ export class LibraryClaimsVerifier {
         const key = exportKey(check);
         let exportRead = exportReads.get(key);
         if (!exportRead) {
+          const globalFile = RUNTIME_MODULE.test(check.package) ? readModule(check, rulesFor(check)?.message ?? false).globalFile : undefined;
           exportRead = DEFAULT_LIBRARY.test(check.package)
-            ? reader.readGlobal(check.package, statementOf(check))
-            : reader.readExport(statementOf(check) as ts.ImportDeclaration);
+            ? reader.readGlobal(reader.defaultLibraryFile(check.package), statementOf(check))
+            : globalFile
+              ? reader.readGlobal(globalFile, globalStatementOf(check))
+              : reader.readExport(statementOf(check) as ts.ImportDeclaration);
           exportReads.set(key, exportRead);
         }
         return exportRead;
@@ -602,6 +662,7 @@ export class LibraryClaimsVerifier {
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
             makerHolding,
+            madeBy: receiverPath.maker?.member === null && receiverPath.scope === undefined ? check.export : undefined,
           })),
         };
       };
@@ -800,7 +861,14 @@ export class LibraryClaimsVerifier {
       const program = this.project.getProgram().compilerObject;
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
+      const reader = new DeclarationReader(
+        program,
+        file,
+        this.project.getModuleResolutionHost(),
+        fromDir,
+        undefined,
+        this.graph
+      );
       return read(program.getTypeChecker(), reader, file);
     } finally {
       this.project.removeSourceFile(probe);
@@ -1002,7 +1070,11 @@ function typeSymbols(type: ts.Type): (ts.Symbol | undefined)[] {
  * declares one.
  */
 function probeLine(pkg: string, name: string, local: string): string {
-  if (!DEFAULT_LIBRARY.test(pkg)) return importLine(pkg, name, local);
+  return DEFAULT_LIBRARY.test(pkg) ? globalRead(name, local) : importLine(pkg, name, local);
+}
+
+/** The probe's read of the global `name`, bound to `local`. */
+function globalRead(name: string, local: string): string {
   const access = IDENTIFIER.test(name) ? `.${name}` : `[${JSON.stringify(name)}]`;
   return `const ${local} = globalThis${access};`;
 }
@@ -1089,10 +1161,11 @@ class DeclarationReader {
     private readonly probe: ts.SourceFile,
     private readonly host: ts.ModuleResolutionHost,
     serviceRoot: string,
-    scanRoot?: string
+    scanRoot: string | undefined,
+    private readonly graph: ModuleGraph
   ) {
     this.checker = program.getTypeChecker();
-    this.pathNames = new PathNames(scanRoot ?? serviceRoot);
+    this.pathNames = new PathNames(scanRoot ?? serviceRoot, graph.packageDirectoryOf);
     this.root = this.realpath(serviceRoot);
     this.printedRoots = [...new Set([this.root, serviceRoot])]
       .filter(root => root.length > 1)
@@ -1136,21 +1209,30 @@ class DeclarationReader {
    */
   readModule(pkg: string, declaration: ts.ImportDeclaration, runtimeModules = false): ModuleRead {
     const specifier = declaration.moduleSpecifier as ts.StringLiteral;
-    const resolved = ts.resolveModuleName(
-      pkg,
-      this.probe.fileName,
-      this.program.getCompilerOptions(),
-      this.host,
-      undefined,
-      undefined,
-      this.program.getModeForUsageLocation(this.probe, specifier)
-    ).resolvedModule;
+    const resolved =
+      this.graph.resolveModule(pkg, this.probe.fileName, this.program.getCompilerOptions()) ??
+      ts.resolveModuleName(
+        pkg,
+        this.probe.fileName,
+        this.program.getCompilerOptions(),
+        this.host,
+        undefined,
+        undefined,
+        this.program.getModeForUsageLocation(this.probe, specifier)
+      ).resolvedModule;
     const entry: SemanticsModule = { package: pkg };
     const done = (reason?: string): ModuleRead =>
       reason ? { entry: { ...entry, reason }, reason } : { entry };
 
     const moduleSymbol = this.checker.getSymbolAtLocation(specifier);
     const declarations = moduleSymbol?.declarations ?? [];
+    const globalFile = declarations.length === 0 ? this.runtimeGlobalFile(pkg) : undefined;
+    if (globalFile) {
+      entry.resolved_file = globalFile.fileName;
+      const version = this.installedPackage(globalFile.fileName)?.version;
+      if (version) entry.installed_version = version;
+      return { entry, globalFile };
+    }
     if (runtimeModules && RUNTIME_MODULE.test(pkg)) return this.readRuntimeModule(declarations, entry, done);
     // The module itself, not a service-side augmentation of it.
     const primary = declarations.find(ts.isSourceFile) ?? declarations[0];
@@ -1243,8 +1325,28 @@ class DeclarationReader {
     return { entry };
   }
 
+  /**
+   * The runtime types' file a `node:<path>` key names, when no module has
+   * that name (carrick#2445): `node:web-globals/fetch` is the file
+   * `web-globals/fetch.d.ts` (or `.../index.d.ts`) of the installed runtime
+   * types package, which declares globals. Undefined when the program loads
+   * no such file; the key is then a module name, read as one.
+   */
+  private runtimeGlobalFile(pkg: string): ts.SourceFile | undefined {
+    if (!RUNTIME_MODULE.test(pkg)) return undefined;
+    const relative = pkg.slice('node:'.length);
+    return this.program.getSourceFiles().find(file => {
+      const owner = this.packageOf(file);
+      if (owner === undefined || !RUNTIME_TYPE_PACKAGES.has(owner)) return false;
+      const name = this.realpath(file.fileName).split(path.sep).join('/');
+      const marker = `/node_modules/${owner}/`;
+      const inside = name.slice(name.lastIndexOf(marker) + marker.length);
+      return inside === `${relative}.d.ts` || inside === `${relative}/index.d.ts`;
+    });
+  }
+
   /** The default-library file a `lib:` key names, when the program loads it. */
-  private defaultLibraryFile(pkg: string): ts.SourceFile | undefined {
+  defaultLibraryFile(pkg: string): ts.SourceFile | undefined {
     const name = pkg.slice('lib:'.length);
     return this.program
       .getSourceFiles()
@@ -1257,7 +1359,7 @@ class DeclarationReader {
    * key's lib file declares; one only another file declares (the runtime's
    * types, the service) is missing from it.
    */
-  readGlobal(pkg: string, statement: ts.Statement | undefined): Read<ExportRead> {
+  readGlobal(file: ts.SourceFile | undefined, statement: ts.Statement | undefined): Read<ExportRead> {
     const declaration =
       statement && ts.isVariableStatement(statement) ? statement.declarationList.declarations[0] : undefined;
     const access = declaration?.initializer;
@@ -1268,7 +1370,6 @@ class DeclarationReader {
           ? access.argumentExpression
           : undefined;
     const target = name ? this.checker.getSymbolAtLocation(name) : undefined;
-    const file = this.defaultLibraryFile(pkg);
     if (
       !declaration ||
       !target ||
@@ -1786,7 +1887,12 @@ class DeclarationReader {
       if (result.rank === Infinity) holding.push(signature);
       else best = furthest(best, result.rank, result.outcome);
     }
-    if (holding.length > 0) return binds ? { outcome: VERIFIED } : { outcome: VERIFIED, holding };
+    if (holding.length > 0) {
+      // The member's own declarations, as a verified op carries them (#2636).
+      const declarations = this.declarationsOf({ signatures: holding, named: callee.named });
+      const outcome: Outcome = declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
+      return binds ? { outcome } : { outcome, holding };
+    }
     return { outcome: best!.outcome };
   }
 
@@ -1814,7 +1920,105 @@ class DeclarationReader {
     if (parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part) || this.isEmptyObject(part))) {
       return unchecked('mounts_untyped');
     }
+    const erased = this.fitsErased(receiver.type, slot, signature.typeParameters ?? []);
+    if (erased !== undefined) return erased ? undefined : failed('mounts_not_instance');
     return this.checker.isTypeAssignableTo(receiver.type, slot) ? undefined : failed('mounts_not_instance');
+  }
+
+  /**
+   * `receiver` fits `slot` with the signature's own type parameters
+   * (`own`) erased to their constraints (carrick#2652), or undefined when
+   * that reading does not apply. The receiver is built at its defaults, so a
+   * parameter typed `Tree<SubEnv, SubBase>` has free arguments that no default
+   * instance is assignable to. It applies when `slot` and `receiver` are
+   * references to the same generic type and no argument mixes an own type
+   * parameter into a larger type: an argument that is an own type parameter
+   * takes any receiver argument its constraint takes (none: any), every other
+   * argument must be the receiver's.
+   */
+  private fitsErased(receiver: ts.Type, slot: ts.Type, own: readonly ts.TypeParameter[]): boolean | undefined {
+    if (own.length === 0) return undefined;
+    const from = this.referenceOf(receiver);
+    const to = this.referenceOf(slot);
+    if (from === undefined || to === undefined) return undefined;
+    const count = (to.target.typeParameters ?? []).length;
+    const given = this.argumentsAs(from.target, this.checker.getTypeArguments(from), to.target);
+    const wanted = this.checker.getTypeArguments(to);
+    if (count === 0 || given === undefined || given.length < count || wanted.length < count) return undefined;
+    for (let i = 0; i < count; i++) {
+      if (own.includes(wanted[i] as ts.TypeParameter)) {
+        const constraint = this.checker.getBaseConstraintOfType(wanted[i]);
+        if (constraint === undefined || this.isOpenTop(constraint)) continue;
+        if (own.some(parameter => this.mentions(constraint, parameter))) return undefined;
+        if (!this.checker.isTypeAssignableTo(given[i], constraint)) return false;
+      } else if (own.some(parameter => this.mentions(wanted[i], parameter))) {
+        return undefined;
+      } else if (
+        given[i] !== wanted[i] &&
+        !(this.checker.isTypeAssignableTo(given[i], wanted[i]) && this.checker.isTypeAssignableTo(wanted[i], given[i]))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * The type arguments the instance `current<args>` has as an instance of
+   * `target`: its own when it is one, else through the base types its class
+   * extends, where each base argument is a type parameter of the class
+   * (replaced by the matching argument) or names none. Undefined when
+   * `target` is not reached that way.
+   */
+  private argumentsAs(
+    current: ts.GenericType,
+    args: readonly ts.Type[],
+    target: ts.GenericType,
+    depth = 0
+  ): readonly ts.Type[] | undefined {
+    if (current === target) return args;
+    if (depth > 6) return undefined;
+    const parameters = current.typeParameters ?? [];
+    for (const base of this.checker.getBaseTypes(current)) {
+      const reference = this.referenceOf(base);
+      if (reference === undefined) continue;
+      const mapped: ts.Type[] = [];
+      let usable = true;
+      for (const argument of this.checker.getTypeArguments(reference)) {
+        const index = parameters.indexOf(argument as ts.TypeParameter);
+        if (index >= 0) mapped.push(args[index]);
+        else if (parameters.some(parameter => this.mentions(argument, parameter))) usable = false;
+        else mapped.push(argument);
+      }
+      const found = usable ? this.argumentsAs(reference.target, mapped, target, depth + 1) : undefined;
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+
+  private referenceOf(type: ts.Type): ts.TypeReference | undefined {
+    if (!(type.flags & ts.TypeFlags.Object)) return undefined;
+    return (type as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? (type as ts.TypeReference) : undefined;
+  }
+
+  /** `type` names `parameter` anywhere in its arguments or members of a union or intersection. */
+  private mentions(type: ts.Type, parameter: ts.TypeParameter, depth = 0): boolean {
+    if (type === parameter) return true;
+    if (depth > 6) return true;
+    if (type.isUnionOrIntersection()) return type.types.some(part => this.mentions(part, parameter, depth + 1));
+    // A deferred conditional (`Server extends X ? A : B`) or an alias
+    // instance names its parameter in its check type or its alias arguments
+    // (carrick#2663).
+    if (type.aliasTypeArguments?.some(argument => this.mentions(argument, parameter, depth + 1))) return true;
+    if (type.flags & ts.TypeFlags.Conditional) {
+      const conditional = type as ts.ConditionalType;
+      return [conditional.checkType, conditional.extendsType].some(part => this.mentions(part, parameter, depth + 1));
+    }
+    const reference = this.referenceOf(type);
+    if (reference !== undefined) {
+      return this.checker.getTypeArguments(reference).some(argument => this.mentions(argument, parameter, depth + 1));
+    }
+    return false;
   }
 
   /**
@@ -1888,20 +2092,26 @@ class DeclarationReader {
     }
     if (!held) return best!.outcome;
     if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
-    const declarations = this.declarationsOf(callee.signatures);
+    const declarations = this.declarationsOf(callee);
     return declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
   }
 
   /**
-   * Where the signatures a verified op resolved to are declared, as position
-   * rows spell it (`decl_file`, `decl_line`): the member on this receiver, so
-   * two members of one name on two types give two answers. A declaration no
-   * row could name is left out.
+   * Where a verified op or scope's member is declared, as position rows spell
+   * it (`decl_file`, `decl_line`): the declaration the call row names for the
+   * member symbol on this receiver ({@link memberDeclaration}), so two members
+   * of one name on two types give two answers, and a property typed by an
+   * interface with call signatures names the property, not the signatures
+   * (carrick#2654). A callee that is the receiver itself has no member symbol
+   * and names its signatures' declarations. A declaration no row could name is
+   * left out.
    */
-  private declarationsOf(signatures: readonly ts.Signature[]): DeclaredAt[] {
+  private declarationsOf(callee: { signatures: readonly ts.Signature[]; named?: NamedMember }): DeclaredAt[] {
     const found: DeclaredAt[] = [];
-    for (const signature of signatures) {
-      const declaration = signature.getDeclaration();
+    const named = callee.named
+      ? [memberDeclaration(() => this.program, callee.named.property, callee.named.holder)]
+      : callee.signatures.map(signature => signature.getDeclaration());
+    for (const declaration of named) {
       if (!declaration) continue;
       const file = declaration.getSourceFile();
       const decl_file = declaringFileName(this.program, this.pathNames, file);
@@ -1985,17 +2195,23 @@ class DeclarationReader {
   }
 
   /**
-   * `yields: { param, export, side }` on a receive op: some signature of the
-   * handler this overload takes declares a parameter at `param` whose type
-   * is the package's own export named `export` (a class, or the interface
-   * an instance has), declared in the receiver's home packages. `side` is
-   * `client` or `server` (`yields_side_invalid`). Undefined when it holds.
+   * `yields: { param, export, side }` on a receive op or a scope: some
+   * signature of the function this overload takes declares a parameter at
+   * `param` whose type is either
+   * - the package's own export named `export` (a class, or the interface an
+   *   instance has), declared in the receiver's home packages; or
+   * - when `export` is the maker whose own call made the instance the claim
+   *   is read on (`madeBy`, carrick#2663): that instance, compared by
+   *   declaration (`handsInstance`), since a factory's result has no export
+   *   name of its own.
+   * `side` is `client` or `server` (`yields_side_invalid`). Undefined when it
+   * holds.
    */
   private yieldsOutcome(
     signature: ts.Signature,
     handler: ClaimSlot,
     yields: { param: number; export: string; side: string },
-    receiver: Holder
+    receiver: MessageReceiver
   ): Outcome | undefined {
     if (yields.side !== 'client' && yields.side !== 'server') return failed('yields_side_invalid');
     let declared = this.keyParameterAt(signature, handler.arg);
@@ -2016,9 +2232,49 @@ class DeclarationReader {
             (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home))
         );
         if (named) return undefined;
+        if (yields.export === receiver.madeBy && this.handsInstance(given, receiver, signature.typeParameters ?? [])) {
+          return undefined;
+        }
       }
     }
     return failed('yields_not_export');
+  }
+
+  /**
+   * `given` (each part, nullish dropped) is the instance `receiver` holds:
+   * some part of its intersection is a class or interface the receiver's
+   * home packages declare, and the same declaration (the same symbol, never
+   * the same name) as a part of the instance's own intersection. A generic
+   * instance is built at its defaults while `given` threads the overload's
+   * own type parameters (`own`) through its arguments, so the arguments are
+   * read as `fitsErased` reads a mounted instance (carrick#2652): a
+   * definite mismatch refuses, an argument it cannot read leaves the
+   * declaration to decide.
+   */
+  private handsInstance(given: ts.Type, receiver: Holder, own: readonly ts.TypeParameter[]): boolean {
+    const declared = (type: ts.Type): ts.Symbol | undefined => {
+      const symbol = type.getSymbol();
+      if (!symbol || !(symbol.flags & (ts.SymbolFlags.Class | ts.SymbolFlags.Interface))) return undefined;
+      const home = (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home));
+      return home ? symbol : undefined;
+    };
+    const intersected = (type: ts.Type): readonly ts.Type[] => (type.isIntersection() ? type.types : [type]);
+    const instances = this.parts(receiver.type)
+      .flatMap(intersected)
+      .filter(part => declared(part) !== undefined);
+    const parts = this.parts(given);
+    return (
+      parts.length > 0 &&
+      parts.every(part =>
+        intersected(part).some(handed => {
+          const symbol = declared(handed);
+          return (
+            symbol !== undefined &&
+            instances.some(instance => declared(instance) === symbol && this.fitsErased(instance, handed, own) !== false)
+          );
+        })
+      )
+    );
   }
 
   /**
@@ -2595,11 +2851,15 @@ class DeclarationReader {
     form: 'call' | 'new'
   ): Callable {
     let holder: Holder = receiver;
+    // The last member the path reaches, with the type it is read on: the
+    // symbol the call row names (carrick#2654).
+    let named: NamedMember | undefined;
     for (const hop of hops) {
       const step = this.ownMember(holder, hop);
       if ('failure' in step) return step;
       const type = step.type;
       if (this.saysNothing(type)) return { failure: unchecked('member_untyped') };
+      named = { property: step.property, holder: holder.type };
       holder = { type, home: this.homeOf(receiver.pkg, typeSymbols(type), holder.home) };
     }
     let type = holder.type;
@@ -2610,6 +2870,7 @@ class DeclarationReader {
       if ('failure' in step) return step;
       type = step.type;
       boundBase = step.bound;
+      named = { property: step.property, holder: holder.type };
     }
     const all =
       form === 'new'
@@ -2623,7 +2884,7 @@ class DeclarationReader {
     const own = boundBase
       ? library
       : library.filter(signature => this.isOwnFile(this.signatureFile(signature, type, form)!, home));
-    if (own.length > 0) return { signatures: own, holder: holder.type };
+    if (own.length > 0) return { signatures: own, holder: holder.type, named };
     if (library.length > 0) return { failure: failed('member_inherited') };
     return { failure: this.slotFailure(type, form === 'new' ? 'member_not_constructible' : 'member_not_callable') };
   }
@@ -2633,13 +2894,16 @@ class DeclarationReader {
    * sits on another package's base that the holder binds with its own type
    * (`bound`).
    */
-  private ownMember(holder: Holder, name: string): { type: ts.Type; bound: boolean } | { failure: Outcome } {
+  private ownMember(
+    holder: Holder,
+    name: string
+  ): { type: ts.Type; bound: boolean; property: ts.Symbol } | { failure: Outcome } {
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(holder.type));
     const property = this.declaredProperty(holder.type, name);
     if (!property) return { failure: failed('member_missing') };
     const type = this.checker.getTypeOfSymbol(property);
-    if (this.isOwnMember(property, apparent, holder.home)) return { type, bound: false };
-    if (this.isBoundByOwnType(property, holder)) return { type, bound: true };
+    if (this.isOwnMember(property, apparent, holder.home)) return { type, bound: false, property };
+    if (this.isBoundByOwnType(property, holder)) return { type, bound: true, property };
     return { failure: failed('member_inherited') };
   }
 
@@ -2749,7 +3013,7 @@ class DeclarationReader {
     if (moduleRead.entry.resolved_file) surface.resolved_file = moduleRead.entry.resolved_file;
     if (moduleRead.entry.installed_version) surface.installed_version = moduleRead.entry.installed_version;
     if (moduleRead.reason) return { ...surface, reason: moduleRead.reason };
-    const exported = this.listedExports(probe, only);
+    const exported = this.listedExports(probe, only, moduleRead.globalFile);
     if (!exported) return { ...surface, reason: 'module_unresolved' };
 
     let budget = maxEntries;
@@ -2766,6 +3030,9 @@ class DeclarationReader {
     const names: Array<() => void> = [];
     const fills: Array<() => void> = [];
 
+    // What the package's default export names: a maker also exported by name
+    // under this declaration is imported the same way, so it is read the same.
+    const defaultTarget = exported.find(each => each.name === 'default')?.target;
     for (const { name, target, type } of exported) {
       if (!take()) continue;
       const entry: SurfaceExport = { export: name, receivers: [] };
@@ -2778,7 +3045,7 @@ class DeclarationReader {
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
-        const made = this.madeBy(maker.signatures, built(name, maker.receiver));
+        const made = this.madeBy(maker.signatures, built(name, maker.receiver), target === defaultTarget);
         if (!made) continue;
         // One level below the export, what the member builds must declare a callable member.
         if (
@@ -2804,8 +3071,9 @@ class DeclarationReader {
    */
   makersOf(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): { export: string; receivers: string[] }[] {
     this.setPackage(pkg);
-    if ('namespace' in probe && this.readModule(pkg, probe.namespace, true).reason) return [];
-    return (this.listedExports(probe, only) ?? [])
+    const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
+    if (moduleRead?.reason) return [];
+    return (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
       .map(({ name, target, type }) => ({
         export: name,
@@ -2823,8 +3091,13 @@ class DeclarationReader {
    * `prototype`, which no service imports. Undefined when the specifier
    * resolves to no module symbol.
    */
-  private listedExports(probe: SurfaceProbe, only: readonly string[] | undefined): ListedExport[] | undefined {
-    if ('defaultLibrary' in probe) return this.listedGlobals(probe.defaultLibrary, only);
+  private listedExports(
+    probe: SurfaceProbe,
+    only: readonly string[] | undefined,
+    globalFile?: ts.SourceFile
+  ): ListedExport[] | undefined {
+    if ('defaultLibrary' in probe) return this.listedGlobals(this.defaultLibraryFile(probe.defaultLibrary), only);
+    if (globalFile) return this.listedGlobals(globalFile, only);
     const moduleSymbol = this.checker.getSymbolAtLocation(probe.namespace.moduleSpecifier);
     if (!moduleSymbol) return undefined;
     const wanted = (name: string) => only === undefined || only.includes(name);
@@ -2858,8 +3131,7 @@ class DeclarationReader {
    * `only` names), sorted by name, each with its declared type: none when the
    * program's `lib` setting does not load the file.
    */
-  private listedGlobals(pkg: string, only: readonly string[] | undefined): ListedExport[] {
-    const file = this.defaultLibraryFile(pkg);
+  private listedGlobals(file: ts.SourceFile | undefined, only: readonly string[] | undefined): ListedExport[] {
     if (!file) return [];
     return this.checker
       .getSymbolsInScope(this.probe, ts.SymbolFlags.Value)
@@ -2910,13 +3182,27 @@ class DeclarationReader {
    * type-parameter defaults where `built` (the probe's no-argument build of
    * the receiver) instantiates it (`returnOf`), less the returns that say
    * nothing, which no maker claim holds on. Listed when what is left is one
-   * object type.
+   * object type. A `default` export, which a service imports under any local
+   * name (usually the one maker a framework has), or the same declaration
+   * exported by name (carrick#2640), that is overloaded and so
+   * returns several types is listed for the return of the overload the
+   * probe's no-argument build resolves (`built`), when that is an object type
+   * with members of its own.
    */
-  private madeBy(signatures: readonly ts.Signature[], built: ts.Signature | undefined): ts.Type | undefined {
+  private madeBy(
+    signatures: readonly ts.Signature[],
+    built: ts.Signature | undefined,
+    isDefault: boolean
+  ): ts.Type | undefined {
     const returns = [
       ...new Set(signatures.map(sig => this.returnOf(sig, built)).filter(type => !this.returnSaysNothing(type))),
     ];
-    return returns.length === 1 && this.isObjectType(returns[0]) ? returns[0] : undefined;
+    if (returns.length === 1) return this.isObjectType(returns[0]) ? returns[0] : undefined;
+    if (!isDefault || returns.length === 0 || built === undefined) return undefined;
+    const resolved = this.checker.getReturnTypeOfSignature(built);
+    return !this.returnSaysNothing(resolved) && this.isObjectType(resolved) && this.namedProperties(resolved).length > 0
+      ? resolved
+      : undefined;
   }
 
   /** The call (or construct) signatures of `type` an installed package or the default library declares. */
@@ -3347,22 +3633,32 @@ class DeclarationReader {
    * source file in a directory that happens to be named `node_modules`, or a
    * repository checked out under a `node_modules` ancestor, is not installed.
    * An install hoisted above the service root (`../../node_modules/pkg`) and
-   * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are.
+   * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are. A path
+   * with no `node_modules` segment is placed by the module graph, where there
+   * is one (carrick#2599).
    * Mirrored by `installedPackageDirectory` in capture/, which the capture
    * seam keeps from being shared.
    */
   private installedPackage(fileName: string): InstalledPackage | undefined {
-    const segments = path.relative(this.root, this.realpath(fileName)).split(path.sep);
+    const real = this.realpath(fileName);
+    const segments = path.relative(this.root, real).split(path.sep);
     const last = segments.lastIndexOf('node_modules');
-    if (last < 0) return undefined;
-    const width = segments[last + 1]?.startsWith('@') ? 2 : 1;
-    const nameSegments = segments.slice(last + 1, last + 1 + width);
+    let placed: { directory: string; name: string } | undefined;
+    if (last >= 0) {
+      const width = segments[last + 1]?.startsWith('@') ? 2 : 1;
+      placed = {
+        directory: path.resolve(this.root, ...segments.slice(0, last + 1 + width)),
+        name: segments.slice(last + 1, last + 1 + width).join('/'),
+      };
+    } else {
+      placed = this.graph.packageDirectoryOf(real);
+    }
+    if (placed === undefined) return undefined;
     // No package.json there (a file directly under node_modules included) means no package.
-    const directory = path.resolve(this.root, ...segments.slice(0, last + 1 + width));
-    let known = this.packageDirectories.get(directory);
+    let known = this.packageDirectories.get(placed.directory);
     if (known === undefined) {
-      known = readInstalledPackage(this.host, directory, nameSegments.join('/'));
-      this.packageDirectories.set(directory, known);
+      known = readInstalledPackage(this.host, placed.directory, placed.name);
+      this.packageDirectories.set(placed.directory, known);
     }
     return known ?? undefined;
   }

@@ -48,6 +48,40 @@ pub(crate) const NODENEXT: (&str, &str) = (
     r#"{ "compilerOptions": { "target": "ES2020", "module": "NodeNext", "moduleResolution": "NodeNext", "jsx": "react-jsx", "strict": true }, "include": ["src"] }"#,
 );
 
+/// The member declarations the trace's own verify request returns for one
+/// service of a real repo, asked of the built sidecar from the service's
+/// root as a scan asks it (carrick#2474 R1, R2b): the offline censuses'.
+pub(crate) fn census_declarations(
+    script: &Path,
+    root: &Path,
+    service: &Config,
+    inputs: &RequestSummaryInputs,
+    exports: &[crate::library_claims::ExportClaims],
+) -> super::discovery::MemberDeclarations {
+    let name = service.service_name.as_deref().unwrap_or("(root)");
+    let service_root = root.join(service.directory.as_deref().unwrap_or("."));
+    let sidecar = crate::services::TypeSidecar::spawn(script).expect("spawn the sidecar");
+    sidecar.set_scan_root(root);
+    sidecar.start_init(&service_root, None);
+    sidecar
+        .wait_ready(std::time::Duration::from_secs(900))
+        .expect("the sidecar is ready");
+    let ask = super::discovery::declaration_ask(inputs, exports);
+    let verdicts = sidecar
+        .verify_library_claims(&service_root, &ask.checks)
+        .map(|answer| answer.verdicts)
+        .unwrap_or_default();
+    let declarations = super::discovery::MemberDeclarations::of(&ask, &verdicts);
+    crate::outln!(
+        "  {name}: {} check(s), {} not reached, {} declaration(s), {} scope(s) verified",
+        declarations.checks,
+        declarations.not_reached,
+        declarations.len(),
+        declarations.verified_scopes.len()
+    );
+    declarations
+}
+
 /// A fixture service, read.
 pub(crate) struct Walked {
     _dir: tempfile::TempDir,
@@ -118,38 +152,15 @@ pub(crate) fn walked_within(
             std::fs::write(&path, text).unwrap();
         }
     }
-    let config = Config::load_services(vec![repo.join("carrick.json")])
-        .unwrap()
-        .remove(0);
-    let positions = with_rows.then(|| {
-        let mut files =
-            crate::file_finder::walk_service(&repo.to_string_lossy(), &config, &[]).files;
-        files.sort();
-        // A directory beside the tree: the walk refuses to write into it.
-        let positions = dir.path().join("positions");
-        std::fs::create_dir_all(&positions).unwrap();
-        let out = positions.join(format!("repo__{service}.jsonl.gz"));
-        let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
-        sidecar.set_scan_root(&repo);
-        let recipe = sidecar.recipe();
-        drop(sidecar);
-        crate::position_rows::record_service_rows(
-            &recipe,
-            &crate::position_rows::ServiceWalk {
-                service_root: &service_root,
-                tsconfig: Some("tsconfig.json"),
-                scan_root: &repo,
-                files: &files,
-                out: &out,
-                service,
-            },
-        )
-        .expect("the walk writes its rows");
-        PositionIndex::of(
-            &repo,
-            crate::position_rows::read_rows_file(&out).expect("the rows read"),
-        )
-    });
+    // The service named `service`, else the first.
+    let mut services = Config::load_services(vec![repo.join("carrick.json")]).unwrap();
+    let at = services
+        .iter()
+        .position(|config| config.service_name.as_deref() == Some(service))
+        .unwrap_or(0);
+    let config = services.remove(at);
+    let positions =
+        with_rows.then(|| rows_of(&script, dir.path(), &repo, &service_root, &config, service));
     let started = std::time::Instant::now();
     let inputs = crate::engine::discover_service_inputs_within(&repo, &config, positions, budget);
     Some(Walked {
@@ -157,5 +168,102 @@ pub(crate) fn walked_within(
         repo,
         inputs,
         discovered_in: started.elapsed(),
+    })
+}
+
+/// The rows the real sidecar walks for `service` of the copied tree `repo`,
+/// written beside it under `dir`.
+fn rows_of(
+    script: &Path,
+    dir: &Path,
+    repo: &Path,
+    service_root: &Path,
+    config: &Config,
+    service: &str,
+) -> PositionIndex {
+    let mut files = crate::file_finder::walk_service(&repo.to_string_lossy(), config, &[]).files;
+    files.sort();
+    // A directory beside the tree: the walk refuses to write into it.
+    let positions = dir.join("positions");
+    std::fs::create_dir_all(&positions).unwrap();
+    let out = positions.join(format!("repo__{service}.jsonl.gz"));
+    let sidecar = crate::services::TypeSidecar::spawn(script).expect("spawn the sidecar");
+    sidecar.set_scan_root(repo);
+    let recipe = sidecar.recipe();
+    drop(sidecar);
+    crate::position_rows::record_service_rows(
+        &recipe,
+        &crate::position_rows::ServiceWalk {
+            service_root,
+            tsconfig: Some("tsconfig.json"),
+            scan_root: repo,
+            files: &files,
+            out: &out,
+            service,
+        },
+    )
+    .expect("the walk writes its rows");
+    PositionIndex::of(
+        repo,
+        crate::position_rows::read_rows_file(&out).expect("the rows read"),
+    )
+}
+
+/// Several services of one fixture tree, each read with its own rows or
+/// with none (carrick#2618).
+pub(crate) struct WalkedServices {
+    _dir: tempfile::TempDir,
+    /// The copied repo's root, canonical.
+    pub(crate) repo: PathBuf,
+    /// Each named service's inputs, in the order named.
+    pub(crate) inputs: Vec<RequestSummaryInputs>,
+}
+
+/// `tests/fixtures/<fixture>/repo`'s services `services` (directory under
+/// the repo and name, as `carrick.json` declares them), copied once and
+/// each walked with its own rows.
+pub(crate) fn walked_services(
+    fixture: &str,
+    services: &[(&str, &str)],
+    with_rows: bool,
+) -> Option<WalkedServices> {
+    let script = sidecar()?;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+    copy_tree(
+        &manifest.join("tests/fixtures").join(fixture).join("repo"),
+        &repo,
+    );
+    let configs = Config::load_services(vec![repo.join("carrick.json")]).unwrap();
+    let inputs = services
+        .iter()
+        .map(|(service_dir, service)| {
+            let config = configs
+                .iter()
+                .find(|config| config.service_name.as_deref() == Some(*service))
+                .unwrap_or_else(|| panic!("carrick.json declares no service {service}"));
+            let positions = with_rows.then(|| {
+                rows_of(
+                    &script,
+                    dir.path(),
+                    &repo,
+                    &repo.join(service_dir),
+                    config,
+                    service,
+                )
+            });
+            crate::engine::discover_service_inputs_within(
+                &repo,
+                config,
+                positions,
+                super::ROWS_JOIN_BUDGET,
+            )
+        })
+        .collect();
+    Some(WalkedServices {
+        _dir: dir,
+        repo,
+        inputs,
     })
 }

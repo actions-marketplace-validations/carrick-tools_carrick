@@ -194,7 +194,7 @@ pub(super) enum Step {
 }
 
 impl Step {
-    fn render(&self) -> String {
+    pub(super) fn render(&self) -> String {
         match self {
             Self::Key(key) => key.clone(),
             Self::Url => "URL".to_string(),
@@ -273,6 +273,26 @@ impl Subject {
 
     fn rendered_steps(&self) -> Vec<String> {
         self.steps.iter().map(Step::render).collect()
+    }
+
+    /// The parameter the value is, as how many functions out (0: the
+    /// reader's own), its position and the keys read down from it, when it
+    /// is one read through keys alone (carrick#2432).
+    pub(super) fn parameter(&self) -> Option<(u8, usize, Vec<String>)> {
+        let (depth, index) = match &self.root {
+            Root::Param(index, _) => (0, *index),
+            Root::Outer(depth, index, _) => (*depth, *index),
+            _ => return None,
+        };
+        let keys = self
+            .steps
+            .iter()
+            .map(|step| match step {
+                Step::Key(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((depth, index, keys))
     }
 
     /// The root the value comes from, as one opaque piece ends at it
@@ -360,19 +380,27 @@ fn shape_of(text: &str) -> GuardShape {
 /// One literal a function compares a value against.
 #[derive(Debug, Clone)]
 pub(super) struct GuardIr {
-    literal: GuardLiteral,
-    position: GuardPosition,
+    pub(super) literal: GuardLiteral,
+    pub(super) position: GuardPosition,
     /// Written as `!==` or `!=`, or under `!`.
-    negated: bool,
+    pub(super) negated: bool,
     /// The comparison: the binary expression, the `case`, the `startsWith`
     /// call or the indexing member.
-    site: Site,
+    pub(super) site: Site,
     subject: Subject,
-    subject_text: String,
+    pub(super) subject_text: String,
     /// The other operands of the `&&` test it stands in, as text and line,
     /// unfiltered: a method test rides along without this pass naming it.
     conjoined: Vec<(String, u32)>,
-    branch: GuardBranch,
+    pub(super) branch: GuardBranch,
+    /// The comparison is one of its test's top-level `&&` operands (not
+    /// under `||` or `!`): what pairs a method with a path (carrick#2474
+    /// R4a). Never serialised.
+    pub(super) conjunct: bool,
+    /// For a table key, the key as written: where its route stands, on a
+    /// span of its own (two keys of one table are two places; carrick#2474
+    /// R4a, R4b). Never serialised.
+    pub(super) literal_at: Option<Site>,
 }
 
 /// A call an `if`, a ternary or a `&&` tests: the branch its result guards.
@@ -381,6 +409,9 @@ pub(super) struct Tested {
     branch: (u32, u32),
     /// The test reads the call's result under an odd number of `!`.
     negated: bool,
+    /// The call is one of the test's top-level `&&` operands (carrick#2474
+    /// R4a).
+    conjunct: bool,
 }
 
 /// Where a function written in a call's argument sits: the call, the
@@ -428,6 +459,8 @@ pub(super) struct ArgName {
 #[derive(Debug, Clone)]
 struct TableEntry {
     key: String,
+    /// The key as written: where its route stands.
+    key_site: Site,
     value_text: String,
     value_line: u32,
 }
@@ -483,6 +516,7 @@ impl ModuleGuards {
                         PropOrSpread::Prop(prop) => match &**prop {
                             Prop::KeyValue(kv) => Some(TableEntry {
                                 key: prop_name(&kv.key)?,
+                                key_site: reader.site(kv.key.span()),
                                 value_text: reader.text(kv.value.span()),
                                 value_line: reader.line(kv.value.span()),
                             }),
@@ -543,6 +577,13 @@ pub(super) struct TestScope {
 }
 
 impl TestScope {
+    /// Whether `span` is exactly one of the test's top-level `&&` operands.
+    fn is_conjunct(&self, span: Span) -> bool {
+        self.conjuncts
+            .iter()
+            .any(|(lo, hi, _, _)| *lo == span.lo.0 && *hi == span.hi.0)
+    }
+
     fn of(test: &Expr, branch: Span, reader: &Reader<'_>) -> Self {
         let mut conjuncts = Vec::new();
         conjuncts_of(test, reader, &mut conjuncts);
@@ -634,6 +675,7 @@ impl WalkState {
         Some(Tested {
             branch: test.branch,
             negated: *negated,
+            conjunct: test.is_conjunct(span),
         })
     }
 
@@ -1356,16 +1398,21 @@ impl CallWalker<'_, '_, '_> {
                     .map(|arg| super::library_sites::site_arg(&arg.expr, self.scope))
                     .collect()
             }),
+            spread_from: None,
             name_line: self.reader.line(new.callee.span()),
             jsx: false,
             arg_subjects: self.reader.arg_subjects(args, self.scope, bound),
             callee_subject: Some(self.reader.subject(&new.callee, self.scope, bound)),
             callee_text,
+            callee_values: Vec::new(),
+            arg_values: Vec::new(),
             tested: None,
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
             spread_args: Vec::new(),
             receiver_spans: super::discovery::receiver_spans(&new.callee),
+            receiver_object: super::discovery::receiver_object(&new.callee),
+            instance: super::InstanceIr::default(),
         };
         self.ir.constructions.push(construction);
     }
@@ -1398,16 +1445,25 @@ impl CallWalker<'_, '_, '_> {
             },
             receiver: None,
             site_args: None,
+            spread_from: None,
             name_line: self.reader.line(call.callee.span()),
             jsx: false,
             arg_subjects: Vec::new(),
             callee_subject: None,
             callee_text: self.reader.text(call.callee.span()),
+            callee_values: self
+                .reader
+                .callee_values(&call.callee, self.scope, &self.guard.bound),
+            arg_values: self
+                .reader
+                .arg_values(&call.args, self.scope, &self.guard.bound),
             tested: None,
             handed: Vec::new(),
             names: Vec::new(),
             spread_args: Vec::new(),
             receiver_spans: super::discovery::receiver_spans(&call.callee),
+            receiver_object: super::discovery::receiver_object(&call.callee),
+            instance: self.reader.instance_ir(Some(&call.callee), &[], self.scope),
         });
     }
 
@@ -1443,6 +1499,7 @@ impl CallWalker<'_, '_, '_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_guard(
         &mut self,
         literal: GuardLiteral,
@@ -1451,6 +1508,7 @@ impl CallWalker<'_, '_, '_> {
         span: Span,
         negated: bool,
         branch: Option<GuardBranch>,
+        literal_at: Option<Site>,
     ) {
         // `typeof x === "string"` compares a type tag the language names,
         // never a value the code was handed.
@@ -1480,6 +1538,12 @@ impl CallWalker<'_, '_, '_> {
             subject_text: self.reader.text(subject.span()),
             conjoined,
             branch,
+            conjunct: self
+                .guard
+                .test
+                .as_ref()
+                .is_some_and(|test| test.is_conjunct(span)),
+            literal_at,
         };
         self.ir.guards.push(guard);
     }
@@ -1501,6 +1565,7 @@ impl CallWalker<'_, '_, '_> {
             subject,
             bin.span,
             negated,
+            None,
             None,
         );
     }
@@ -1526,6 +1591,7 @@ impl CallWalker<'_, '_, '_> {
                 &member.obj,
                 call.span,
                 false,
+                None,
                 None,
             );
         }
@@ -1556,6 +1622,7 @@ impl CallWalker<'_, '_, '_> {
                 case.span,
                 false,
                 Some(branch),
+                None,
             );
         }
     }
@@ -1596,6 +1663,7 @@ impl CallWalker<'_, '_, '_> {
                     text: entry.value_text,
                     line: entry.value_line,
                 }),
+                Some(entry.key_site),
             );
         }
     }
@@ -1794,14 +1862,14 @@ pub struct GuardChain {
 }
 
 /// One function the chains move through.
-struct Node<'a> {
-    file: &'a Path,
+pub(super) struct Node<'a> {
+    pub(super) file: &'a Path,
     /// The extractor's key, when it keys the function.
-    key: Option<String>,
+    pub(super) key: Option<String>,
     exported: bool,
-    ir: &'a FnIr,
+    pub(super) ir: &'a FnIr,
     /// The function this one is written in.
-    parent: Option<usize>,
+    pub(super) parent: Option<usize>,
 }
 
 /// A chain being followed.
@@ -1814,15 +1882,69 @@ struct Trace {
     negated: bool,
     /// The functions passed through.
     passed: Vec<usize>,
+    /// What the chain's facts are, kept for the routes a dispatch states
+    /// (carrick#2474 R4a) and never serialised.
+    facts: ChainFacts,
 }
 
-struct Chains<'a> {
+/// What a chain passed on its way to its end, read off the trace itself
+/// rather than the rendered chain (carrick#2474 R4a): the first call the
+/// chain is handed to, the entry point it ends at, and the call that
+/// decided a predicate's branch.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ChainFacts {
+    pub(super) handoff: Option<Handoff>,
+    pub(super) entry: Option<EntryAt>,
+    pub(super) decided_at: Option<DecidedAt>,
+    /// The function the trace was last in: where a chain that ends at a
+    /// hole stopped (carrick#2474 R4b), which places the hole in a request
+    /// handler or in a function written inside one.
+    pub(super) stopped: Option<usize>,
+}
+
+/// The first call a chain's function is handed to.
+#[derive(Debug, Clone)]
+pub(super) struct Handoff {
+    /// The function handed over.
+    pub(super) handed: usize,
+    /// The function the call is written in.
+    pub(super) caller: usize,
+    /// The call.
+    pub(super) site: Site,
+    /// The argument the function is passed in, and the keys down to it.
+    pub(super) arg: usize,
+    pub(super) path: Vec<String>,
+    /// The parameter the chain was following, and the accesses from it.
+    pub(super) param: usize,
+    pub(super) steps: Vec<Step>,
+}
+
+/// The function a chain ends at as an entry point.
+#[derive(Debug, Clone)]
+pub(super) struct EntryAt {
+    pub(super) node: usize,
+    pub(super) param: usize,
+    pub(super) steps: Vec<Step>,
+}
+
+/// The caller's call that decided a predicate's branch: the function it is
+/// written in, its span (discovery numbering), the branch its result guards
+/// and whether it is a top-level `&&` operand of its test.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DecidedAt {
+    pub(super) node: usize,
+    pub(super) span: (u32, u32),
+    pub(super) branch: (u32, u32),
+    pub(super) conjunct: bool,
+}
+
+pub(super) struct Chains<'a> {
     inputs: &'a RequestSummaryInputs,
     root: &'a Path,
     /// What each constant a guard or a call argument names reads as, with
     /// every module's uses of it known.
     names: LinkedNames<'a>,
-    nodes: Vec<Node<'a>>,
+    pub(super) nodes: Vec<Node<'a>>,
     /// (file, span start, span end) of each call -> (node, call index).
     calls: HashMap<(&'a Path, u32, u32), (usize, usize)>,
     /// The same for each construction.
@@ -1870,7 +1992,7 @@ pub fn guard_chains(inputs: &RequestSummaryInputs, root: &Path) -> Vec<GuardChai
 }
 
 impl<'a> Chains<'a> {
-    fn new(inputs: &'a RequestSummaryInputs, root: &'a Path) -> Self {
+    pub(super) fn new(inputs: &'a RequestSummaryInputs, root: &'a Path) -> Self {
         let mut chains = Self {
             inputs,
             root,
@@ -1989,15 +2111,60 @@ impl<'a> Chains<'a> {
         }
     }
 
-    fn rel(&self, path: &Path) -> String {
+    pub(super) fn rel(&self, path: &Path) -> String {
         path.strip_prefix(self.root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned()
     }
 
-    fn line_of(&self, node: usize) -> u32 {
+    pub(super) fn line_of(&self, node: usize) -> u32 {
         self.nodes[node].ir.site.map_or(0, |site| site.line)
+    }
+
+    /// Whether `open` ends a chain in `node` at an entry point: a keyed
+    /// function the module exports that nothing in the repository calls
+    /// and that is handed to no call (carrick#2474 R4b).
+    pub(super) fn is_entry(&self, node: usize) -> bool {
+        let current = &self.nodes[node];
+        current.exported
+            && current.key.as_ref().is_some_and(|key| {
+                self.callers
+                    .get(&(current.file.to_path_buf(), key.clone()))
+                    .is_none_or(|callers| callers.is_empty())
+            })
+            && self.handed_at(node).is_empty()
+    }
+
+    /// Each call `node` is handed to (carrick#2474 R4b): the function the
+    /// call is written in, the call, the argument and the keys down to the
+    /// function inside it.
+    pub(super) fn handed_calls(&self, node: usize) -> Vec<(usize, Site, usize, Vec<String>)> {
+        self.handed_at(node)
+            .into_iter()
+            .map(|(caller, at, arg, path)| (caller, self.call(caller, at).site, arg, path))
+            .collect()
+    }
+
+    /// The functions one call above `node` (carrick#2474 R4b, the census's
+    /// what-if arm alone): its in-repo callers and the functions that hand
+    /// it on.
+    pub(super) fn one_call_up(&self, node: usize) -> Vec<usize> {
+        let current = &self.nodes[node];
+        let mut up = Vec::new();
+        if let Some(key) = &current.key
+            && let Some(callers) = self.callers.get(&(current.file.to_path_buf(), key.clone()))
+        {
+            for (file, lo, hi) in callers {
+                if let Some(&(caller, _)) = self.calls.get(&(file.as_path(), *lo, *hi)) {
+                    up.push(caller);
+                }
+            }
+        }
+        up.extend(self.handed_at(node).into_iter().map(|(caller, ..)| caller));
+        up.sort();
+        up.dedup();
+        up
     }
 
     fn hole(&self, reason: HoleReason, node: usize) -> ChainEnd {
@@ -2013,7 +2180,7 @@ impl<'a> Chains<'a> {
     /// unread constant comes through. A constant that reads as no text, a
     /// builder's call among them, is kept as written: the hole and its
     /// reason are what the model reads.
-    fn literal(
+    pub(super) fn literal(
         &self,
         node: usize,
         literal: &GuardLiteral,
@@ -2110,7 +2277,7 @@ impl<'a> Chains<'a> {
     }
 
     /// The calls written in `node` between `lo` and `hi`, in source order.
-    fn branch_calls(&self, node: usize, (lo, hi): (u32, u32)) -> Vec<Branch> {
+    pub(super) fn branch_calls(&self, node: usize, (lo, hi): (u32, u32)) -> Vec<Branch> {
         let node = &self.nodes[node];
         let mut calls: Vec<_> = node
             .ir
@@ -2134,6 +2301,16 @@ impl<'a> Chains<'a> {
     }
 
     fn of_guard(&self, node: usize, guard: &GuardIr) -> Vec<GuardChain> {
+        self.traced(node, guard)
+            .into_iter()
+            .map(|(chain, _)| chain)
+            .collect()
+    }
+
+    /// Each chain of `guard`, written in `node`, with the facts its trace
+    /// passed (carrick#2474 R4a): [`Self::of_guard`]'s chains, in the same
+    /// order.
+    pub(super) fn traced(&self, node: usize, guard: &GuardIr) -> Vec<(GuardChain, ChainFacts)> {
         let (literal, shape, constant) = self.literal(node, &guard.literal);
         let returns = &self.nodes[node].ir.returns_tests;
         let is_predicate = !returns.is_empty() && returns.iter().all(|test| *test);
@@ -2153,38 +2330,42 @@ impl<'a> Chains<'a> {
             branch,
             negated: guard.negated,
             passed: Vec::new(),
+            facts: ChainFacts::default(),
         };
         let mut ends = Ends::default();
         self.follow(node, trace, &mut ends);
         ends.found
             .into_iter()
-            .map(|(trace, end)| GuardChain {
-                literal: literal.clone(),
-                shape,
-                constant: constant.clone(),
-                within: if trace.hops.is_empty() && matches!(end, ChainEnd::Hole { .. }) {
-                    self.within(node)
-                } else {
-                    Vec::new()
-                },
-                position: guard.position,
-                negated: trace.negated,
-                site: ChainSite {
-                    file: self.rel(self.nodes[node].file),
-                    line: guard.site.line,
-                },
-                subject: guard.subject_text.clone(),
-                conjoined: guard
-                    .conjoined
-                    .iter()
-                    .map(|(text, line)| Conjoined {
-                        text: text.clone(),
-                        line: *line,
-                    })
-                    .collect(),
-                hops: trace.hops,
-                end,
-                branch: trace.branch.unwrap_or_default(),
+            .map(|(trace, end)| {
+                let chain = GuardChain {
+                    literal: literal.clone(),
+                    shape,
+                    constant: constant.clone(),
+                    within: if trace.hops.is_empty() && matches!(end, ChainEnd::Hole { .. }) {
+                        self.within(node)
+                    } else {
+                        Vec::new()
+                    },
+                    position: guard.position,
+                    negated: trace.negated,
+                    site: ChainSite {
+                        file: self.rel(self.nodes[node].file),
+                        line: guard.site.line,
+                    },
+                    subject: guard.subject_text.clone(),
+                    conjoined: guard
+                        .conjoined
+                        .iter()
+                        .map(|(text, line)| Conjoined {
+                            text: text.clone(),
+                            line: *line,
+                        })
+                        .collect(),
+                    hops: trace.hops,
+                    end,
+                    branch: trace.branch.unwrap_or_default(),
+                };
+                (chain, trace.facts)
             })
             .collect()
     }
@@ -2232,6 +2413,7 @@ impl<'a> Chains<'a> {
     }
 
     fn follow(&self, node: usize, mut trace: Trace, ends: &mut Ends) {
+        trace.facts.stopped = Some(node);
         if ends.full() {
             ends.cap(self.hole(HoleReason::FanOutCap, node), trace);
             return;
@@ -2292,6 +2474,7 @@ impl<'a> Chains<'a> {
     /// Where `node`'s parameter `index` comes from: its callers, the calls
     /// it is handed to, or the function itself.
     fn open(&self, node: usize, index: usize, mut trace: Trace, ends: &mut Ends) {
+        trace.facts.stopped = Some(node);
         if trace.passed.contains(&node) {
             let end = self.hole(HoleReason::Recursion, node);
             ends.push(trace, end);
@@ -2339,6 +2522,12 @@ impl<'a> Chains<'a> {
                 {
                     next.branch = Some(self.branch_calls(caller, tested.branch));
                     next.negated ^= tested.negated;
+                    next.facts.decided_at = Some(DecidedAt {
+                        node: caller,
+                        span: (call.site.lo, call.site.hi),
+                        branch: tested.branch,
+                        conjunct: tested.conjunct,
+                    });
                 }
                 match call.arg_subjects.get(index).cloned().flatten() {
                     Some(arg) => {
@@ -2362,27 +2551,37 @@ impl<'a> Chains<'a> {
         let handed = self.handed_at(node);
         if !handed.is_empty() {
             for (caller, at, arg, path) in handed {
-                self.handed_to(caller, at, arg, path, index, trace.clone(), ends);
+                self.handed_to(node, caller, at, arg, path, index, trace.clone(), ends);
             }
             return;
         }
         let end = match &current.key {
-            Some(key) if current.exported => ChainEnd::EntryPoint {
-                file: self.rel(current.file),
-                line: self.line_of(node),
-                function: key.clone(),
-                param: index,
-                steps: trace.subject.rendered_steps(),
-            },
+            Some(key) if current.exported => {
+                trace.facts.entry = Some(EntryAt {
+                    node,
+                    param: index,
+                    steps: trace.subject.steps.clone(),
+                });
+                ChainEnd::EntryPoint {
+                    file: self.rel(current.file),
+                    line: self.line_of(node),
+                    function: key.clone(),
+                    param: index,
+                    steps: trace.subject.rendered_steps(),
+                }
+            }
             Some(_) => self.hole(HoleReason::NoCallerNotExported, node),
             None => self.hole(HoleReason::DetachedUnplaced, node),
         };
         ends.push(trace, end);
     }
 
+    /// `handed`'s parameter `param`, followed into the call `at` of `node`
+    /// that `handed` is passed to.
     #[allow(clippy::too_many_arguments)]
     fn handed_to(
         &self,
+        handed: usize,
         node: usize,
         at: At,
         arg: usize,
@@ -2393,6 +2592,17 @@ impl<'a> Chains<'a> {
     ) {
         let file = self.nodes[node].file;
         let call = self.call(node, at);
+        if trace.facts.handoff.is_none() {
+            trace.facts.handoff = Some(Handoff {
+                handed,
+                caller: node,
+                site: call.site,
+                arg,
+                path: path.clone(),
+                param,
+                steps: trace.subject.steps.clone(),
+            });
+        }
         trace.hops.push(Hop::HandedTo {
             file: self.rel(file),
             line: call.site.line,
@@ -2711,6 +2921,7 @@ impl<'a> Chains<'a> {
             branch: Some(Vec::new()),
             negated: false,
             passed: Vec::new(),
+            facts: ChainFacts::default(),
         };
         let mut ends = Ends::default();
         self.callee_end(node, call, trace, &mut ends);

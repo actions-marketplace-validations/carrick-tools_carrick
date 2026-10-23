@@ -55,7 +55,21 @@ use swc_common::{SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::row_calls::Reach;
 use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
+
+pub mod boundaries;
+mod composed;
+mod instances;
+pub use boundaries::RouteBoundaries;
+pub use composed::Composed;
+pub use instances::{
+    InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
+};
+
+/// The hop discovery records where a walk enters a function through a value
+/// the call runs (carrick#2432, [`super::discovery`]).
+pub(super) const VALUE_HOP: &str = "<value>";
 
 /// The labelled call a discovery site reaches: the store key of the package
 /// (`lib:lib.dom.d.ts` for the language's own library), the export and member, the
@@ -113,6 +127,13 @@ pub struct DiscoverySite {
     pub chain: Vec<ChainHop>,
     #[serde(default)]
     pub stop: Option<String>,
+    /// The binding the labelled call is made on (carrick#2474 R1), with the
+    /// receiver trace on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<super::discovery::ReceiverAt>,
+    /// How discovery matched the labelled call, with the receiver trace on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<super::discovery::ReachedBy>,
 }
 
 /// Discovery's census file: `{ "sites": [...] }`.
@@ -173,6 +194,11 @@ pub struct SiteLabel {
     /// label with no `op`): the slot and the form it is claimed for.
     #[serde(default)]
     pub runs: Option<RunsMake>,
+    /// A `receive` op's route fields (#2474 R0): where the handler's request
+    /// holds its path and method. Read by the dispatch routes (R4a); no
+    /// site's state carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<crate::services::type_sidecar::RequestAt>,
 }
 
 /// A maker that runs the function its call supplies at `slot`
@@ -202,6 +228,8 @@ impl SiteLabel {
             handler: Option<ArgSlot>,
             #[serde(default)]
             method: Option<MethodLabel>,
+            #[serde(default)]
+            request: Option<crate::services::type_sidecar::RequestAt>,
         }
         #[derive(Deserialize)]
         struct Export {
@@ -240,6 +268,7 @@ impl SiteLabel {
                         method: op.method,
                         reserved: Vec::new(),
                         runs: None,
+                        request: op.request,
                     });
                 }
             }
@@ -292,6 +321,7 @@ impl SiteLabel {
                             slot: slot(runs),
                             new: *form == MakeForm::New,
                         }),
+                        request: None,
                     });
                     continue;
                 }
@@ -307,6 +337,7 @@ impl SiteLabel {
                     method,
                     method_key,
                     method_default,
+                    request,
                     ..
                 } = claim
                 else {
@@ -334,6 +365,7 @@ impl SiteLabel {
                     method,
                     reserved: reserved_on(&export.claims, member.as_deref(), path, (*on, of)),
                     runs: None,
+                    request: request.as_deref().cloned(),
                 });
             }
         }
@@ -495,6 +527,25 @@ pub struct DecidedSite {
     pub handler: Option<HandlerAt>,
     /// What the label's method slot holds here, when it names one.
     pub method: Option<MethodValue>,
+    /// The binding the labelled call is made on (carrick#2474 R1), with the
+    /// receiver trace on: where the registration is made, wherever the name
+    /// is decided.
+    pub receiver: Option<super::discovery::ReceiverAt>,
+    /// How discovery matched the labelled call, with the receiver trace on.
+    pub reached: Option<super::discovery::ReachedBy>,
+    /// With the receiver trace on, the instance the labelled call is made
+    /// on, one end per caller that hands one in (carrick#2474 R2a). Read by
+    /// nothing; never part of a record's state.
+    pub instances: Vec<InstanceEnd>,
+    /// With the receiver trace on, the full path the route is served at
+    /// per instance end, every scope and mount prefix joined from the top
+    /// down (carrick#2474 R2b). Read by nothing; never part of a record's
+    /// state.
+    pub composed: Vec<Composed>,
+    /// Whether `composed` stopped at its cap
+    /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
+    /// left out.
+    pub composed_trimmed: bool,
 }
 
 impl DecidedSite {
@@ -618,6 +669,9 @@ pub enum Undecided {
     /// no op (carrick#2515): the store says nothing about what its members
     /// do, so no slot can be read. The call is listed, not named.
     NoOpClaim,
+    /// The callee is a value whose values reach different labelled exports,
+    /// or one of them none (carrick#2432): which one runs is the caller's.
+    SeveralValues,
 }
 
 /// A discovered call whose name no call of this code decides.
@@ -652,23 +706,89 @@ pub struct Decided {
     /// Sites that state no row because their name is one the library emits
     /// itself (carrick#2426), by `file:line`.
     pub reserved: Vec<String>,
+    /// Calls above a decided site on its chain (carrick#2614).
+    pub through: Vec<Through>,
+    /// With the receiver trace on, where the service's route chains leave
+    /// it (carrick#2474 R5a). Read by nothing yet; never part of a record's
+    /// state.
+    pub boundaries: RouteBoundaries,
+}
+
+/// A discovered call whose request is decided lower down its chain
+/// (carrick#2614): `await login(…)` where `login`'s own call writes the path.
+/// The call is not a second request; the site at `site_file:site_line` is.
+/// Recorded only where each hop from this call down to the site is the
+/// definition [`RequestSummaryInputs::reach`] reads off the compiler's `call`
+/// row (or, for a bare call of a function the same file declares, SWC's exact
+/// binding), never the unresolved-import fallback to the call graph's name
+/// join, so a call into another service or an unresolved one is never
+/// recorded.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Through {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub line: u32,
+    pub site_file: String,
+    pub site_line: u32,
+}
+
+/// The [`Through`] from `chain[0]` to the site at `chain[to]`, when `to` is
+/// below it and every hop between is one the compiler's rows resolve.
+fn through(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    chain: &[Placed<'_>],
+    to: usize,
+) -> Option<Through> {
+    if to == 0 || to >= chain.len() || inputs.row_calls.is_none() {
+        return None;
+    }
+    let resolved = chain[..=to].windows(2).all(|pair| {
+        let (call, into) = (&pair[0], &pair[1]);
+        let (file, lo, hi) = (call.file, call.call.site.lo, call.call.site.hi);
+        !inputs.fell_back(file, lo, hi)
+            && matches!(
+                inputs.reach(file, lo, hi),
+                Reach::Function(target, key)
+                    if target == into.file && into.key == Some(key.as_str())
+            )
+    });
+    resolved.then(|| Through {
+        file: relative(root, chain[0].file),
+        line: chain[0].call.site.line,
+        site_file: relative(root, chain[to].file),
+        site_line: chain[to].call.site.line,
+    })
 }
 
 /// One call, where it is written: its file, the definition key of the
 /// function whose body holds it (`None` at module level), how many functions
 /// deep inside that one it is, and the body that writes it.
 #[derive(Clone, Copy)]
-struct Placed<'a> {
-    file: &'a Path,
-    key: Option<&'a str>,
-    depth: u8,
-    call: &'a CallIr,
+pub(super) struct Placed<'a> {
+    pub(super) file: &'a Path,
+    pub(super) key: Option<&'a str>,
+    pub(super) depth: u8,
+    pub(super) call: &'a CallIr,
+    /// For a call inside a function written as a call's argument, that
+    /// call: what runs the innermost function the call is written in
+    /// (carrick#2474 R2a). `None` at depth 0, and for a function written
+    /// anywhere else.
+    host: Option<&'a CallIr>,
+    /// Where the innermost function the call is written in sits in a
+    /// call's argument (carrick#2474 R2b): the argument, and the keys down
+    /// to it. `None` at depth 0, and for a function written anywhere else.
+    written_in: Option<&'a super::guards::WrittenIn>,
 }
+
+/// The definition a call reaches, as a callers index reads it: its file and
+/// key.
+type Target = Option<(PathBuf, String)>;
 
 /// Every call of the service, by file and span, by the function whose body
 /// holds it, and by the function of the service the call graph resolves it
 /// to.
-struct Calls<'a> {
+pub(super) struct Calls<'a> {
     sites: &'a crate::call_graph::CallSiteTargets,
     by_span: HashMap<(&'a Path, u32, u32), Placed<'a>>,
     by_owner: HashMap<(&'a Path, &'a str), Vec<Placed<'a>>>,
@@ -677,19 +797,49 @@ struct Calls<'a> {
 
 impl<'a> Calls<'a> {
     fn index(inputs: &'a RequestSummaryInputs) -> Self {
+        Self::build(inputs, |file, call| {
+            inputs
+                .sites
+                .target_at(file, call.site.lo, call.site.hi)
+                .cloned()
+        })
+    }
+
+    /// The same index, each call's callers edge read from what the rows say
+    /// it reaches ([`RequestSummaryInputs::reach`], rows first): the callers
+    /// discovery's value walk reads (carrick#2432).
+    pub(super) fn through_reach(inputs: &'a RequestSummaryInputs) -> Self {
+        Self::build(inputs, |file, call| {
+            match inputs.reach(file, call.site.lo, call.site.hi) {
+                super::row_calls::Reach::Function(target, key) => Some((target, key)),
+                _ => None,
+            }
+        })
+    }
+
+    fn build(inputs: &'a RequestSummaryInputs, target: impl Fn(&Path, &CallIr) -> Target) -> Self {
         fn walk<'a>(
             file: &'a Path,
             key: Option<&'a str>,
             depth: u8,
             ir: &'a FnIr,
+            host: Option<&'a CallIr>,
             out: &mut Calls<'a>,
+            target: &dyn Fn(&Path, &CallIr) -> Target,
         ) {
+            let written_in = if depth == 0 {
+                None
+            } else {
+                ir.written_in.as_ref()
+            };
             for call in ir.calls.iter().chain(&ir.constructions) {
                 let placed = Placed {
                     file,
                     key,
                     depth,
                     call,
+                    host,
+                    written_in,
                 };
                 out.by_span
                     .entry((file, call.site.span_start, call.site.span_end))
@@ -697,12 +847,20 @@ impl<'a> Calls<'a> {
                 if let Some(key) = key {
                     out.by_owner.entry((file, key)).or_default().push(placed);
                 }
-                if let Some(target) = out.sites.target_at(file, call.site.lo, call.site.hi) {
-                    out.callers.entry(target.clone()).or_default().push(placed);
+                if let Some(target) = target(file, call) {
+                    out.callers.entry(target).or_default().push(placed);
                 }
             }
-            for inner in ir.nested.iter().chain(&ir.detached) {
-                walk(file, key, depth.saturating_add(1), inner, out);
+            for (index, inner) in ir.nested.iter().enumerate() {
+                let host = ir.calls.iter().find(|call| {
+                    call.args
+                        .iter()
+                        .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
+                });
+                walk(file, key, depth.saturating_add(1), inner, host, out, target);
+            }
+            for inner in &ir.detached {
+                walk(file, key, depth.saturating_add(1), inner, None, out, target);
             }
         }
         let mut calls = Calls {
@@ -723,10 +881,12 @@ impl<'a> Calls<'a> {
                     Some(key.as_str()),
                     0,
                     &file.functions[key],
+                    None,
                     &mut calls,
+                    &target,
                 );
             }
-            walk(path, None, 0, &file.module_level, &mut calls);
+            walk(path, None, 0, &file.module_level, None, &mut calls, &target);
         }
         calls
     }
@@ -740,7 +900,7 @@ impl<'a> Calls<'a> {
             .target_at(placed.file, placed.call.site.lo, placed.call.site.hi)
     }
 
-    fn callers_of(&self, file: &Path, key: &str) -> &[Placed<'a>] {
+    pub(super) fn callers_of(&self, file: &Path, key: &str) -> &[Placed<'a>] {
         self.callers
             .get(&(file.to_path_buf(), key.to_string()))
             .map_or(&[], Vec::as_slice)
@@ -782,10 +942,14 @@ fn to_definition(pieces: &[Piece], depth: u8) -> Option<Vec<Piece>> {
 }
 
 /// The argument `call` writes at `index`, unless a spread before it moves
-/// every position.
+/// every position. With the receiver trace on, a spread leaves the
+/// arguments before it as written ([`CallIr::spread_from`]).
 fn argument(call: &CallIr, index: usize) -> Option<&Value> {
-    call.site_args.as_ref()?;
-    call.args.get(index)
+    match (&call.site_args, call.spread_from) {
+        (Some(_), _) => call.args.get(index),
+        (None, Some(from)) if index < from => call.args.get(index),
+        _ => None,
+    }
 }
 
 /// `pieces` (the callee's own, its parameters by position) with each
@@ -1106,11 +1270,25 @@ pub(crate) fn relative(root: &Path, file: &Path) -> String {
 
 struct Walk<'a, 'i> {
     calls: &'i Calls<'a>,
+    inputs: &'i RequestSummaryInputs,
     root: &'i Path,
+    /// With the receiver trace on, the makers the store labels: each site's
+    /// instance is walked to them ([`instances`]).
+    makers: Option<&'i [MakerLabel]>,
+    /// With the receiver trace on, the scope members the store labels
+    /// (carrick#2474 R2b).
+    scopes: &'i [ScopeLabel],
+    /// With the receiver trace on, what every instance walk of the service
+    /// reads, built once.
+    index: Option<&'i instances::WalkIndex<'a>>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
     /// The label of the labelled call being walked.
     label: Option<&'i SiteLabel>,
+    /// The receiver of the labelled call being walked, and how discovery
+    /// reached it.
+    receiver: Option<super::discovery::ReceiverAt>,
+    reached: Option<super::discovery::ReachedBy>,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -1149,6 +1327,7 @@ impl<'a> Walk<'a, '_> {
             .and_then(|label| label.method.as_ref())
             .and_then(|method| method.from.as_ref())
             .and_then(|slot| method_value(down, slot));
+        let instances = self.instances(down);
         self.out.sites.push(DecidedSite {
             file,
             line: placed.call.site.line,
@@ -1162,7 +1341,29 @@ impl<'a> Walk<'a, '_> {
             payload,
             handler,
             method,
+            receiver: self.receiver.clone(),
+            reached: self.reached,
+            instances,
+            composed: Vec::new(),
+            composed_trimmed: false,
         });
+    }
+
+    /// With the receiver trace on, the instance ends of the site whose
+    /// calls are `down` ([`instances`]); none with it off.
+    fn instances(&self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
+        match (self.makers, self.index) {
+            (Some(makers), Some(index)) => instances::InstanceWalk::new(
+                self.calls,
+                self.inputs,
+                self.root,
+                makers,
+                self.scopes,
+                index,
+            )
+            .of(down),
+            _ => Vec::new(),
+        }
     }
 
     fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Undecided) {
@@ -1283,6 +1484,7 @@ impl<'a> Walk<'a, '_> {
     /// a loop, at the line of the function under each key.
     fn table(&mut self, placed: &Placed<'a>, end: &LabelledEnd, keys: Vec<TableKey>) {
         let file = relative(self.root, placed.file);
+        let instances = self.instances(std::slice::from_ref(placed));
         for entry in keys {
             if self
                 .label
@@ -1313,6 +1515,11 @@ impl<'a> Walk<'a, '_> {
                 payload: None,
                 handler: Some(entry.handler),
                 method: None,
+                receiver: self.receiver.clone(),
+                reached: self.reached,
+                instances: instances.clone(),
+                composed: Vec::new(),
+                composed_trimmed: false,
             });
         }
     }
@@ -1366,7 +1573,36 @@ pub fn decided_sites(
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
 ) -> Decided {
+    decide(inputs, root, discovered, labels, None, &[])
+}
+
+/// [`decided_sites`] with the receiver trace on (carrick#2474 R2a): each
+/// site also names the instance its labelled call is made on, walked to the
+/// makers the store labels (`makers`), one end per caller that hands one in
+/// ([`DecidedSite::instances`]), through the scopes the store's scope
+/// members open (`scopes`), and the full path it is served at under them
+/// and the mounts ([`DecidedSite::composed`], R2b).
+pub fn decided_sites_traced(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    discovered: &[DiscoverySite],
+    labels: &[SiteLabel],
+    makers: &[MakerLabel],
+    scopes: &[ScopeLabel],
+) -> Decided {
+    decide(inputs, root, discovered, labels, Some(makers), scopes)
+}
+
+fn decide(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    discovered: &[DiscoverySite],
+    labels: &[SiteLabel],
+    makers: Option<&[MakerLabel]>,
+    scopes: &[ScopeLabel],
+) -> Decided {
     let calls = Calls::index(inputs);
+    let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
     // still holds a parameter is decided by those callers, which discovery
@@ -1381,15 +1617,34 @@ pub fn decided_sites(
     let mut unplaced: Vec<String> = Vec::new();
     let mut walk = Walk {
         calls: &calls,
+        inputs,
         root,
+        makers,
+        scopes,
+        index: index.as_ref(),
         out: &mut out,
         seen: HashSet::new(),
         label: None,
+        receiver: None,
+        reached: None,
     };
     for site in discovered {
         let Some(end) = &site.end else {
             continue;
         };
+        walk.receiver = site.receiver.clone();
+        walk.reached = site.reached;
+        // An end discovery keeps with a stop is one of the labelled exports
+        // a callee's disagreeing values reach (carrick#2432): the call is a
+        // lead, named by none of them.
+        if site.stop.is_some() {
+            if let Some(placed) =
+                calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+            {
+                walk.lead(&placed, end, Undecided::SeveralValues);
+            }
+            continue;
+        }
         let Some(label) = SiteLabel::find(labels, end) else {
             // A call that hands a maker the function it runs
             // (carrick#2426): the function holds the request, found at its
@@ -1416,9 +1671,18 @@ pub fn decided_sites(
             unplaced.push(format!("{}:{}", site.file, site.line));
             continue;
         };
+        // A call above the labelled call, when that call is the site.
+        let through_to_last = |walk: &mut Walk<'_, '_>| {
+            if let Some(chain) = place_chain(&calls, root, site, &last)
+                && let Some(through) = through(inputs, root, &chain, chain.len() - 1)
+            {
+                walk.out.through.push(through);
+            }
+        };
         let Some(slot) = &label.name else {
             // The label names no slot: the labelled call is the site.
             walk.site(&[last], end, Vec::new(), BTreeSet::new());
+            through_to_last(&mut walk);
             continue;
         };
         let table = tables
@@ -1432,6 +1696,26 @@ pub fn decided_sites(
         let at_end = slot_value(last.call, slot);
         if walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
+            through_to_last(&mut walk);
+            continue;
+        }
+        // The site's call runs, as a value, the function that makes the
+        // labelled call (carrick#2432): its arguments fill that function's
+        // own parameters, which no call-graph caller does.
+        if let [hop] = site.chain.as_slice()
+            && hop.function == VALUE_HOP
+            && !at_end.iter().any(|piece| matches!(piece, Piece::Outer(..)))
+            && let Some(first) =
+                calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+        {
+            let value = filled(&at_end, first.call);
+            let down = [first, last];
+            if walk.settles(&first, &value, end) {
+                walk.site(&down, end, value, parameter_positions(&at_end));
+            } else {
+                walked.push(format!("{}:{}", site.file, site.line));
+                walk.up(&down, &value, end, &mut Vec::new());
+            }
             continue;
         }
         let Some(chain) = place_chain(&calls, root, site, &last) else {
@@ -1467,6 +1751,19 @@ pub fn decided_sites(
                     .is_none_or(|pieces| !walk.settles(&chain[1], pieces, end));
             if below_open {
                 walk.site(&chain, end, top, args[0].clone());
+            } else {
+                // The site is the lowest call whose value still settles.
+                let to = (1..n)
+                    .take_while(|&k| {
+                        values[k]
+                            .as_ref()
+                            .is_some_and(|pieces| walk.settles(&chain[k], pieces, end))
+                    })
+                    .last()
+                    .unwrap_or(0);
+                if let Some(through) = through(inputs, root, &chain, to) {
+                    walk.out.through.push(through);
+                }
             }
             continue;
         }
@@ -1479,12 +1776,25 @@ pub fn decided_sites(
             walk.up(&chain, &top, end, &mut Vec::new());
         }
     }
+    let mounts = match (makers, &index) {
+        (Some(makers), Some(index)) => {
+            let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
+            for site in &mut out.sites {
+                (site.composed, site.composed_trimmed) =
+                    composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
+            }
+            mounts
+        }
+        _ => Vec::new(),
+    };
     walked.sort();
     walked.dedup();
     out.walked = walked;
     out.unplaced = unplaced;
     out.ran.sort();
     out.reserved.sort();
+    out.through.sort();
+    out.through.dedup();
     out.sites.sort_by(|a, b| {
         (&a.file, a.line, &a.key, &a.end.file, a.end.line).cmp(&(
             &b.file,
@@ -1496,6 +1806,18 @@ pub fn decided_sites(
     });
     out.leads
         .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    if let (Some(makers), Some(index)) = (makers, &index) {
+        out.boundaries = boundaries::Collect {
+            calls: &calls,
+            inputs,
+            root,
+            makers,
+            scopes,
+            index,
+            mounts: &mounts,
+        }
+        .of(&out, labels);
+    }
     out
 }
 
@@ -1913,6 +2235,7 @@ pub(crate) mod tests {
                     handler: None,
                     reserved: Vec::new(),
                     runs: None,
+                    request: None,
                     method: Some(MethodLabel {
                         from: None,
                         default: None,
@@ -1931,6 +2254,7 @@ pub(crate) mod tests {
                     handler: None,
                     reserved: Vec::new(),
                     runs: None,
+                    request: None,
                     method: Some(MethodLabel {
                         from: Some(ArgSlot {
                             arg: 1,
@@ -2346,7 +2670,13 @@ pub(crate) mod tests {
                     lead.reason
                 ))
                 .collect::<Vec<_>>(),
-            vec![("api.ts".to_string(), 10, Undecided::NameNeverBound)]
+            vec![
+                ("api.ts".to_string(), 10, Undecided::NameNeverBound),
+                // A callee whose values reach two labelled exports
+                // (carrick#2432): one lead per export, at the call.
+                ("values.ts".to_string(), 32, Undecided::SeveralValues),
+                ("values.ts".to_string(), 32, Undecided::SeveralValues),
+            ]
         );
     }
 
@@ -2356,6 +2686,17 @@ pub(crate) mod tests {
     fn a_name_nothing_binds_is_a_possible_call() {
         let decided = decided();
         let found = crate::possible_calls::from_sites(&decided, &[]);
+        // The others are a callee whose values disagree (carrick#2432).
+        let (found, values): (Vec<_>, Vec<_>) = found
+            .into_iter()
+            .partition(|call| !call.file_path.ends_with("values.ts"));
+        assert!(
+            values
+                .iter()
+                .all(|call| call.unread.reason
+                    == crate::possible_calls::UnreadReason::InjectedCallee),
+            "{values:?}"
+        );
         assert_eq!(found.len(), 1, "{found:?}");
         let call = &found[0];
         assert_eq!(call.file_path.trim_start_matches(WEB), "api.ts");
@@ -2395,9 +2736,17 @@ pub(crate) mod tests {
             ("pages/b.ts:4", Some("/b")),
             ("pages/c.ts:4", Some("/c")),
             ("pages/things.ts:4", Some("/v1/things")),
+            // A callee that is a value, followed to the labelled export it
+            // holds (carrick#2432): at the call that runs it, and at each
+            // caller that hands a different one.
+            ("passed-in.ts:2", Some("/defaulted")),
             ("presence.ts:4", Some("user.joined")),
             ("store.ts:3", Some("/settings")),
             ("traced-load.ts:4", Some("/traced")),
+            ("values.ts:6", Some("/api/events")),
+            ("values.ts:19", Some("/api/sync")),
+            ("values.ts:36", Some("/api/a")),
+            ("values.ts:40", Some("/api/b")),
         ];
         let mut got: Vec<(String, Option<String>)> = sites;
         got.sort();
@@ -2431,7 +2780,11 @@ pub(crate) mod tests {
             names.sort();
             names
         };
-        let only_chain = |name: &(String, u32, Option<String>)| name.0.ends_with("presence.ts");
+        // Discovery's chain alone reaches a member of a call's result, and
+        // a caller that hands a callee its value (carrick#2432).
+        let only_chain = |name: &(String, u32, Option<String>)| {
+            name.0.ends_with("presence.ts") || (name.0.ends_with("values.ts") && name.1 >= 36)
+        };
         let mut expected = names(&full);
         expected.retain(|name| !only_chain(name));
         assert_eq!(names(&walked), expected);
@@ -2443,7 +2796,12 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             leads,
-            vec![("api.ts".to_string(), 10), ("session.ts".to_string(), 7)]
+            vec![
+                ("api.ts".to_string(), 10),
+                ("session.ts".to_string(), 7),
+                ("values.ts".to_string(), 32),
+                ("values.ts".to_string(), 32),
+            ]
         );
         assert!(!walked.walked.is_empty());
     }
@@ -2506,6 +2864,8 @@ pub(crate) mod tests {
             end: Some(end),
             chain: Vec::new(),
             stop: None,
+            receiver: None,
+            reached: None,
         };
         let answer: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
@@ -2632,6 +2992,7 @@ pub(crate) mod tests {
             handler: handler.map(|arg| ArgSlot { arg, key: None }),
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: None,
         }
     }
@@ -2650,6 +3011,7 @@ pub(crate) mod tests {
             handler: None,
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: Some(MethodLabel {
                 from: Some(ArgSlot {
                     arg: 1,
@@ -2676,6 +3038,7 @@ pub(crate) mod tests {
             handler: None,
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: None,
         }
     }
@@ -2708,6 +3071,8 @@ pub(crate) mod tests {
             end: Some(end.clone()),
             chain: Vec::new(),
             stop: None,
+            receiver: None,
+            reached: None,
         }
     }
 
@@ -2794,6 +3159,8 @@ pub(crate) mod tests {
                 },
             ],
             stop: None,
+            receiver: None,
+            reached: None,
         };
         let decided = decided_sites(&inputs, &root, &[site], &[send]);
         assert_eq!(
@@ -3174,6 +3541,7 @@ pub(crate) mod tests {
             handler: None,
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: Some(MethodLabel {
                 from: None,
                 default: None,

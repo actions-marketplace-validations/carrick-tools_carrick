@@ -80,7 +80,7 @@ jobs:
             partitioned: --test local_mode_test
             partition: slice:2/2
             targets: >-
-              --test socket_namespace_test --test new_url_target_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test
+              --test socket_namespace_test --test new_url_target_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test --test final_loss_scan_test
           - shard: n3
             runner: nextest
             partitioned: --test local_mode_test
@@ -92,13 +92,13 @@ jobs:
             partitioned: --test call_through_rows_test
             partition: slice:2/3
             targets: >-
-              --test shadowed_binding_test --test library_store_test --test site_questions_test --test site_row_span_test --test graphql_declared_result_types_test --test nested_service_walk_test --test graphql_code_first_resolvers_test --test wrapper_chain_const_url_test --test service_derivation_test --test llm_mock_pipeline_test --test extraction_config_test
+              --test shadowed_binding_test --test library_store_test --test site_questions_test --test site_row_span_test --test fact_files_test --test row_call_edges_test --test site_caller_fold_test --test runtime_globals_test --test injected_callee_test --test graphql_declared_result_types_test --test nested_service_walk_test --test graphql_code_first_resolvers_test --test wrapper_chain_const_url_test --test service_derivation_test --test llm_mock_pipeline_test --test extraction_config_test
           - shard: n5
             runner: nextest
             partitioned: --test call_through_rows_test
             partition: slice:3/3
             targets: >-
-              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test composed_strings_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test --test class_client_construction_test
+              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test composed_strings_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test --test class_client_construction_test
           - shard: n6
             runner: nextest
             partitioned: --test call_through_rows_test
@@ -112,7 +112,7 @@ jobs:
           - shard: n8
             runner: nextest
             targets: >-
-              --test retype_consumer_test --test socket_type_alias_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test alias_import_callers_test --test receiver_type_classification_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test workspace_package_client_test
+              --test retype_consumer_test --test unwidened_budget_test --test socket_type_alias_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test alias_import_callers_test --test receiver_type_classification_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test workspace_package_client_test
           - shard: n9
             runner: nextest
             targets: >-
@@ -140,7 +140,7 @@ jobs:
           - shard: steps
             runner: steps
             targets: >-
-              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test
+              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -436,6 +436,11 @@ jobs:
 
       - name: Dry-run the release steps with a failed and a passed lister
         run: bash scripts/release-artifacts.test.sh
+
+      # The release's glibc floor check (scripts/glibc-floor.sh, carrick#2218)
+      # against stubbed objdump output: it must fail a binary above the floor.
+      - name: The glibc floor check fails a binary above the floor
+        run: bash scripts/glibc-floor.test.sh
 
   wasm-match:
     name: carrick-match wasm smoke

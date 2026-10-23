@@ -120,7 +120,7 @@ pub struct ExportClaims {
     /// Label v2: the type-only packages whose declarations this package's
     /// surface re-exports (`@types/<name>` and types-only core packages). A
     /// declaration found in one of them is this package's
-    /// ([`runtime_package_of`]).
+    /// ([`runtime_packages_of`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_packages: Vec<String>,
     #[serde(default)]
@@ -133,17 +133,33 @@ pub struct ExportClaims {
     pub patterns: Vec<String>,
 }
 
-/// The package a declaration found in `declaring` stands for: the package
-/// whose answered `type_packages` lists it, or, by the DefinitelyTyped
-/// convention, the package an `@types/*` name types. Anything else is itself.
-pub fn runtime_package_of(declaring: &str, exports: &[ExportClaims]) -> String {
-    if let Some(export) = exports
+/// The packages a declaration found in `declaring` stands for: every package
+/// whose answered `type_packages` lists it, in answer order, or, when none
+/// does, by the DefinitelyTyped convention, the package an `@types/*` name
+/// types. Anything else is itself.
+///
+/// A type-only package is often in several packages' lists: a package whose
+/// surface extends another's types lists the other's type packages too. Each
+/// of them is a package the declaration may stand for, and the store's labels
+/// on any of them may name it; which one holds is the verifier's to judge, so
+/// none is picked here (carrick#2661: the first match took a package's own
+/// declarations away from it).
+pub fn runtime_packages_of(declaring: &str, exports: &[ExportClaims]) -> Vec<String> {
+    let mut packages: Vec<String> = Vec::new();
+    for export in exports
         .iter()
-        .find(|export| export.type_packages.iter().any(|types| types == declaring))
+        .filter(|export| export.type_packages.iter().any(|types| types == declaring))
     {
-        return export.package.clone();
+        if !packages.contains(&export.package) {
+            packages.push(export.package.clone());
+        }
     }
-    crate::engine::type_compat_v2::types_package_runtime_name(declaring)
+    if packages.is_empty() {
+        packages.push(crate::engine::type_compat_v2::types_package_runtime_name(
+            declaring,
+        ));
+    }
+    packages
 }
 
 /// The roles whose rows this module writes.
@@ -162,6 +178,20 @@ impl ExportClaims {
     /// dropped. Scope claims are left out: no reader reads the receivers a
     /// scope returns yet (carrick#1678).
     pub fn claims_by_id(&self) -> Vec<(String, &LibraryClaim)> {
+        self.by_id(false)
+    }
+
+    /// [`Self::claims_by_id`] with the scope claims in too
+    /// (`<prefix>:scope:<path.member>:name@<slot>:<binds>[:on/of…]`, where
+    /// `<binds>` is `runs@<slot>><param>`, `mounts@<slot>` or `returns` and
+    /// a slot is `<arg>` or `<arg>.<key>`): what the receiver trace sends in
+    /// its own request (carrick#2474 R2b, carrick#1678), never the library
+    /// check's.
+    pub fn claims_with_scopes_by_id(&self) -> Vec<(String, &LibraryClaim)> {
+        self.by_id(true)
+    }
+
+    fn by_id(&self, scopes: bool) -> Vec<(String, &LibraryClaim)> {
         let prefix = format!(
             "{}@{}:{}",
             self.specifier,
@@ -171,6 +201,9 @@ impl ExportClaims {
         let mut stated: Vec<(String, &LibraryClaim)> = Vec::new();
         let mut twice: HashSet<String> = HashSet::new();
         for claim in &self.claims {
+            if !scopes && matches!(claim, LibraryClaim::Scope { .. }) {
+                continue;
+            }
             let Some(id) = claim_id(&prefix, claim) else {
                 continue;
             };
@@ -287,7 +320,7 @@ fn same_form(form: MakeForm, site: MakerForm) -> bool {
     )
 }
 
-/// The id of one claim under `prefix`; `None` for a scope claim.
+/// The id of one claim under `prefix`.
 fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
     let hops = |path: &[String], member: Option<&str>| {
         let mut hops: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -334,7 +367,51 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             hops(path, Some(member)),
             selector(on, of)
         )),
-        LibraryClaim::Scope { .. } => None,
+        LibraryClaim::Scope {
+            member,
+            name,
+            path,
+            on,
+            of,
+            runs,
+            yields,
+            mounts,
+            ..
+        } => {
+            // What it binds (carrick#2474 R0's fields): two scope claims of
+            // one member on one receiver that read different slots are two
+            // claims (carrick#2474 R2b).
+            let binds = match (runs, yields, mounts) {
+                (Some(runs), Some(yields), None) => {
+                    format!("runs@{}>{}", slot(runs), yields.param)
+                }
+                (None, None, Some(mounts)) => format!("mounts@{}", slot(mounts)),
+                (None, None, None) => "returns".to_string(),
+                (runs, yields, mounts) => format!(
+                    "runs@{}>{}:mounts@{}",
+                    runs.as_ref().map(slot).unwrap_or_default(),
+                    yields
+                        .as_ref()
+                        .map(|yields| yields.param.to_string())
+                        .unwrap_or_default(),
+                    mounts.as_ref().map(slot).unwrap_or_default()
+                ),
+            };
+            Some(format!(
+                "{prefix}:scope:{}:name@{}:{binds}{}",
+                hops(path, Some(member)),
+                slot(name),
+                selector(on, of)
+            ))
+        }
+    }
+}
+
+/// A slot as a claim id spells it: `<arg>` or `<arg>.<key>`.
+fn slot(slot: &ClaimSlot) -> String {
+    match &slot.key {
+        Some(key) => format!("{}.{key}", slot.arg),
+        None => slot.arg.to_string(),
     }
 }
 
@@ -965,15 +1042,47 @@ mod tests {
         core.type_packages = vec!["fixture-server-core-types".into()];
         let exports = vec![core];
         assert_eq!(
-            runtime_package_of("fixture-server-core-types", &exports),
-            "fixture-server"
+            runtime_packages_of("fixture-server-core-types", &exports),
+            ["fixture-server"]
         );
         assert_eq!(
-            runtime_package_of("@types/scope__name", &exports),
-            "@scope/name"
+            runtime_packages_of("@types/scope__name", &exports),
+            ["@scope/name"]
         );
-        assert_eq!(runtime_package_of("@types/plain", &[]), "plain");
-        assert_eq!(runtime_package_of("other", &exports), "other");
+        assert_eq!(runtime_packages_of("@types/plain", &[]), ["plain"]);
+        assert_eq!(runtime_packages_of("other", &exports), ["other"]);
+    }
+
+    /// A type-only package two packages list (a middleware package whose
+    /// surface extends a server package's types lists the server's type
+    /// packages too) stands for both, in answer order, whichever comes
+    /// first (carrick#2661).
+    #[test]
+    fn a_type_only_package_two_packages_list_stands_for_both() {
+        let mut middleware = export(json!({
+            "package": "fixture-middleware", "version": "1.0.0", "specifier": "fixture-middleware",
+            "export": "default", "role": "server_framework"
+        }));
+        middleware.type_packages = vec![
+            "fixture-server-core-types".into(),
+            "fixture-middleware-types".into(),
+        ];
+        let mut server = export(json!({
+            "package": "fixture-server", "version": "4.0.0", "specifier": "fixture-server",
+            "export": "default", "role": "server_framework"
+        }));
+        server.type_packages = vec!["fixture-server-core-types".into()];
+        let mut router = server.clone();
+        router.export = "Router".into();
+        let exports = vec![middleware, server, router];
+        assert_eq!(
+            runtime_packages_of("fixture-server-core-types", &exports),
+            ["fixture-middleware", "fixture-server"]
+        );
+        assert_eq!(
+            runtime_packages_of("fixture-middleware-types", &exports),
+            ["fixture-middleware"]
+        );
     }
 
     fn bus() -> ExportClaims {
@@ -1037,6 +1146,44 @@ mod tests {
         assert_eq!(major("2.4.1"), "2");
         assert_eq!(major("^10.0.0"), "10");
         assert_eq!(major("latest"), "x");
+    }
+
+    /// carrick#2474 R2b: a scope claim's id names its name slot and what it
+    /// binds, so two scope claims on one member and one receiver that read
+    /// different slots (`use(router)` and `use("/p", router)`) are two
+    /// claims, each asked and verified on its own, and neither drops the
+    /// other as stated twice.
+    #[test]
+    fn scope_claims_on_one_member_are_told_apart_by_slot_and_binding() {
+        let server = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "Server", "role": "server_framework",
+            "claims": [
+                { "kind": "scope", "member": "use", "of": "instance:new",
+                  "name": { "arg": 1 }, "mounts": { "arg": 0 } },
+                { "kind": "scope", "member": "use", "of": "instance:new",
+                  "name": { "arg": 0 }, "mounts": { "arg": 1 } },
+                { "kind": "scope", "member": "register", "of": "instance:new",
+                  "name": { "arg": 1, "key": "prefix" }, "runs": { "arg": 0 },
+                  "yields": { "param": 0, "export": "Server", "side": "server" } },
+                { "kind": "scope", "member": "basePath", "of": "instance:new",
+                  "name": { "arg": 0 } }
+            ]
+        }));
+        let ids: Vec<String> = server
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fixture-server@2:Server:scope:use:name@1:mounts@0:of:instance:new",
+                "fixture-server@2:Server:scope:use:name@0:mounts@1:of:instance:new",
+                "fixture-server@2:Server:scope:register:name@1.prefix:runs@0>0:of:instance:new",
+                "fixture-server@2:Server:scope:basePath:name@0:returns:of:instance:new",
+            ]
+        );
     }
 
     /// A verified send is a publisher row and a verified receive a

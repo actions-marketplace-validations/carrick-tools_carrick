@@ -1412,7 +1412,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if let Some(ref types_lost) = types_lost {
         headline.push_str(&format!("; {}", types_lost));
     }
-    let owing = runs.iter().filter(|run| !run.owed.is_empty()).count();
+    // A service whose only debt is files lost for good is complete
+    // (carrick#2488): the closing summary lists it as such.
+    let owing = runs
+        .iter()
+        .filter(|run| !run.owed.is_empty() && !run.owed.owes_only_final_files())
+        .count();
     if owing > 0 {
         headline.push_str(&format!("; {owing} service(s) pending model analysis"));
     }
@@ -3907,7 +3912,12 @@ async fn analyze_current_repo_incremental(
                 Path::new(repo_path),
                 ask_turns.clone(),
             );
-            let (analysis, (settled, placements), library_answer) = tokio::join!(
+            let (early_answer, first_answer) = tokio::sync::oneshot::channel();
+            let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
+            let file_orchestrator = file_orchestrator.with_fact_files(
+                crate::agents::file_orchestrator::FactFileSource::later(fact_files),
+            );
+            let (analysis, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3929,8 +3939,16 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                settled_library_answer(library_ask.as_ref()),
+                settled_library_answer(library_ask.as_ref(), early_answer),
+                fact_files_of(
+                    library_ask.as_ref(),
+                    first_answer,
+                    &request_inputs,
+                    Path::new(repo_path),
+                    fact_sender,
+                ),
             );
+            report_fallbacks(fallbacks, analysis.as_ref().ok().map(|done| &done.stats));
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
@@ -3994,6 +4012,14 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             protocol_extractions.library = library;
+            let declarations = member_declarations(
+                crate::site_questions::enabled()
+                    && crate::request_summary::discovery::receiver_trace_enabled(),
+                &request_inputs,
+                &claims,
+                sidecar,
+                &semantics_root,
+            );
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
                 &request_inputs,
@@ -4003,6 +4029,8 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
+                    prior: first_discovery.as_ref(),
+                    declarations: declarations.as_ref(),
                 },
             )
             .await;
@@ -4014,6 +4042,8 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
+                    prior: first_discovery.as_ref(),
+                    declarations: declarations.as_ref(),
                 },
             );
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -4775,20 +4805,18 @@ impl LibraryAsk {
         let home = dirs::home_dir();
         let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
         let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
-        let asked = crate::library_store::request(
-            &specifiers,
-            &crate::library_store::Install {
-                service_root,
-                repo_root,
-                home: home.as_deref(),
-                yarn_registry_env: yarn_registry_env.as_deref(),
-                npm_registry_env: npm_registry_env.as_deref(),
-            },
-        );
+        let install = crate::library_store::Install {
+            service_root,
+            repo_root,
+            home: home.as_deref(),
+            yarn_registry_env: yarn_registry_env.as_deref(),
+            npm_registry_env: npm_registry_env.as_deref(),
+        };
+        let asked = crate::library_store::request(&specifiers, &install);
         // The language's own library (carrick#2504): the default-library
         // files the compiler read the code's globals from, asked only with
         // site questions on.
-        let library = match inputs
+        let mut library = match inputs
             .positions
             .as_ref()
             .map(|p| p.default_library_globals())
@@ -4798,6 +4826,14 @@ impl LibraryAsk {
             }
             _ => Vec::new(),
         };
+        // And the runtime's own (carrick#2445): the globals its types
+        // declare, for a program that loads no DOM library.
+        if site_questions {
+            library.extend(crate::library_store::runtime_global_packages(
+                &crate::request_summary::discovery::runtime_globals(inputs),
+                &install,
+            ));
+        }
         let asked = crate::library_store::Asked::with_default_library(asked, library)?
             .with_roles(crate::library_store::roles_for(site_questions));
         Some(Self {
@@ -4845,18 +4881,89 @@ fn library_turn(
 /// to [`crate::library_store::WAIT_CAP`] from the first ask (carrick#2496).
 /// Run beside the analysis, so a scan whose analysis outlasts the builds
 /// waits nothing more.
-async fn settled_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::Settled {
+async fn settled_library_answer(
+    ask: Option<&LibraryAsk>,
+    early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
+) -> crate::library_store::Settled {
     match ask {
         Some(ask) => {
             crate::library_store::ask_until_settled(
                 &ask.asked,
                 |request| library_turn(&ask.turns)(request),
                 send_to_library_store,
+                Some(early),
             )
             .await
         }
         None => crate::library_store::Settled::default(),
     }
+}
+
+/// Run discovery on the store's first answer and tell the file reader's
+/// orchestrator which files the fact layer would send it (carrick#2613,
+/// record-only). Always sends: `None` when the scan records nothing here
+/// (site questions off, nothing asked, no compiler rows), so the orchestrator
+/// never waits on a sender that is gone. The walk is returned, so the site
+/// questions reuse it when the settled answer equals the first.
+async fn fact_files_of(
+    ask: Option<&LibraryAsk>,
+    first: tokio::sync::oneshot::Receiver<crate::library_store::FirstAnswer>,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    sender: tokio::sync::oneshot::Sender<Option<crate::request_summary::fact_files::FactFiles>>,
+) -> Option<FirstDiscovery> {
+    let recorded = match ask {
+        Some(ask) if crate::site_questions::enabled() && inputs.positions.is_some() => {
+            first.await.ok().map(|answer| (ask, answer))
+        }
+        _ => None,
+    };
+    let Some((ask, answer)) = recorded else {
+        let _ = sender.send(None);
+        return None;
+    };
+    let (facts, first) = first_discovery(&ask.sites, answer, inputs, root);
+    let _ = sender.send(Some(facts));
+    Some(first)
+}
+
+/// Discovery run on the store's first `answer`, and the files the fact layer
+/// would send the reader from it ([`crate::request_summary::fact_files`]).
+fn first_discovery(
+    library: &crate::request_summary::LibrarySites,
+    answer: crate::library_store::FirstAnswer,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+) -> (
+    crate::request_summary::fact_files::FactFiles,
+    FirstDiscovery,
+) {
+    // With the packages answered, so a call into one the store has not
+    // answered is told apart (`unanswered_package`) from a call it answered
+    // with nothing to label.
+    let labels =
+        crate::request_summary::discovery::Labels::of_answered(&answer.exports, &answer.answered);
+    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
+    let decided = crate::request_summary::decided_sites::decided_sites(
+        inputs,
+        root,
+        &discovered_sites(&discovery),
+        &crate::request_summary::decided_sites::SiteLabel::from_exports(&answer.exports),
+    );
+    let facts = crate::request_summary::fact_files::FactFiles::of(
+        &discovery,
+        &decided,
+        Some(library),
+        &answer,
+        root,
+    );
+    (
+        facts,
+        FirstDiscovery {
+            exports: answer.exports,
+            discovery,
+        },
+    )
 }
 
 /// The service's library rows: its library sites read through the claims
@@ -4911,6 +5018,7 @@ async fn site_rows_of(
         decided,
         records,
         labels: site_labels,
+        handlers,
     } = site_records_of(inputs, root, claims, context);
     let answers = crate::site_questions::ask_service(
         &crate::site_questions::agent(),
@@ -4920,6 +5028,13 @@ async fn site_rows_of(
     )
     .await;
     let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
+    // With the receiver trace on, the routes hand-written dispatch chooses
+    // (carrick#2474 R4b) join the site rows before the fold.
+    if let Some((handlers, built)) = &handlers {
+        let dispatch = dispatch_rows_of(handlers, *built, repo_path, service).await;
+        rows.rows.extend(dispatch.rows);
+        rows.leads.extend(dispatch.leads);
+    }
     rows.rows.retain(|row| {
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
@@ -4983,6 +5098,64 @@ fn site_payloads_of(
 struct SiteContext<'a> {
     placements: Option<&'a crate::request_summary::decided_sites::SummaryPlacements>,
     library: Option<&'a crate::request_summary::LibrarySites>,
+    /// The walk made on the store's first answer, read again when the settled
+    /// answer is the same (carrick#2613).
+    prior: Option<&'a FirstDiscovery>,
+    /// With the receiver trace on (carrick#2474 R1): the member
+    /// declarations verified op claims resolve to ([`member_declarations`]).
+    /// `None` leaves discovery as it was.
+    declarations: Option<&'a crate::request_summary::discovery::MemberDeclarations>,
+}
+
+/// Discovery run on the library store's first answer, before the file reader
+/// dispatched (carrick#2613), with the answer it read. The site questions read
+/// it instead of walking again when the settled answer equals it.
+#[derive(Debug)]
+struct FirstDiscovery {
+    exports: Vec<crate::library_claims::ExportClaims>,
+    discovery: crate::request_summary::discovery::Discovery,
+}
+
+/// The receiver trace's member declarations (carrick#2474 R1): one more
+/// verify request, beside the library rows', for each labelled op claim whose
+/// member a `call` row of that package names, on every receiver the claim
+/// applies to ([`crate::request_summary::discovery::declaration_ask`]). It
+/// runs under the library checks' time limit; the checks it does not reach
+/// are counted. `None` unless `enabled` (`CARRICK_RECEIVER_TRACE=1` with site
+/// questions on) and the service has rows. No sidecar, or a failed request,
+/// indexes nothing; the trace still records each site's receiver.
+fn member_declarations(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    claims: &[crate::library_claims::ExportClaims],
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> Option<crate::request_summary::discovery::MemberDeclarations> {
+    use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
+    if !enabled || inputs.positions.is_none() {
+        return None;
+    }
+    let ask = declaration_ask(inputs, claims);
+    let verdicts = match sidecar {
+        Some(sidecar) if !ask.checks.is_empty() => {
+            match sidecar.verify_library_claims(from_dir, &ask.checks) {
+                Ok(answer) => answer.verdicts,
+                Err(error) => {
+                    warn!(%error, "receiver trace: the declaration ask failed; none indexed");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let declarations = MemberDeclarations::of(&ask, &verdicts);
+    debug!(
+        checks = declarations.checks,
+        not_reached = declarations.not_reached,
+        declarations = declarations.len(),
+        "receiver trace: member declarations"
+    );
+    Some(declarations)
 }
 
 /// What a service's site questions read before anything is asked
@@ -4996,6 +5169,27 @@ struct SiteRecordsOf {
     decided: crate::request_summary::decided_sites::Decided,
     records: Vec<crate::request_summary::site_record::SiteRecord>,
     labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
+    /// With the receiver trace on: the handler records (carrick#2474 R4b)
+    /// and how long building them took.
+    handlers: Option<(
+        crate::request_summary::dispatch::HandlerRecords,
+        std::time::Duration,
+    )>,
+}
+
+/// `discovery`'s sites as the decided-sites pass reads them.
+fn discovered_sites(
+    discovery: &crate::request_summary::discovery::Discovery,
+) -> Vec<crate::request_summary::decided_sites::DiscoverySite> {
+    discovery
+        .sites
+        .iter()
+        .filter_map(|site| {
+            serde_json::to_value(site)
+                .and_then(serde_json::from_value)
+                .ok()
+        })
+        .collect()
 }
 
 /// The site labels the settled `claims` give, of every role the store was
@@ -5008,25 +5202,64 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
-    let labels = crate::request_summary::discovery::Labels::of(claims);
-    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
+    let walked;
+    // A walk made without the trace is not the walk the trace asks for.
+    let prior = context
+        .prior
+        .filter(|prior| prior.exports == claims && context.declarations.is_none());
+    let discovery = match prior {
+        Some(prior) => &prior.discovery,
+        None => {
+            let labels = match context.declarations {
+                Some(declarations) => {
+                    crate::request_summary::discovery::Labels::traced(claims, declarations)
+                }
+                None => crate::request_summary::discovery::Labels::of(claims),
+            };
+            walked = crate::request_summary::discovery::discover(inputs, &labels, root);
+            &walked
+        }
+    };
     let reached_label = discovery
         .sites
         .iter()
         .filter(|site| site.end.is_some())
         .count();
-    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> = discovery
-        .sites
-        .iter()
-        .filter_map(|site| {
-            serde_json::to_value(site)
-                .and_then(serde_json::from_value)
-                .ok()
-        })
-        .collect();
+    let discovered = discovered_sites(discovery);
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
-    let mut decided =
-        crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
+    // With the receiver trace on, each request handler's path and method
+    // comparisons, as the records the handler questions ask (carrick#2474
+    // R4b).
+    let handlers = context.declarations.map(|_| {
+        let started = std::time::Instant::now();
+        let records = crate::request_summary::dispatch::handler_records(
+            inputs,
+            &discovered,
+            &labels,
+            root,
+            crate::request_summary::dispatch::HoleReach::Nested,
+        );
+        (records, started.elapsed())
+    });
+    // With the receiver trace on, each site also names its instance
+    // (carrick#2474 R2a) and the full path it is served at under the scope
+    // members the trace's own request verified (R2b): read by nothing.
+    let mut decided = match context.declarations {
+        Some(declarations) => crate::request_summary::decided_sites::decided_sites_traced(
+            inputs,
+            root,
+            &discovered,
+            &labels,
+            &crate::request_summary::decided_sites::MakerLabel::from_exports(claims),
+            &crate::request_summary::decided_sites::ScopeLabel::from_exports(
+                claims,
+                &declarations.verified_scopes,
+            ),
+        ),
+        None => {
+            crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels)
+        }
+    };
     let yielded = context
         .placements
         .map_or(0, |placed| decided.yield_to_summaries(root, placed));
@@ -5048,7 +5281,60 @@ fn site_records_of(
         decided,
         records,
         labels,
+        handlers,
     }
+}
+
+/// The dispatch rows of a service's handler records (carrick#2474 R4b): the
+/// records that ask a comparison asked in requests of their own, and the
+/// answers and the code's settled values read into rows and possible calls
+/// ([`crate::site_rows::dispatch`]). One run-log summary line per service.
+async fn dispatch_rows_of(
+    records: &crate::request_summary::dispatch::HandlerRecords,
+    built: std::time::Duration,
+    repo_path: &str,
+    service: &Config,
+) -> crate::site_rows::dispatch::DispatchRows {
+    let started = std::time::Instant::now();
+    let answers = crate::site_questions::ask_handlers_service(
+        &crate::site_questions::agent(),
+        &get_repository_name(repo_path),
+        service.service_name.as_deref(),
+        crate::site_rows::dispatch::handler_questions(records),
+    )
+    .await;
+    let rows = crate::site_rows::dispatch::dispatch_rows(records, &answers);
+    let read = |what: &str| records.counts.get(what).copied().unwrap_or_default() as u64;
+    let made = |what: &str| rows.counts.get(what).copied().unwrap_or_default() as u64;
+    let mut leads_by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for lead in &rows.leads {
+        let reason = serde_json::to_value(lead.unread.reason)
+            .ok()
+            .and_then(|reason| reason.as_str().map(str::to_string))
+            .unwrap_or_default();
+        *leads_by_reason.entry(reason).or_default() += 1;
+    }
+    debug!(
+        records = read("records"),
+        shared = read("records_shared"),
+        asked_records = read("records_asked"),
+        asked = read("asked"),
+        forced = read("forced"),
+        no_method = read("no_method"),
+        holes = read("holes"),
+        not_attached = records.not_attached.values().sum::<usize>() as u64,
+        requests = answers.requests as u64,
+        unanswered_records = made("records_unanswered"),
+        rows_fact = made("rows_fact"),
+        rows_model = made("rows_model"),
+        not_a_route = made("not_a_route"),
+        leads = rows.leads.len() as u64,
+        leads_by_reason = ?leads_by_reason,
+        ms = (built + started.elapsed()).as_millis() as u64,
+        "receiver trace: handler records"
+    );
+    rows
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
@@ -5510,6 +5796,8 @@ fn append_deterministic_protocol_operations(
             possible_calls = site.leads.len(),
             stated = site.stated.len(),
             withdrawn = site.withdrawn.len(),
+            through = extractions.site.through.len(),
+            through_folded = site.through_folded,
             "site questions: fold"
         );
     }
@@ -6624,6 +6912,7 @@ fn add_graphql_request_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
         v1_state_before_demotion: None,
@@ -6871,6 +7160,7 @@ fn add_protocol_manifest_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
         v1_state_before_demotion: None,
@@ -7710,6 +8000,17 @@ fn run_capture_for_service(
     }
     if let Some(manifest) = cloud_data.type_manifest.as_mut() {
         stamp_response_modes(manifest, &type_resolution.inferred_types);
+        let out_of_budget =
+            stamp_unwidened_out_of_budget(manifest, &type_resolution.inferred_types);
+        if out_of_budget > 0 {
+            debug!(
+                "Unwidened reading ran out of its budget: {out_of_budget} producer response(s) judged without it"
+            );
+        }
+        crate::scan_health::record_time_limit(
+            crate::time_limits::TimeLimit::UnwidenedReading,
+            out_of_budget,
+        );
     }
 
     // Literal texts for the last-resort backfill re-anchor: when capture
@@ -8358,6 +8659,20 @@ fn discover_with_positions(
             service.service_name.as_deref().unwrap_or("(root)"),
             row_calls.describe()
         );
+        // Member calls on a receiver a call initialised take their target
+        // from the `call` row where resolution by name stated none
+        // (carrick#2615).
+        let added = crate::call_graph::add_row_edges(
+            &mut all_function_definitions,
+            &per_file_calls,
+            &keys,
+            &request_inputs.sites,
+            |file, lo, hi| request_inputs.call_target(file, lo, hi),
+        );
+        debug!(
+            "Call edges the position rows added for service {}: {added}",
+            service.service_name.as_deref().unwrap_or("(root)")
+        );
     }
 
     debug!(
@@ -8456,12 +8771,25 @@ fn summarize_requests(
         summaries.unfollowed_count(),
         serde_json::to_string(summaries.unfollowed()).unwrap_or_default()
     );
-    crate::fallback_tally::report(&crate::fallback_tally::ServiceFallbacks::of(
-        crate::current_service::name(),
-        inputs,
-        &summaries,
-    ));
     summaries
+}
+
+/// State the service's fallbacks to the old path (`fallback_tally`), once its
+/// analysis is done: the summaries' own, and, when the fact layer chooses the
+/// reader's files, each register signal's candidates kept where discovery
+/// could not follow the call (`fallback_selection_<signal>`, carrick#2613).
+fn report_fallbacks(
+    mut fallbacks: crate::fallback_tally::ServiceFallbacks,
+    stats: Option<&crate::agents::file_orchestrator::ProcessingStats>,
+) {
+    if let Some(stats) = stats {
+        for (signal, count) in &stats.fallback_selection {
+            fallbacks
+                .counts
+                .insert(format!("fallback_selection_{signal}"), *count);
+        }
+    }
+    crate::fallback_tally::report(&fallbacks);
 }
 
 /// A service's library semantics while the in-scan schedule settles them
@@ -8626,14 +8954,19 @@ async fn compose_summaries(
 ) -> (
     Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
     crate::request_summary::decided_sites::SummaryPlacements,
+    crate::fallback_tally::ServiceFallbacks,
 ) {
     let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
     let placements = index.placements();
+    // Stated once the analysis is done ([`report_fallbacks`]), with what the
+    // reader's file selection fell back on.
+    let fallbacks =
+        crate::fallback_tally::ServiceFallbacks::of(crate::current_service::name(), inputs, &index);
     if summaries.send(index).is_err() {
         debug!("The analysis ended before its request summaries were composed");
     }
-    (settled, placements)
+    (settled, placements, fallbacks)
 }
 
 /// The library semantics one in-scan re-ask gives: what `ask` answered, when
@@ -9210,6 +9543,25 @@ fn stamp_response_modes(
             .get(entry.type_alias.as_str())
             .map(|(found, _)| found.clone());
     }
+}
+
+/// Mark each producer response entry whose published inference was owed an
+/// unwidened reading the sidecar ran out of time to make (carrick#2100), and
+/// return how many were marked. The check reads the mark to keep a mismatch
+/// judged on the widened type alone off the index.
+fn stamp_unwidened_out_of_budget(
+    manifest: &mut [TypeManifestEntry],
+    inferred: &[crate::services::type_sidecar::InferredType],
+) -> usize {
+    let spent = type_compat_v2::unwidened_out_of_budget_aliases(inferred);
+    let mut marked = 0;
+    for entry in manifest.iter_mut() {
+        entry.unwidened_out_of_budget = entry.role == ManifestRole::Producer
+            && entry.type_kind == ManifestTypeKind::Response
+            && spent.contains(entry.type_alias.as_str());
+        marked += usize::from(entry.unwidened_out_of_budget);
+    }
+    marked
 }
 
 /// The literal `key=value` pairs of a call target's query string
@@ -9797,6 +10149,7 @@ fn add_manifest_pair(
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
             v1_state_before_demotion: None,
@@ -10116,7 +10469,9 @@ async fn analyze_current_repo(
         Path::new(repo_path),
         ask_turns.clone(),
     );
-    let (analysis_result, (settled, placements), library_answer) = tokio::join!(
+    let (early_answer, first_answer) = tokio::sync::oneshot::channel();
+    let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
+    let (analysis_result, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -10129,6 +10484,7 @@ async fn analyze_current_repo(
             &service_modules,
             sidecar,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
+            crate::agents::file_orchestrator::FactFileSource::later(fact_files),
         ),
         compose_summaries(
             &request_inputs,
@@ -10137,7 +10493,18 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        settled_library_answer(library_ask.as_ref()),
+        settled_library_answer(library_ask.as_ref(), early_answer),
+        fact_files_of(
+            library_ask.as_ref(),
+            first_answer,
+            &request_inputs,
+            Path::new(repo_path),
+            fact_sender,
+        ),
+    );
+    report_fallbacks(
+        fallbacks,
+        analysis_result.as_ref().ok().map(|done| &done.stats),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
@@ -10186,6 +10553,14 @@ async fn analyze_current_repo(
     let (library, claims) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
+    let declarations = member_declarations(
+        crate::site_questions::enabled()
+            && crate::request_summary::discovery::receiver_trace_enabled(),
+        &request_inputs,
+        &claims,
+        sidecar,
+        &service_root,
+    );
     protocol_extractions.site = site_rows_of(
         crate::site_questions::enabled(),
         &request_inputs,
@@ -10195,6 +10570,8 @@ async fn analyze_current_repo(
         SiteContext {
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
+            prior: first_discovery.as_ref(),
+            declarations: declarations.as_ref(),
         },
     )
     .await;
@@ -10206,6 +10583,8 @@ async fn analyze_current_repo(
         SiteContext {
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
+            prior: first_discovery.as_ref(),
+            declarations: declarations.as_ref(),
         },
     );
     let withdrawn = withdraw_model_routes_at_definitions(
@@ -10733,6 +11112,7 @@ mod tests {
                 &ask.asked,
                 |_| async {},
                 |_| async { Ok(body.to_string()) },
+                None,
             )
             .await;
             super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
@@ -13295,6 +13675,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 defined_in: None,
                 any_provenance: Vec::new(),
                 unwidened_definition: None,
+                unwidened_out_of_budget: false,
                 response_modes: None,
                 stated_values: Default::default(),
                 v1_state_before_demotion: None,
@@ -19199,6 +19580,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
             v1_state_before_demotion: None,
@@ -19320,6 +19702,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
@@ -19358,6 +19741,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
@@ -19396,6 +19780,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
@@ -21794,6 +22179,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 trace_depth: 0,
             },
             needs_reader: false,
+            within: Vec::new(),
         }
     }
 
@@ -21884,6 +22270,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )],
             leads: Vec::new(),
             routes: Vec::new(),
+            through: Vec::new(),
         };
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
@@ -21993,6 +22380,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 &asked,
                 |_| async {},
                 |request| async move { Ok(http_store(&request)) },
+                None,
             )
             .await;
             let of = super::site_records_of(
@@ -22097,6 +22485,177 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// carrick#2445: a service whose program loads no DOM library, its
+    /// `fetch` declared by the runtime's types package.
+    fn runtime_fetch_edit() -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "tsconfig.json",
+                "{\n  \"compilerOptions\": {\n    \"target\": \"es2022\",\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"strict\": true,\n    \"skipLibCheck\": true,\n    \"lib\": [\"es2022\"],\n    \"types\": [\"node\"]\n  },\n  \"include\": [\"src/**/*\"]\n}\n",
+            ),
+            (
+                "node_modules/@types/node/index.d.ts",
+                "/// <reference path=\"child_process.d.ts\" />\n/// <reference path=\"web-globals/fetch.d.ts\" />\n",
+            ),
+            (
+                "node_modules/@types/node/web-globals/fetch.d.ts",
+                "export {};\ndeclare global {\n  function fetch(input: string, init?: unknown): Promise<unknown>;\n}\n",
+            ),
+            (
+                "src/node-fetch.ts",
+                "export function sendNode(): Promise<unknown> {\n  return fetch(\"/node-global\");\n}\n",
+            ),
+        ]
+    }
+
+    /// carrick#2445: a service asks for a global the runtime's types
+    /// declare under the key the store gives the file (`node:web-globals/fetch`),
+    /// at the runtime types' installed version, narrowed to the name, only
+    /// with site questions on; and asks no `lib:` key for it. A program
+    /// that loads the DOM library asks only `lib:lib.dom.d.ts`.
+    #[test]
+    fn a_service_asks_for_the_runtime_s_globals_only_with_site_questions_on() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &runtime_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let body = |inputs: &crate::request_summary::RequestSummaryInputs, site_questions| {
+            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default(), site_questions)
+                .map(|ask| serde_json::to_string(&ask.asked.request).unwrap())
+        };
+        let off = body(&on.inputs, false).expect("off: the service asks about its packages");
+        assert!(
+            !off.contains("web-globals") && !off.contains("exports"),
+            "off: the request names no runtime global: {off}"
+        );
+        let request =
+            serde_json::from_str::<serde_json::Value>(&body(&on.inputs, true).unwrap()).unwrap();
+        let packages = request["packages"].as_array().unwrap();
+        let runtime = packages
+            .iter()
+            .find(|package| package["package"] == "node:web-globals/fetch")
+            .expect("on: the runtime's fetch is asked about");
+        assert_eq!(runtime["version"], "22.0.0");
+        assert_eq!(
+            runtime["specifiers"],
+            serde_json::json!(["node:web-globals/fetch"])
+        );
+        assert_eq!(runtime["exports"], serde_json::json!(["fetch"]));
+        assert!(
+            packages
+                .iter()
+                .all(|package| package["package"] != "lib:lib.dom.d.ts"),
+            "on: the DOM library is not loaded, so not asked: {request}"
+        );
+
+        let Some(dom) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let asked =
+            serde_json::from_str::<serde_json::Value>(&body(&dom.inputs, true).unwrap()).unwrap();
+        assert!(
+            asked["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|package| !package["package"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("node:web-globals")),
+            "a DOM program asks only the DOM library: {asked}"
+        );
+    }
+
+    /// carrick#2445: the store's label for the runtime's `fetch`, under the
+    /// key the scanner asked, survives the per-service filter unrenamed and
+    /// makes the call a site keyed as the runtime keys it.
+    #[tokio::test]
+    async fn a_fetch_call_is_a_site_through_the_runtime_s_key() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &runtime_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+            .expect("the service asks the store");
+        let store = |request: &crate::library_store::LibraryClaimsRequest| {
+            let answers: Vec<serde_json::Value> = request
+                .packages
+                .iter()
+                .filter(|package| package.package.starts_with("node:web-globals/"))
+                .map(|package| {
+                    serde_json::json!({
+                        "package": package.package, "version": package.version,
+                        "status": "answered",
+                        "exports": [{
+                            "specifier": package.package, "export": "fetch",
+                            "role": "http_client", "side": "client",
+                            "makes": [], "scopes": [],
+                            "ops": [{"op": "request", "member": null, "on": "export",
+                                     "name": {"arg": 0}}],
+                            "reserved": [], "calls": [], "patterns": []
+                        }]
+                    })
+                })
+                .collect();
+            serde_json::json!({ "library_claims": answers }).to_string()
+        };
+        let settled = crate::library_store::ask_until_settled(
+            &ask.asked,
+            |_| async {},
+            |request| async move { Ok(store(&request)) },
+            None,
+        )
+        .await;
+        assert_eq!(
+            settled
+                .exports
+                .iter()
+                .map(|export| (export.package.as_str(), export.specifier.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("node:web-globals/fetch", "node:web-globals/fetch")],
+            "the answer survives the filter unrenamed"
+        );
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext::default(),
+        );
+        let sites: Vec<(u32, String, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == "services/web/src/node-fetch.ts")
+            .map(|site| (site.line, site.end.package.clone(), site.end.role.clone()))
+            .collect();
+        assert_eq!(
+            sites,
+            vec![(
+                2,
+                "node:web-globals/fetch".to_string(),
+                "http_client".to_string()
+            )]
+        );
+    }
+
     /// The shim store's answer for the language's library: `fetch` labelled
     /// an HTTP client under each `lib:` package the request names, at the
     /// version it names, and nothing for any other.
@@ -22145,6 +22704,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &ask.asked,
             |_| async {},
             |request| async move { Ok(lib_store(&request)) },
+            None,
         )
         .await;
         let of = super::site_records_of(
@@ -22174,6 +22734,79 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             })
             .count();
         assert_eq!(records, 1, "the site has its record");
+    }
+
+    /// carrick#2613: the store's first answer gives the fact layer's files
+    /// before the settle ends (the file holding a site is one), and the site
+    /// questions read that walk again, not a second one, only while the
+    /// settled answer equals the first.
+    #[tokio::test]
+    async fn the_first_answers_walk_is_read_again_only_for_an_equal_settled_answer() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+            .expect("the service asks the store");
+        let (early, first) = tokio::sync::oneshot::channel();
+        let settled = crate::library_store::ask_until_settled(
+            &ask.asked,
+            |_| async {},
+            |request| async move { Ok(lib_store(&request)) },
+            Some(early),
+        )
+        .await;
+        let first = first.await.expect("the first answer is sent");
+        assert_eq!(first.exports, settled.exports, "the settle added nothing");
+        let (facts, prior) = super::first_discovery(&ask.sites, first, &on.inputs, &on.repo);
+        let why = facts
+            .files
+            .get(LIB_FETCH_FILE)
+            .expect("the file with the site is a fact file");
+        assert!(why.site, "{why:?}");
+        assert!(
+            facts.calls.values().any(|followed| {
+                *followed == crate::request_summary::fact_files::Followed::Site
+            }),
+            "the call is recorded as a site"
+        );
+        // An equal settled answer reads the prior walk: an emptied one finds
+        // no site, so the walk was not made again.
+        let emptied = super::FirstDiscovery {
+            exports: prior.exports.clone(),
+            discovery: Default::default(),
+        };
+        let reused = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext {
+                prior: Some(&emptied),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reused.discovered, 0, "the prior walk was read");
+        // A different settled answer walks again.
+        let stale = super::FirstDiscovery {
+            exports: Vec::new(),
+            discovery: Default::default(),
+        };
+        let walked = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext {
+                prior: Some(&stale),
+                ..Default::default()
+            },
+        );
+        assert!(walked.discovered > 0, "a settle that changed it walks");
     }
 
     /// carrick#2506: a factory typed in a DefinitelyTyped-style package
@@ -22433,6 +23066,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ],
                 leads: Vec::new(),
                 routes: Vec::new(),
+                through: Vec::new(),
             },
             ..ProtocolExtractions::default()
         };
@@ -22507,6 +23141,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ],
             leads: Vec::new(),
             routes: Vec::new(),
+            through: Vec::new(),
         };
         key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
         let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
@@ -22556,6 +23191,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             leads: Vec::new(),
             route_kept_reader: 0,
             lead_on_row_line: 0,
+            through_folded: 0,
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(

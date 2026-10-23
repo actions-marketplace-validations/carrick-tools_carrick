@@ -1,0 +1,327 @@
+//! The files the fact layer sends to the file reader (carrick#2613). The
+//! engine builds this from the library store's first answer, before the
+//! reader dispatches. With `CARRICK_FACT_FILES=1` ([`enabled`]) the
+//! orchestrator reads it to choose the reader's files (ticket T3); without,
+//! it only logs how it compares with the files the hand-written signals
+//! select (ticket T1).
+//!
+//! A file is a fact file when any of these holds (decisions D1-D2 on
+//! carrick#2440's plan):
+//! - discovery found a site in it, or the site's labelled call is in it;
+//! - a decided-sites lead is in it: a discovered call whose name no call of
+//!   this code decides. These are the leads known before any model question
+//!   is asked; the possible calls the questions add later are not here, and
+//!   each of those has a site that already put its file in the set;
+//! - a call in it goes through a package the store's first answer leaves
+//!   without exports.
+//!
+//! A call discovery could not follow (a stopped walk, or one of
+//! [`Discovery::unfollowed`]'s reasons) selects no file by itself: the
+//! orchestrator keeps a register signal's candidate there instead (D4).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use super::LibrarySites;
+use super::decided_sites::Decided;
+use super::discovery::Discovery;
+use crate::library_store::FirstAnswer;
+use crate::services::type_sidecar::LibraryRole;
+
+/// Whether the fact layer chooses the file reader's files
+/// (`CARRICK_FACT_FILES=1`, decision D6). Off: it only logs them.
+pub fn enabled() -> bool {
+    std::env::var("CARRICK_FACT_FILES").is_ok_and(|value| value == "1")
+}
+
+/// The reason a call is not followed to the end when the walk found no site
+/// and passed a call it could not follow inside
+/// ([`Discovery::missed_inside`]).
+pub const MISSED_INSIDE: &str = "missed_inside";
+
+/// What discovery recorded for one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Followed {
+    /// The walk reached a labelled export.
+    Site,
+    /// The walk entered code and stopped, for this reason.
+    Stopped(String),
+    /// The walk entered no code and missed something, for this reason
+    /// ([`Discovery::unfollowed`]).
+    Unfollowed(String),
+    /// The walk ended with nothing missed and no site.
+    Finished,
+}
+
+impl Followed {
+    /// The walk did not reach the end of what the call runs: a stop or an
+    /// unfollowed call.
+    pub fn short(&self) -> bool {
+        matches!(self, Followed::Stopped(_) | Followed::Unfollowed(_))
+    }
+}
+
+/// Why a file is a fact file. A file may carry several.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Why {
+    pub site: bool,
+    pub lead: bool,
+    pub unanswered_package: bool,
+}
+
+/// The fact layer's files for one service, by repo-relative path with `/`
+/// separators.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FactFiles {
+    pub files: BTreeMap<String, Why>,
+    /// The calls each fact file sends the reader as listed HTTP candidates,
+    /// by SWC span (D3): sites and leads whose labelled export is an HTTP
+    /// client or a server framework, and calls into an unanswered package,
+    /// whose role nothing knows yet. A site of another role selects its file
+    /// and lists nothing, as today's GraphQL and messaging files do.
+    pub listed: BTreeMap<String, BTreeSet<(u32, u32)>>,
+    /// What discovery recorded at each call, by file and SWC span.
+    pub calls: BTreeMap<(String, u32, u32), Followed>,
+    /// Packages the first answer left without exports.
+    pub unanswered_packages: usize,
+    /// The ask got no answer at all.
+    pub ask_failed: bool,
+}
+
+/// Whether a call reaching an export of `role` is listed for the HTTP
+/// reader.
+fn listed_role(role: LibraryRole) -> bool {
+    matches!(role, LibraryRole::HttpClient | LibraryRole::ServerFramework)
+}
+
+impl FactFiles {
+    /// The fact files of a service: `discovery` read through the first
+    /// answer's labels, `decided` its leads, `library` its calls through
+    /// packages, `first` what the store left unanswered. Paths relative to
+    /// `root`.
+    pub fn of(
+        discovery: &Discovery,
+        decided: &Decided,
+        library: Option<&LibrarySites>,
+        first: &FirstAnswer,
+        root: &Path,
+    ) -> Self {
+        let mut facts = FactFiles {
+            unanswered_packages: first.unanswered.len(),
+            ask_failed: first.ask_failed,
+            ..FactFiles::default()
+        };
+        for site in &discovery.sites {
+            let followed = match (&site.end, &site.stop) {
+                (Some(_), _) => Followed::Site,
+                (None, Some(stop)) => Followed::Stopped(stop.clone()),
+                (None, None) => continue,
+            };
+            facts.record(&site.file, (site.span_start, site.span_end), followed);
+            if let Some(end) = &site.end {
+                let listed = listed_role(end.role);
+                facts.select(&site.file, (site.span_start, site.span_end), listed);
+                facts.select(&end.file, (end.span_start, end.span_end), listed);
+                facts.files.entry(site.file.clone()).or_default().site = true;
+                facts.files.entry(end.file.clone()).or_default().site = true;
+            }
+        }
+        for site in &discovery.unfollowed {
+            let reason = site.stop.clone().unwrap_or_default();
+            facts.record(
+                &site.file,
+                (site.span_start, site.span_end),
+                Followed::Unfollowed(reason),
+            );
+        }
+        for (file, start, end) in &discovery.missed_inside {
+            facts.record(
+                file,
+                (*start, *end),
+                Followed::Unfollowed(MISSED_INSIDE.to_string()),
+            );
+        }
+        for (file, start, end) in &discovery.finished {
+            facts.record(file, (*start, *end), Followed::Finished);
+        }
+        for lead in &decided.leads {
+            let listed = serde_json::from_value::<LibraryRole>(lead.end.role.clone().into())
+                .is_ok_and(listed_role);
+            facts.select(&lead.file, (lead.span_start, lead.span_end), listed);
+            facts.select(
+                &lead.end.file,
+                (lead.end.span_start, lead.end.span_end),
+                listed,
+            );
+            facts.files.entry(lead.file.clone()).or_default().lead = true;
+            facts.files.entry(lead.end.file.clone()).or_default().lead = true;
+        }
+        if let Some(library) = library {
+            for site in &library.sites {
+                if !first.unanswered.contains(site.package()) {
+                    continue;
+                }
+                let relative = site.file.strip_prefix(root).unwrap_or(&site.file);
+                let file = relative.to_string_lossy().replace('\\', "/");
+                facts.select(&file, (site.span_start, site.span_end), true);
+                facts.files.entry(file).or_default().unanswered_package = true;
+            }
+        }
+        facts
+    }
+
+    /// Record what discovery found at one call. A site wins over anything
+    /// else recorded there, and anything else over a finished walk.
+    fn record(&mut self, file: &str, span: (u32, u32), followed: Followed) {
+        let key = (file.to_string(), span.0, span.1);
+        match self.calls.get(&key) {
+            Some(Followed::Site) => {}
+            Some(kept) if *kept != Followed::Finished && followed != Followed::Site => {}
+            _ => {
+                self.calls.insert(key, followed);
+            }
+        }
+    }
+
+    /// List the call at `span` in `file` for the reader, when `listed`.
+    fn select(&mut self, file: &str, span: (u32, u32), listed: bool) {
+        if listed {
+            self.listed
+                .entry(file.to_string())
+                .or_default()
+                .insert(span);
+        }
+    }
+
+    /// How many fact files hold a site, a lead and an unanswered-package
+    /// call, in that order.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let count = |why: fn(&Why) -> bool| self.files.values().filter(|why_| why(why_)).count();
+        (
+            count(|why| why.site),
+            count(|why| why.lead),
+            count(|why| why.unanswered_package),
+        )
+    }
+
+    /// What discovery recorded at the call at `span` in `file`, or `None`
+    /// when it recorded nothing there.
+    pub fn followed(&self, file: &str, span: (u32, u32)) -> Option<&Followed> {
+        self.calls.get(&(file.to_string(), span.0, span.1))
+    }
+
+    /// The spans `file` lists for the reader, none when it lists nothing.
+    pub fn listed_in(&self, file: &str) -> BTreeSet<(u32, u32)> {
+        self.listed.get(file).cloned().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request_summary::discovery::{DiscoverySite, SiteEnd};
+
+    fn site(
+        file: &str,
+        span: (u32, u32),
+        end: Option<SiteEnd>,
+        stop: Option<&str>,
+    ) -> DiscoverySite {
+        DiscoverySite {
+            file: file.to_string(),
+            line: 1,
+            span_start: span.0,
+            span_end: span.1,
+            callee: "send".to_string(),
+            end,
+            chain: Vec::new(),
+            stop: stop.map(str::to_string),
+            receiver: None,
+            reached: None,
+        }
+    }
+
+    fn end(file: &str, role: LibraryRole) -> SiteEnd {
+        SiteEnd {
+            package: "lib".to_string(),
+            export: "default".to_string(),
+            member: None,
+            role,
+            op: None,
+            file: file.to_string(),
+            line: 1,
+            span_start: 5,
+            span_end: 9,
+            new: false,
+        }
+    }
+
+    /// A site puts its own file and its labelled call's file in the set; a
+    /// stopped walk records the call as stopped and selects nothing; a call
+    /// one walk reached and another stopped is a site.
+    #[test]
+    fn a_site_selects_both_files_and_a_stop_selects_none() {
+        let discovery = Discovery {
+            sites: vec![
+                site(
+                    "a.ts",
+                    (1, 4),
+                    Some(end("b.ts", LibraryRole::HttpClient)),
+                    None,
+                ),
+                site("c.ts", (1, 4), None, Some("no_body")),
+                site("d.ts", (1, 4), None, Some("no_body")),
+                site("d.ts", (1, 4), Some(end("e.ts", LibraryRole::Broker)), None),
+            ],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        );
+        let files: Vec<&str> = facts.files.keys().map(String::as_str).collect();
+        assert_eq!(files, ["a.ts", "b.ts", "d.ts", "e.ts"]);
+        assert_eq!(
+            facts.followed("c.ts", (1, 4)),
+            Some(&Followed::Stopped("no_body".to_string()))
+        );
+        assert_eq!(facts.followed("d.ts", (1, 4)), Some(&Followed::Site));
+        assert_eq!(facts.followed("a.ts", (9, 9)), None);
+        assert_eq!(facts.counts(), (4, 0, 0));
+        // The HTTP client's site and its labelled call are listed; the
+        // broker's file is read with nothing listed.
+        assert_eq!(facts.listed_in("a.ts"), BTreeSet::from([(1, 4)]));
+        assert_eq!(facts.listed_in("b.ts"), BTreeSet::from([(5, 9)]));
+        assert!(facts.listed_in("d.ts").is_empty());
+        assert!(facts.listed_in("e.ts").is_empty());
+    }
+
+    /// An unfollowed call and a finished walk are recorded and select no
+    /// file; a finished walk never hides what another record says.
+    #[test]
+    fn unfollowed_and_finished_calls_are_recorded_and_select_nothing() {
+        let discovery = Discovery {
+            unfollowed: vec![site("f.ts", (1, 4), None, Some("value_callee"))],
+            finished: vec![("f.ts".to_string(), 1, 4), ("g.ts".to_string(), 2, 6)],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        );
+        assert!(facts.files.is_empty());
+        assert_eq!(
+            facts.followed("f.ts", (1, 4)),
+            Some(&Followed::Unfollowed("value_callee".to_string()))
+        );
+        assert_eq!(facts.followed("g.ts", (2, 6)), Some(&Followed::Finished));
+        assert!(facts.followed("f.ts", (1, 4)).unwrap().short());
+        assert!(!Followed::Finished.short());
+    }
+}

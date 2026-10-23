@@ -198,6 +198,8 @@ use guards::{GuardIr, Subject, Tested, WrittenIn};
 // the offline census read them yet.
 #[allow(dead_code)]
 pub mod decided_sites;
+// The files the fact layer would send the file reader (carrick#2613): record-only.
+pub mod fact_files;
 #[cfg(test)]
 mod site_census;
 #[allow(dead_code)]
@@ -210,6 +212,7 @@ mod row_links;
 // The definition each call reaches, read from the compiler's per-position
 // rows when the run walks them (carrick#2413 slice D).
 mod row_calls;
+pub(crate) use row_calls::CallIntoFile;
 
 // What binding the rows costs, and the budget that bounds it (carrick#2564).
 mod rows_join;
@@ -220,6 +223,15 @@ pub use rows_join::ROWS_JOIN_BUDGET;
 // census read it so far, so the binary sees it as unused.
 #[allow(dead_code)]
 pub(crate) mod discovery;
+
+// The routes a hand-written dispatch states (carrick#2474 R4a): record-only,
+// logged by a scan with the receiver trace on and dropped.
+pub(crate) mod dispatch;
+
+// What a callee that is a value may hold, read where each value is written,
+// for discovery's value walk (carrick#2432).
+mod values;
+use values::ValueAt;
 
 // One fixture service walked with or without rows, for the tests of what
 // the summaries read through them.
@@ -422,9 +434,39 @@ pub struct ObjValue {
     /// decided site's option key (its method) reads this; the body a request
     /// sends does not, so no body row moves.
     pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
+    /// The keys whose value depends on which spread branch runs (carrick#2474
+    /// R5e): `open` is also set, for the readers that only ask whether
+    /// anything beyond `fields` may be in the object.
+    pub unsettled: BTreeSet<String>,
+    /// Something the source does not state is in the object: a spread of a
+    /// value, a computed key, or a method, getter or setter. Any key not in
+    /// `fields` may be set by it.
+    pub wide: bool,
+}
+
+/// What an object states about one key ([`ObjValue::key`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyState<'a> {
+    /// The source states the key's value.
+    Known(&'a Value),
+    /// No spread or computed key can set the key: it is not there.
+    Absent,
+    /// A spread or a computed key may set the key; the source does not say
+    /// to what.
+    Unread,
 }
 
 impl ObjValue {
+    /// What this object states about `key`. Only a prefix slot reads this
+    /// (carrick#2474 R5e); body and name readers keep `open`.
+    pub fn key(&self, key: &str) -> KeyState<'_> {
+        match self.fields.get(key) {
+            Some(value) => KeyState::Known(value),
+            None if self.wide || self.unsettled.contains(key) => KeyState::Unread,
+            None => KeyState::Absent,
+        }
+    }
+
     /// Put a spread in place whose possible objects are `branches`: a key it
     /// sets to the same value on every branch holds that value; a key only
     /// some branches set, or set to different values, holds nothing the
@@ -446,6 +488,7 @@ impl ObjValue {
                 }
                 _ => {
                     self.fields.remove(key);
+                    self.unsettled.insert(key.clone());
                     self.open = true;
                 }
             }
@@ -488,6 +531,8 @@ impl Value {
                     .map(|(key, value)| (key.clone(), value.enclosed()))
                     .collect(),
                 open: obj.open,
+                unsettled: obj.unsettled.clone(),
+                wide: obj.wide,
                 // A closure's object reads as it always did.
                 under_param: None,
                 under_rest: None,
@@ -841,6 +886,11 @@ struct CallIr {
     /// a name from a parameter (carrick#1562). `None` when an argument is
     /// spread: it moves every position after it.
     site_args: Option<Vec<SiteArg>>,
+    /// The position of the first spread argument, when the receiver trace is
+    /// on (carrick#2662): a decided site reads the arguments before it as
+    /// written, and every position from it on as unread. `None` without a
+    /// spread, and with the trace off.
+    spread_from: Option<usize>,
     /// The line of the member the call names, or of the callee: where a
     /// library call a caller fills is placed ([`LibrarySite::line`]).
     name_line: u32,
@@ -858,6 +908,14 @@ struct CallIr {
     callee_subject: Option<Subject>,
     /// The callee as written.
     callee_text: String,
+    /// What the callee may hold, when it is a value rather than a name the
+    /// rows' call target reads (carrick#2432): a parameter, a key of one, a
+    /// local holding one, each side of a fallback. Read by discovery alone.
+    callee_values: Vec<ValueAt>,
+    /// What each argument may hold, by position (carrick#2432): the values a
+    /// parameter of the callee is handed. A spread is an empty entry, and
+    /// the last ([`values`]). Read by discovery alone.
+    arg_values: Vec<Vec<ValueAt>>,
     /// The call is what an `if`, a ternary or a `&&` tests: the branch its
     /// result guards.
     tested: Option<Tested>,
@@ -878,6 +936,108 @@ struct CallIr {
     /// `this.child.send()`): where a compiler row names the receiver's type
     /// (carrick#2431). Read by discovery alone.
     receiver_spans: Vec<(u32, u32, bool)>,
+    /// The object the callee's member is read on, whatever it is written
+    /// as: its span (discovery numbering) and form. `None` when the callee
+    /// is no member access. Read by the receiver trace alone (carrick#2474).
+    receiver_object: Option<(u32, u32, discovery::ObjectForm)>,
+    /// What the receiver trace walks an instance from (carrick#2474 R2a).
+    /// Read by the trace alone.
+    instance: InstanceIr,
+}
+
+/// The instance an expression holds where it is written, as the syntax
+/// names one (carrick#2474 R2a): where the receiver trace's walk ends.
+#[derive(Debug, Clone)]
+enum HeldInstance {
+    /// What the library-site reader reads a holder as: a maker's instance,
+    /// or what an own factory call returns ([`Reader::written_instance`]).
+    Client(Box<ClientRef>),
+    /// A name an import binds, or a module-scope instance's name a scope
+    /// below declares again (carrick#2474 R2b), at its span (discovery
+    /// numbering): which declaration it reaches is the compiler's to say.
+    Imported(u32, u32),
+    /// A call of a member that is no maker's and no own factory's, or a
+    /// module-scope binding such a call initialises, at the call's span
+    /// (discovery numbering): a scope a labelled member returns, which the
+    /// walk reads (carrick#2474 R2b).
+    Returned(u32, u32),
+}
+
+/// A call of a member (`app.basePath("/v2")`), as the scope it may return
+/// ([`HeldInstance::Returned`]).
+fn returned_call(expr: &Expr) -> Option<HeldInstance> {
+    match unwrap_value(expr) {
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) if matches!(unwrap_value(callee), Expr::Member(_)) => {
+                Some(HeldInstance::Returned(call.span.lo.0, call.span.hi.0))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// What one argument holds, whole, and what each plain key of an object
+/// literal written there holds (`{ app }`).
+#[derive(Debug, Clone, Default)]
+struct ArgHeld {
+    whole: Option<HeldInstance>,
+    keys: BTreeMap<String, HeldInstance>,
+    /// The argument's span (discovery numbering), where no spread comes
+    /// before it: where a compiler row names what a name there declares
+    /// (carrick#2474 R2b).
+    span: Option<(u32, u32)>,
+    /// Every way the value reads where the source states more than one
+    /// (carrick#2635).
+    alts: ArgAlts,
+}
+
+/// The values an argument may take, one list of pieces per way it reads,
+/// where it holds a default (`opts.prefix ?? '/api'`, `a || b`, a defaulted
+/// parameter) or a conditional (carrick#2635): the whole argument, and each
+/// plain key of an object literal written there. A value with one reading
+/// is not here. Read by the receiver trace alone.
+#[derive(Debug, Clone, Default)]
+struct ArgAlts {
+    whole: Vec<Way>,
+    keys: BTreeMap<String, Vec<Way>>,
+}
+
+/// One way a value reads (carrick#2635).
+#[derive(Debug, Clone)]
+struct Way {
+    pieces: Vec<Piece>,
+    /// A default: it applies only where the value written before it is
+    /// missing (a caller omits it, or none is known), so it is stated only
+    /// then.
+    fallback: bool,
+}
+
+impl Way {
+    fn stated(pieces: Vec<Piece>) -> Self {
+        Way {
+            pieces,
+            fallback: false,
+        }
+    }
+
+    fn defaulted(ways: Vec<Way>) -> impl Iterator<Item = Way> {
+        ways.into_iter().map(|way| Way {
+            fallback: true,
+            ..way
+        })
+    }
+}
+
+/// What the receiver trace reads at one call (carrick#2474 R2a): the
+/// receiver object's value as the body reads it (a parameter, a key of
+/// one, an enclosing function's), the instance the receiver holds where
+/// the syntax names one, and each argument's.
+#[derive(Debug, Clone, Default)]
+struct InstanceIr {
+    receiver_value: Option<Value>,
+    receiver_held: Option<HeldInstance>,
+    args: Vec<ArgHeld>,
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -970,6 +1130,14 @@ struct FnIr {
     /// discovery and the rows' call targets alone (carrick#2431): the
     /// summaries compose none, so the body stays [`Self::unfollowed`].
     optional_calls: Vec<CallIr>,
+    /// Each default a parameter, or a key of a destructured one, is given:
+    /// its position, the keys down to it and what it may hold, read in the
+    /// function's own scope (carrick#2432). Read by discovery alone.
+    param_defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
+    /// What each `return` (an arrow's expression body included) may hand
+    /// back, for a callee an own factory returns (carrick#2432). Read by
+    /// discovery alone.
+    returned_values: Vec<ValueAt>,
 }
 
 impl FnIr {
@@ -1172,6 +1340,11 @@ pub struct FileIr {
     /// `const` a factory call built, and an anonymous `export default
     /// <factory call>` under [`DEFAULT_EXPORT`].
     module_clients: HashMap<String, ClientRef>,
+    /// What each module-scope binding left out of `module_clients` because
+    /// a scope below declares its name again holds (carrick#2474 R2b): read
+    /// only by the receiver trace, through the declaration the compiler
+    /// names at a use, which tells the two bindings apart.
+    shadowed_clients: HashMap<String, ClientRef>,
     /// Every import binding the file uses, with how it uses it. What a module
     /// that declares one of them holds is changed by these uses too.
     imported: HashMap<String, BindingUse>,
@@ -1409,6 +1582,8 @@ pub fn extract_file_ir(
         query_builders: module_query_builders(module, &reassigned),
         receivers: HashMap::new(),
         lazy_clients: HashMap::new(),
+        shadowed_clients: HashSet::new(),
+        returned_consts: HashMap::new(),
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
@@ -1568,12 +1743,21 @@ pub fn extract_file_ir(
                     // ([`ClientInstance::http_factory`]), and a service that
                     // held none before held no HTTP instance a specifier
                     // could take away.
-                    if let Some(client) = client
+                    if client.is_none()
                         && !redeclared.declares_name(&name)
+                        && let Some(HeldInstance::Returned(lo, hi)) = returned_call(init)
                     {
+                        module_scope.returned_consts.insert(name.clone(), (lo, hi));
+                    }
+                    if let Some(client) = client {
                         let client = module_scope.with_uses(client, &name);
-                        file.module_clients.insert(name.clone(), client.clone());
-                        module_scope.receivers.insert(name, client);
+                        if redeclared.declares_name(&name) {
+                            module_scope.shadowed_clients.insert(name.clone());
+                            file.shadowed_clients.insert(name, client);
+                        } else {
+                            file.module_clients.insert(name.clone(), client.clone());
+                            module_scope.receivers.insert(name, client);
+                        }
                     }
                     if let Some(text) = text {
                         module_scope.texts.insert(ident_key(&ident.id), text);
@@ -1909,6 +2093,13 @@ struct ModuleScope {
     /// [`Reader::lazy_clients`]). Read only where a function returns it: no
     /// call is read through the `let`, for any role.
     lazy_clients: HashMap<BindingKey, ClientRef>,
+    /// The module-scope bindings that hold an instance a scope below
+    /// declares the name of again ([`FileIr::shadowed_clients`]).
+    shadowed_clients: HashSet<String>,
+    /// Each module-scope `const` a member call that is no maker's
+    /// initialises, by name, at the call's span (discovery numbering):
+    /// [`HeldInstance::Returned`] (carrick#2474 R2b).
+    returned_consts: HashMap<String, (u32, u32)>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
     /// (carrick#1568).
@@ -3434,6 +3625,8 @@ struct Captured {
     /// [`Scope::subjects`], each parameter of the enclosing functions read
     /// as an enclosing one ([`Subject::enclosed`]).
     subjects: HashMap<BindingKey, Subject>,
+    /// [`Scope::held`], each parameter one function further out.
+    held: HashMap<BindingKey, Vec<ValueAt>>,
 }
 
 /// One module-scope binding an import introduces.
@@ -3874,6 +4067,13 @@ struct Scope<'a> {
     /// nested pattern: each may hold something other than what the caller
     /// wrote under that key.
     keyed: HashMap<BindingKey, (usize, String)>,
+    /// Each parameter, or key of an object parameter, the function gives a
+    /// default (`prefix = '/api'`, `{ prefix = '/api' } = {}`): the
+    /// parameter's position, the key (`None`: the parameter itself) and the
+    /// default as written. Never a binding the body assigns again. Read by
+    /// the receiver trace alone (carrick#2635), which states both what a
+    /// caller hands in and the default.
+    defaults: HashMap<BindingKey, (usize, Option<String>, Expr)>,
     /// The rest element of a parameter the body unpacks (`const { path,
     /// ...rest } = config`, or `= init ?? {}`), with the parameter's
     /// position and every key the pattern takes out (carrick#2519): it holds
@@ -3925,6 +4125,11 @@ struct Scope<'a> {
     /// hold, comes from, as a guard reads it (carrick#2386). The send side
     /// never reads it.
     subjects: HashMap<BindingKey, Subject>,
+    /// What each key of a destructured parameter, and each local the body
+    /// declares once and never assigns again, may hold, the enclosing
+    /// functions' included (carrick#2432). Read by discovery's value walk
+    /// alone ([`values::ValueAt`]).
+    held: HashMap<BindingKey, Vec<ValueAt>>,
     /// The names the function writes a member of (`url.pathname = …`),
     /// anywhere in it: a guard reads no such binding as what it was declared
     /// with (carrick#2386). The send side never reads it.
@@ -3938,6 +4143,7 @@ impl<'a> Scope<'a> {
         Self {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaults: HashMap::new(),
             rest_of: HashMap::new(),
             key_objects: HashSet::new(),
             outer_objects: HashMap::new(),
@@ -3952,6 +4158,7 @@ impl<'a> Scope<'a> {
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: HashMap::new(),
+            held: HashMap::new(),
             fields: None,
             module,
         }
@@ -4014,11 +4221,37 @@ impl<'a> Scope<'a> {
             {
                 self.param_verbs.insert(index, verbs);
             }
+            // `prefix = '/api'`: the parameter, or one key of an object
+            // parameter, with a default (carrick#2635).
+            if let Pat::Assign(assign) = pat
+                && let Some(binding) = &key
+                && settled(binding)
+            {
+                self.defaults
+                    .insert(binding.clone(), (index, None, (*assign.right).clone()));
+            }
             self.params.push(key);
             if let Pat::Object(object) = pattern {
                 for (binding, key) in keyed_names(object) {
                     if settled(&binding) {
                         self.keyed.insert(binding, (index, key));
+                    }
+                }
+                for prop in &object.props {
+                    if let ObjectPatProp::Assign(assign) = prop
+                        && let Some(default) = &assign.value
+                    {
+                        let binding = ident_key(&assign.key.id);
+                        if settled(&binding) {
+                            self.defaults.insert(
+                                binding,
+                                (
+                                    index,
+                                    Some(assign.key.id.sym.to_string()),
+                                    (**default).clone(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -4080,6 +4313,205 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    /// The instance `expr` holds where it is written (carrick#2474 R2a): a
+    /// name the scope holds an instance in, a maker or own factory call
+    /// ([`Reader::written_instance`]), or a name an import binds, whose
+    /// declaration the compiler names. A parameter is the walk's to fill,
+    /// and anything else holds nothing the syntax names.
+    fn held(&self, expr: &Expr, scope: &Scope<'_>) -> Option<HeldInstance> {
+        match unwrap_value(expr) {
+            Expr::Ident(ident) => {
+                if scope.param_index(ident).is_some() {
+                    return None;
+                }
+                if let Some(client) = scope.receiver(ident)
+                    && client.instance.is_some()
+                {
+                    return Some(HeldInstance::Client(Box::new(client.clone())));
+                }
+                let key = ident_key(ident);
+                let name = ident.sym.as_ref();
+                if scope.locals.contains_key(&key) || scope.local_receivers.contains_key(&key) {
+                    return None;
+                }
+                if let Some((lo, hi)) = scope.module.returned_consts.get(name) {
+                    return Some(HeldInstance::Returned(*lo, *hi));
+                }
+                (scope.module.imports.contains(name)
+                    || scope.module.shadowed_clients.contains(name))
+                .then_some(HeldInstance::Imported(ident.span.lo.0, ident.span.hi.0))
+            }
+            call @ (Expr::Call(_) | Expr::New(_)) => self
+                .written_instance(call, scope)
+                .map(|client| HeldInstance::Client(Box::new(client)))
+                .or_else(|| returned_call(call)),
+            _ => None,
+        }
+    }
+
+    /// Every way `expr` reads, one list of pieces each, where it holds a
+    /// default or a conditional (carrick#2635); empty where it reads one
+    /// way. `eval` reads the same expressions as one opaque value, which
+    /// the send side keys rows on, so this is a separate reading, for the
+    /// receiver trace alone.
+    fn stated_ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Way> {
+        // Most arguments state one value: read no further.
+        let branching = match unwrap_value(expr) {
+            Expr::Bin(bin) => matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr),
+            Expr::Cond(_) => true,
+            Expr::Ident(ident) => scope.defaults.contains_key(&ident_key(ident)),
+            _ => false,
+        };
+        if !branching {
+            return Vec::new();
+        }
+        let ways = self.ways(expr, scope);
+        if ways.len() > 1 { ways } else { Vec::new() }
+    }
+
+    fn ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Way> {
+        match unwrap_value(expr) {
+            // `opts.prefix ?? '/api'`: the left side, then the default.
+            Expr::Bin(bin) if bin.op == BinaryOp::NullishCoalescing => {
+                let mut ways = self.ways(&bin.left, scope);
+                ways.extend(Way::defaulted(self.ways(&bin.right, scope)));
+                ways
+            }
+            // `opts.prefix || '/api'`.
+            Expr::Bin(bin) if bin.op == BinaryOp::LogicalOr => {
+                let mut ways = self.ways(&bin.left, scope);
+                ways.extend(Way::defaulted(self.ways(&bin.right, scope)));
+                ways
+            }
+            // `opts.legacy ? '/legacy' : '/api'`: each branch.
+            Expr::Cond(cond) => {
+                let mut ways = self.ways(&cond.cons, scope);
+                ways.extend(self.ways(&cond.alt, scope));
+                ways
+            }
+            // A parameter with a default: what a caller hands in, then
+            // the default.
+            Expr::Ident(ident) if scope.defaults.contains_key(&ident_key(ident)) => {
+                let (index, key, default) = &scope.defaults[&ident_key(ident)];
+                let name = ident.sym.to_string();
+                let own = match key {
+                    Some(key) => Piece::ParamKey(*index, key.clone(), name),
+                    None => Piece::Param(*index, name),
+                };
+                let mut ways = vec![Way::stated(vec![own])];
+                ways.extend(Way::defaulted(self.ways(default, scope)));
+                ways
+            }
+            other => vec![Way::stated(self.eval(other, scope).pieces())],
+        }
+    }
+
+    /// What the receiver trace reads at a call whose callee is `callee`,
+    /// handed `args` ([`InstanceIr`]). The receiver's value is read only
+    /// for a name or a member read: a call's value is no parameter.
+    fn instance_ir(
+        &self,
+        callee: Option<&Expr>,
+        args: &[ExprOrSpread],
+        scope: &Scope<'_>,
+    ) -> InstanceIr {
+        let object = callee.and_then(|callee| match unwrap_value(callee) {
+            Expr::Member(member) => Some(&*member.obj),
+            Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                OptChainBase::Member(member) => Some(&*member.obj),
+                OptChainBase::Call(_) => None,
+            },
+            _ => None,
+        });
+        let receiver_value = object
+            .filter(|object| matches!(unwrap_value(object), Expr::Ident(_) | Expr::Member(_)))
+            .map(|object| self.eval(unwrap_value(object), scope));
+        let receiver_held = object.and_then(|object| self.held(object, scope));
+        let args = args
+            .iter()
+            .map(|arg| {
+                if arg.spread.is_some() {
+                    return ArgHeld::default();
+                }
+                let span = unwrap_value(&arg.expr).span();
+                let keys = match unwrap_value(&arg.expr) {
+                    Expr::Object(object) => object
+                        .props
+                        .iter()
+                        .filter_map(|prop| match prop {
+                            PropOrSpread::Prop(prop) => match &**prop {
+                                Prop::Shorthand(ident) => {
+                                    let held = self.held(&Expr::Ident(ident.clone()), scope)?;
+                                    Some((ident.sym.to_string(), held))
+                                }
+                                Prop::KeyValue(entry) => {
+                                    let name = match &entry.key {
+                                        PropName::Ident(name) => name.sym.to_string(),
+                                        PropName::Str(text) => {
+                                            text.value.to_string_lossy().into_owned()
+                                        }
+                                        _ => return None,
+                                    };
+                                    Some((name, self.held(&entry.value, scope)?))
+                                }
+                                _ => None,
+                            },
+                            PropOrSpread::Spread(_) => None,
+                        })
+                        .collect(),
+                    _ => BTreeMap::new(),
+                };
+                let alts = match unwrap_value(&arg.expr) {
+                    Expr::Object(object) => ArgAlts {
+                        whole: Vec::new(),
+                        keys: object
+                            .props
+                            .iter()
+                            .filter_map(|prop| {
+                                let PropOrSpread::Prop(prop) = prop else {
+                                    return None;
+                                };
+                                let (name, value) = match &**prop {
+                                    Prop::Shorthand(ident) => {
+                                        (ident.sym.to_string(), Expr::Ident(ident.clone()))
+                                    }
+                                    Prop::KeyValue(entry) => (
+                                        match &entry.key {
+                                            PropName::Ident(name) => name.sym.to_string(),
+                                            PropName::Str(text) => {
+                                                text.value.to_string_lossy().into_owned()
+                                            }
+                                            _ => return None,
+                                        },
+                                        (*entry.value).clone(),
+                                    ),
+                                    _ => return None,
+                                };
+                                let ways = self.stated_ways(&value, scope);
+                                (!ways.is_empty()).then_some((name, ways))
+                            })
+                            .collect(),
+                    },
+                    expr => ArgAlts {
+                        whole: self.stated_ways(expr, scope),
+                        keys: BTreeMap::new(),
+                    },
+                };
+                ArgHeld {
+                    whole: self.held(&arg.expr, scope),
+                    keys,
+                    span: Some((span.lo.0, span.hi.0)),
+                    alts,
+                }
+            })
+            .collect();
+        InstanceIr {
+            receiver_value,
+            receiver_held,
+            args,
+        }
+    }
+
     fn text(&self, span: Span) -> String {
         self.source_map
             .span_to_snippet(span)
@@ -4518,6 +4950,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
@@ -4532,6 +4965,7 @@ impl Reader<'_> {
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
+            held: captured.held.clone(),
             fields,
             module,
         };
@@ -4541,6 +4975,8 @@ impl Reader<'_> {
             module,
             &type_param_names(function.type_params.as_deref()),
         );
+        let values = self.param_values(function.params.iter().map(|param| &param.pat), &scope);
+        scope.held.extend(values.held);
         let mut ir = FnIr {
             params: ParamDecl::all(
                 function.params.iter().map(|param| &param.pat),
@@ -4549,6 +4985,7 @@ impl Reader<'_> {
             ),
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
+            param_defaults: values.defaults,
             ..FnIr::default()
         };
         match &function.body {
@@ -4573,6 +5010,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
@@ -4587,6 +5025,7 @@ impl Reader<'_> {
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
+            held: captured.held.clone(),
             fields,
             module,
         };
@@ -4596,10 +5035,13 @@ impl Reader<'_> {
             module,
             &type_param_names(arrow.type_params.as_deref()),
         );
+        let values = self.param_values(&arrow.params, &scope);
+        scope.held.extend(values.held);
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
+            param_defaults: values.defaults,
             ..FnIr::default()
         };
         match &*arrow.body {
@@ -4610,6 +5052,8 @@ impl Reader<'_> {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
                 ir.body_returns.push(body_return(expr, &scope.bodies));
+                ir.returned_values
+                    .extend(self.value_of(expr, &scope, &guards::Bound::default()));
                 ir.returns_tests.push(guards::is_test(expr));
                 self.walk_returned(expr, &scope, &mut ir);
             }
@@ -4652,6 +5096,17 @@ impl Reader<'_> {
                         &reassigned,
                         &declared,
                     );
+                    // What a local declared once and never assigned again may
+                    // hold, for a call through it (carrick#2432).
+                    if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
+                        && !reassigned.names.contains(ident.id.sym.as_ref())
+                        && declared.binding_count(&ident_key(&ident.id)) == 1
+                    {
+                        let values = self.value_of(init, scope, &guards::Bound::default());
+                        if values.iter().any(|value| *value != ValueAt::Unread) {
+                            scope.held.insert(ident_key(&ident.id), values);
+                        }
+                    }
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its
@@ -4897,6 +5352,8 @@ impl Reader<'_> {
                             open: true,
                             under_param: None,
                             under_rest: None,
+                            unsettled: BTreeSet::new(),
+                            wide: true,
                         });
                     }
                     return value.clone();
@@ -5209,6 +5666,7 @@ impl Reader<'_> {
                             }
                             value.fields.clear();
                             value.open = true;
+                            value.wide = true;
                         }
                     }
                     continue;
@@ -5223,6 +5681,7 @@ impl Reader<'_> {
                     None => {
                         value.fields.clear();
                         value.open = true;
+                        value.wide = true;
                         value.under_param = None;
                         value.under_rest = None;
                     }
@@ -5248,6 +5707,7 @@ impl Reader<'_> {
                         _ => {}
                     }
                     value.open = true;
+                    value.wide = true;
                     value.under_param = None;
                     value.under_rest = None;
                 }
@@ -6280,6 +6740,11 @@ impl Visit for CallWalker<'_, '_, '_> {
         let handed = self.reader.handed(&call.args, self.scope, bound);
         let names = self.reader.arg_names(&call.args, self.scope);
         let spread_args = self.reader.spread_args(&call.args, self.scope);
+        let callee_values = match &call.callee {
+            Callee::Expr(callee) => self.reader.callee_values(callee, self.scope, bound),
+            _ => Vec::new(),
+        };
+        let arg_values = self.reader.arg_values(&call.args, self.scope, bound);
         self.ir.calls.push(CallIr {
             site: call_site,
             callee,
@@ -6290,11 +6755,14 @@ impl Visit for CallWalker<'_, '_, '_> {
             invokes_param,
             receiver,
             site_args,
+            spread_from: library_sites::spread_from(&call.args),
             name_line,
             jsx: false,
             arg_subjects,
             callee_subject,
             callee_text,
+            callee_values,
+            arg_values,
             tested: self.guard.tested(call.span),
             handed,
             names,
@@ -6303,6 +6771,18 @@ impl Visit for CallWalker<'_, '_, '_> {
                 Callee::Expr(callee) => discovery::receiver_spans(callee),
                 _ => Vec::new(),
             },
+            receiver_object: match &call.callee {
+                Callee::Expr(callee) => discovery::receiver_object(callee),
+                _ => None,
+            },
+            instance: self.reader.instance_ir(
+                match &call.callee {
+                    Callee::Expr(callee) => Some(&**callee),
+                    _ => None,
+                },
+                &call.args,
+                self.scope,
+            ),
         });
     }
 
@@ -6357,16 +6837,21 @@ impl Visit for CallWalker<'_, '_, '_> {
                 invokes_param: None,
                 receiver: None,
                 site_args: None,
+                spread_from: None,
                 name_line: self.reader.line(element.span),
                 jsx: true,
                 arg_subjects: Vec::new(),
                 callee_subject: None,
                 callee_text: String::new(),
+                callee_values: Vec::new(),
+                arg_values: Vec::new(),
                 tested: None,
                 handed: Vec::new(),
                 names: Vec::new(),
                 spread_args: Vec::new(),
                 receiver_spans: Vec::new(),
+                receiver_object: None,
+                instance: InstanceIr::default(),
             });
         }
         element.visit_children_with(self);
@@ -6453,6 +6938,10 @@ impl Visit for CallWalker<'_, '_, '_> {
             .as_deref()
             .map(|arg| self.reader.returned_instances(arg, self.scope))
             .unwrap_or_default();
+        if let Some(arg) = ret.arg.as_deref() {
+            let values = self.reader.value_of(arg, self.scope, &self.guard.bound);
+            self.ir.returned_values.extend(values);
+        }
         self.ir.returns.push((ret.span.lo.0, returned));
         self.ir
             .body_returns
@@ -6628,6 +7117,12 @@ impl CallWalker<'_, '_, '_> {
             receivers: self.scope.local_receivers.clone(),
             fetches: self.scope.fetches.clone(),
             subjects: guards::captured_subjects(self.scope, &self.guard.bound),
+            held: self
+                .scope
+                .held
+                .iter()
+                .map(|(key, values)| (key.clone(), values.iter().map(ValueAt::enclosed).collect()))
+                .collect(),
         }
     }
 }
@@ -9253,6 +9748,8 @@ mod tests {
             open,
             under_param: None,
             under_rest: None,
+            unsettled: BTreeSet::new(),
+            wide: open,
         })
     }
 
@@ -9407,6 +9904,8 @@ mod tests {
             open: false,
             under_param: None,
             under_rest: None,
+            unsettled: BTreeSet::new(),
+            wide: false,
         });
         assert_eq!(
             wrapper.instantiate(&[nested], &[]).url,

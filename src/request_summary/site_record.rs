@@ -349,6 +349,11 @@ pub struct SiteRecord {
     pub bucket: Bucket,
     /// Why a lead is one.
     pub lead: Option<&'static str>,
+    /// The binding the labelled call is made on (carrick#2474 R1), with the
+    /// receiver trace on. Scanner-side only, off the wire like the anchors:
+    /// no site's sha moves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<super::discovery::ReceiverAt>,
 }
 
 impl SiteRecord {
@@ -407,19 +412,25 @@ impl Parsed {
 
     /// Lines `from..=to` (1-based), each numbered.
     fn numbered(&self, from: u32, to: u32) -> String {
-        self.text
-            .lines()
-            .enumerate()
-            .map(|(index, line)| (index as u32 + 1, line))
-            .filter(|(number, _)| *number >= from && *number <= to)
-            .map(|(number, line)| format!("{number}: {}", cap(line, MAX_LINE_CHARS)))
-            .collect::<Vec<_>>()
-            .join("\n")
+        numbered(&self.text, from, to)
     }
 
     fn line_text(&self, line: u32) -> Option<&str> {
         self.text.lines().nth(line.checked_sub(1)? as usize)
     }
+}
+
+/// Lines `from..=to` (1-based) of `text`, each numbered `NN: ` and cut at
+/// [`MAX_LINE_CHARS`]: the form a site's `point.code` and a handler
+/// record's `code` share (carrick#2474 R4b).
+pub(super) fn numbered(text: &str, from: u32, to: u32) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| (index as u32 + 1, line))
+        .filter(|(number, _)| *number >= from && *number <= to)
+        .map(|(number, line)| format!("{number}: {}", cap(line, MAX_LINE_CHARS)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn cap(text: &str, chars: usize) -> String {
@@ -1215,7 +1226,10 @@ fn place(from: PlaceFrom, at: &str) -> Place {
 }
 
 /// The kind and role a label's role and op force, where they force one.
-fn kind_and_role(role: &str, op: Option<&str>) -> (Option<&'static str>, Option<&'static str>) {
+pub(super) fn kind_and_role(
+    role: &str,
+    op: Option<&str>,
+) -> (Option<&'static str>, Option<&'static str>) {
     let kind = match role {
         "http_client" | "server_framework" => Some("http"),
         "socket" => Some("socket_event"),
@@ -1232,10 +1246,17 @@ fn kind_and_role(role: &str, op: Option<&str>) -> (Option<&'static str>, Option<
     (kind, side)
 }
 
-/// The service's labelled network roles by the files that use them.
+/// The service's labelled network roles by the files that use them. A site
+/// only the receiver trace finds (carrick#2474 R1, reached by its member's
+/// declaration) is left out while the trace is record-only, so no state
+/// found without it moves.
 fn roles_by_file(decided: &Decided) -> BTreeMap<String, BTreeSet<String>> {
     let mut roles: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for site in &decided.sites {
+    for site in decided
+        .sites
+        .iter()
+        .filter(|site| site.reached != Some(super::discovery::ReachedBy::Declaration))
+    {
         roles
             .entry(site.end.role.clone())
             .or_default()
@@ -1734,6 +1755,7 @@ fn record(
         basis,
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
+        receiver: site.receiver.clone(),
     })
 }
 

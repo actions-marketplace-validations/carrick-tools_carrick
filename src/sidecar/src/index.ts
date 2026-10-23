@@ -36,6 +36,7 @@ import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
 import { writePositionRows } from './position-rows.js';
+import { findImplementations } from './implementations.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -56,6 +57,7 @@ import type {
   ListProgramFilesResponse,
   AddProgramFilesResponse,
   PositionRowsResponse,
+  ImplementationsResponse,
   ErrorResponse,
 } from './types.js';
 
@@ -102,6 +104,18 @@ function initializedLoader(): ProjectLoader {
 }
 
 /**
+ * carrick#2100: the unwidened reading's budget in milliseconds, when
+ * `CARRICK_UNWIDENED_BUDGET_MS` sets one. A switch for tests that drive the
+ * scanner's binary: it forces the budget to run out on any machine. Unset or
+ * not a whole number of milliseconds, the inferrer's default stands.
+ */
+function unwidenedBudgetFromEnv(): number | undefined {
+  const value = process.env.CARRICK_UNWIDENED_BUDGET_MS;
+  if (value === undefined || !/^\d+$/.test(value.trim())) return undefined;
+  return Number(value.trim());
+}
+
+/**
  * Get the project-backed components, building the project if this is the
  * first request that needs it.
  *
@@ -123,6 +137,7 @@ function projectComponents(key = ''): ProjectComponents {
       project,
       repoRoot,
       packageOf: (filePath) => loader.packageOf(filePath),
+      unwidenedBudgetMs: unwidenedBudgetFromEnv(),
     });
     built = {
       typeBundler: new TypeBundler({ project, repoRoot }),
@@ -141,7 +156,10 @@ function projectComponents(key = ''): ProjectComponents {
         jsonWireDeclarations,
         findDisqualifyingTopTypes as unknown as TopTypeWalk
       ),
-      claimsVerifier: new LibraryClaimsVerifier(project),
+      claimsVerifier: new LibraryClaimsVerifier(project, {
+        packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
+        resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
+      }),
     };
     components.set(key, built);
   }
@@ -691,6 +709,38 @@ function handleAddProgramFiles(
 }
 
 /**
+ * Handle the 'implementations' action - the implementations of the bodyless
+ * declaration each call goes through (carrick#2432). Asked of the analysis
+ * process: it reads the programs the service's other actions read, and
+ * releases none of them.
+ */
+function handleImplementations(
+  request: SidecarRequest & { action: 'implementations' }
+): ImplementationsResponse {
+  try {
+    const loader = initializedLoader();
+    let done = 0;
+    const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+      writeProgress(request.request_id, 'implementations', `${done} of ${request.queries.length}`)
+    );
+    const answers = findImplementations({
+      loader,
+      scanRoot: request.scan_root,
+      queries: request.queries,
+      onAnswer: () => {
+        done += 1;
+        report();
+      },
+    });
+    return { request_id: request.request_id, status: 'success', result: { answers } };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Implementations failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'position_rows' action - write the compiler's rows for each
  * call, member access, comparison and identifier of the given files
  * (carrick#2405). Asked of a process of its own: it releases each owner's
@@ -794,6 +844,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleAddProgramFiles(request);
     case 'position_rows':
       return handlePositionRows(request);
+    case 'implementations':
+      return handleImplementations(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

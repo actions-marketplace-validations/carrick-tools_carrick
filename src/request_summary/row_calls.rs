@@ -63,6 +63,37 @@ pub(crate) struct DeclarationLines {
     /// Each definition the extractor keyed whose holder starts on another
     /// line than the extractor's, by the holder's line ([`Self::place`]).
     starts: HashMap<u32, Vec<String>>,
+    /// Each name a function's parameter binds (a destructured one's names
+    /// included), by the line the parameter starts on and the line the name
+    /// is written on: where a compiler row places a parameter's declaration
+    /// (carrick#2474's receiver kind).
+    pub(crate) params: HashSet<(u32, String)>,
+}
+
+/// Each name `pat` binds, with where it is written.
+fn bound_names(pat: &Pat, out: &mut Vec<(Span, String)>) {
+    match pat {
+        Pat::Ident(ident) => out.push((ident.id.span, ident.id.sym.to_string())),
+        Pat::Array(array) => {
+            for element in array.elems.iter().flatten() {
+                bound_names(element, out);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(entry) => bound_names(&entry.value, out),
+                    ObjectPatProp::Assign(assign) => {
+                        out.push((assign.key.id.span, assign.key.id.sym.to_string()))
+                    }
+                    ObjectPatProp::Rest(rest) => bound_names(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Assign(assign) => bound_names(&assign.left, out),
+        Pat::Rest(rest) => bound_names(&rest.arg, out),
+        _ => {}
+    }
 }
 
 /// Where the function an initialiser or a property value is starts, when it
@@ -94,8 +125,37 @@ impl DeclarationLines {
             fn line(&self, span: Span) -> u32 {
                 self.source_map.lookup_char_pos(span.lo).line as u32
             }
+            /// Record the names a parameter starting at `start` binds.
+            fn param(&mut self, start: Span, pat: &Pat) {
+                let mut names = Vec::new();
+                bound_names(pat, &mut names);
+                let opens = self.line(start);
+                for (span, name) in names {
+                    let written = self.line(span);
+                    self.out.params.insert((opens, name.clone()));
+                    self.out.params.insert((written, name));
+                }
+            }
         }
         impl Visit for Lines<'_> {
+            fn visit_param(&mut self, param: &Param) {
+                self.param(param.span, &param.pat);
+                param.visit_children_with(self);
+            }
+            fn visit_ts_param_prop(&mut self, prop: &TsParamProp) {
+                let pat = match &prop.param {
+                    TsParamPropParam::Ident(ident) => Pat::Ident(ident.clone()),
+                    TsParamPropParam::Assign(assign) => Pat::Assign(assign.clone()),
+                };
+                self.param(prop.span, &pat);
+                prop.visit_children_with(self);
+            }
+            fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+                for pat in &arrow.params {
+                    self.param(pat.span(), pat);
+                }
+                arrow.visit_children_with(self);
+            }
             fn visit_export_default_decl(&mut self, export: &ExportDefaultDecl) {
                 let declared = match &export.decl {
                     DefaultDecl::Fn(FnExpr {
@@ -457,15 +517,72 @@ impl RequestSummaryInputs {
         self.reach(file, lo, hi).target()
     }
 
+    /// Every call of the service's files whose callee [`Self::reach`] names
+    /// as a function another file of the service declares
+    /// ([`crate::call_through`]'s leaf calls). A construction (`new
+    /// Client()`) is left out: it builds a value and sends nothing itself.
+    /// So is a JSX element: it renders a component, which is no call the
+    /// source writes. Sorted by file and span, each call once.
+    pub(crate) fn calls_into_other_files(&self) -> Vec<CallIntoFile> {
+        let mut out: Vec<CallIntoFile> = every_call(&self.files)
+            .into_iter()
+            .filter(|(_, call, construction)| !construction && !call.jsx)
+            .filter_map(
+                |(file, call, _)| match self.reach(file, call.site.lo, call.site.hi) {
+                    Reach::Function(target, key) if target != file => Some(CallIntoFile {
+                        file: file.to_path_buf(),
+                        span_start: call.site.span_start,
+                        span_end: call.site.span_end,
+                        line: call.site.line,
+                        target,
+                        key,
+                    }),
+                    _ => None,
+                },
+            )
+            .collect();
+        out.sort_by(|a, b| {
+            (&a.file, a.span_start, a.span_end).cmp(&(&b.file, b.span_start, b.span_end))
+        });
+        out.dedup_by(|a, b| {
+            (&a.file, a.span_start, a.span_end) == (&b.file, b.span_start, b.span_end)
+        });
+        out
+    }
+}
+
+/// One call [`RequestSummaryInputs::calls_into_other_files`] lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallIntoFile {
+    /// The file as walked.
+    pub(crate) file: PathBuf,
+    /// The call's span in SWC's own numbering ([`SWC_SPAN_BASE`]), and the
+    /// line it opens on.
+    pub(crate) span_start: u32,
+    pub(crate) span_end: u32,
+    pub(crate) line: u32,
+    /// The definition the callee resolves to: the file as walked and its key.
+    pub(crate) target: PathBuf,
+    pub(crate) key: String,
+}
+
+impl RequestSummaryInputs {
     /// What the call row at `lo..hi` in `file` names.
     fn row_reach(&self, file: &Path, lo: u32, hi: u32) -> Reach {
+        self.row_names(file, lo, hi, Kind::Call)
+    }
+
+    /// The definition the row of `kind` at `lo..hi` in `file` names: for a
+    /// name or a member read as a value (carrick#2432), the function it
+    /// holds when it holds one of the repository's.
+    pub(super) fn row_names(&self, file: &Path, lo: u32, hi: u32, kind: Kind) -> Reach {
         let Some(positions) = &self.positions else {
             return Reach::Unknown(HoleReason::RowsMissing);
         };
         let Some(ir) = self.files.get(file) else {
             return Reach::Unknown(HoleReason::RowsMissing);
         };
-        let row = match positions.lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Call) {
+        let row = match positions.lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind) {
             Ok(row) => row,
             Err(reason) => return Reach::Unknown(reason),
         };
@@ -490,11 +607,7 @@ impl RequestSummaryInputs {
         let Some(declared) = self.files.get(&declaring) else {
             return Reach::OutsideService(declaring, symbol.to_string());
         };
-        let joined = join(declared, row.decl_line(), symbol);
-        match joined {
-            Join::One(key) => Reach::Function(declaring, key),
-            Join::Several => Reach::Unknown(HoleReason::RowsMissing),
-            Join::Unfollowed => Reach::Unknown(HoleReason::UnreadExpression),
+        match join(declared, row.decl_line(), symbol) {
             // A call whose result did not resolve, at a declaration that is
             // no definition: an import of nothing, as the import line is.
             Join::None if unresolved => Reach::Unknown(if declaring == file {
@@ -502,8 +615,30 @@ impl RequestSummaryInputs {
             } else {
                 HoleReason::UnresolvedName
             }),
-            Join::None => Reach::NoFunction,
+            joined => reach_of_join(declaring, joined),
         }
+    }
+
+    /// The definition of `file` the declaration of `symbol` at `line` is,
+    /// when the service holds `file`: what [`Self::row_names`] reads of a
+    /// declaration in one of its files, for a call another service of the
+    /// run makes (carrick#2618). `NoFunction` when the service holds no such
+    /// file or the declaration is no definition.
+    pub(crate) fn definition_at(&self, file: &Path, line: Option<u32>, symbol: &str) -> Reach {
+        match self.files.get(file) {
+            Some(declared) => reach_of_join(file.to_path_buf(), join(declared, line, symbol)),
+            None => Reach::NoFunction,
+        }
+    }
+}
+
+/// What a declaration in `declaring` that [`join`] read is.
+fn reach_of_join(declaring: PathBuf, joined: Join) -> Reach {
+    match joined {
+        Join::One(key) => Reach::Function(declaring, key),
+        Join::Several => Reach::Unknown(HoleReason::RowsMissing),
+        Join::Unfollowed => Reach::Unknown(HoleReason::UnreadExpression),
+        Join::None => Reach::NoFunction,
     }
 }
 

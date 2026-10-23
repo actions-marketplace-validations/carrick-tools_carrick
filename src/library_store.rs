@@ -350,6 +350,31 @@ pub fn default_library_packages(
         .collect()
 }
 
+/// The globals the runtime's own types declare, as the store is asked about
+/// them (carrick#2445): one package per declaring file, keyed as a runtime
+/// module is (`node:web-globals/fetch`), at the installed runtime types'
+/// version, narrowed to the globals the code uses from it. `globals` is by
+/// that key ([`crate::request_summary::discovery::runtime_globals`]). None
+/// when no runtime types are installed.
+pub fn runtime_global_packages(
+    globals: &BTreeMap<String, BTreeSet<String>>,
+    install: &Install<'_>,
+) -> Vec<RegistryPackage> {
+    let Some(runtime) = installed(RUNTIME_TYPES, install) else {
+        return Vec::new();
+    };
+    globals
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(key, names)| RegistryPackage {
+            package: key.clone(),
+            version: runtime.version.clone(),
+            specifiers: vec![key.clone()],
+            exports: names.iter().cloned().collect(),
+        })
+        .collect()
+}
+
 /// The entry one specifier is asked under.
 struct AskedAs {
     package: String,
@@ -878,6 +903,8 @@ fn deno_lock_key(key: &str) -> Option<(&str, &str)> {
 pub struct LibraryAnswer {
     /// Every export of every `answered` package, element by element.
     pub exports: Vec<ExportClaims>,
+    /// Every package the store answered, with or without an export.
+    pub answered_packages: BTreeSet<String>,
     /// The packages the store has not finished (`pending`).
     pub pending: BTreeSet<String>,
     /// The part of `pending` a wait can end ([`WAITED_REASONS`]).
@@ -911,7 +938,12 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
         let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
         let package = entry.get("package").and_then(Value::as_str);
         match status {
-            "answered" => answer.answered += 1,
+            "answered" => {
+                answer.answered += 1;
+                if let Some(package) = package {
+                    answer.answered_packages.insert(package.to_string());
+                }
+            }
             "pending" => {
                 if let Some(package) = package {
                     answer.pending.insert(package.to_string());
@@ -1120,6 +1152,24 @@ pub struct Settled {
     pub asked: bool,
 }
 
+/// The store's first answer to a scan, sent the moment it arrives while the
+/// wait for the packages still building carries on (carrick#2613).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FirstAnswer {
+    /// Every export of every package answered, as [`Settled::exports`] holds
+    /// them: the same filter, so a settle that adds nothing equals it.
+    pub exports: Vec<ExportClaims>,
+    /// The packages this answer leaves without exports: pending for any
+    /// reason, answered `skipped` with `build_failed`, and every package
+    /// asked when the ask itself failed.
+    pub unanswered: BTreeSet<String>,
+    /// Every package the answer holds as answered, with or without an export
+    /// ([`LibraryAnswer::answered_packages`]).
+    pub answered: BTreeSet<String>,
+    /// The ask itself got no answer (a refusal, an error, a timeout).
+    pub ask_failed: bool,
+}
+
 /// The store's answer for `asked`, waiting for the packages it is building
 /// (carrick#2496). The first ask is the whole request. The packages it
 /// answered `pending` for a reason a build can end ([`WAITED_REASONS`]) are
@@ -1128,8 +1178,15 @@ pub struct Settled {
 /// future's alone, so the caller runs it beside the analysis. A store that
 /// stops answering ends the wait: it never fails the scan.
 ///
-/// `gate` is taken before every ask, as [`ask`]'s is.
-pub async fn ask_until_settled<G, GateFut, S, Fut>(asked: &Asked, gate: G, send: S) -> Settled
+/// `gate` is taken before every ask, as [`ask`]'s is. `early` receives the
+/// first answer as soon as there is one, on every path: the caller that
+/// passes one may be waiting on it (carrick#2613).
+pub async fn ask_until_settled<G, GateFut, S, Fut>(
+    asked: &Asked,
+    gate: G,
+    send: S,
+    early: Option<tokio::sync::oneshot::Sender<FirstAnswer>>,
+) -> Settled
 where
     G: Fn(&LibraryClaimsRequest) -> GateFut,
     GateFut: Future,
@@ -1139,11 +1196,32 @@ where
     let started = tokio::time::Instant::now();
     let deadline = started + WAIT_CAP;
     let Some(first) = try_ask(asked.request.clone(), &gate, &send, ASK_TIMEOUT).await else {
+        if let Some(early) = early {
+            let _ = early.send(FirstAnswer {
+                exports: Vec::new(),
+                unanswered: asked
+                    .request
+                    .packages
+                    .iter()
+                    .map(|package| package.package.clone())
+                    .collect(),
+                answered: BTreeSet::new(),
+                ask_failed: true,
+            });
+        }
         return Settled {
             asked: true,
             ..Settled::default()
         };
     };
+    if let Some(early) = early {
+        let _ = early.send(FirstAnswer {
+            exports: asked.claims(first.exports.clone()),
+            unanswered: first.pending.union(&first.build_failed).cloned().collect(),
+            answered: first.answered_packages.clone(),
+            ask_failed: false,
+        });
+    }
     let mut exports = first.exports;
     let mut pending: BTreeSet<String> =
         first.pending.difference(&first.building).cloned().collect();
@@ -2444,6 +2522,7 @@ mod tests {
                     let store = store.clone();
                     async move { store.send(request).await }
                 },
+                None,
             )
             .await
         }
@@ -2567,6 +2646,67 @@ mod tests {
             settled.pending.is_empty(),
             "a store that never answered named nothing pending"
         );
+    }
+
+    /// carrick#2613: the first answer goes out the moment it arrives, while
+    /// the wait for the package still building carries on, and it names what
+    /// it leaves without exports.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_answer_is_sent_before_the_wait_for_a_building_package_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![pending_for("in_flight"), STORE_ANSWERED.to_string()]);
+        let (early, first) = tokio::sync::oneshot::channel();
+        let sent = store.clone();
+        let (settled, (answer, got_it_at)) = tokio::join!(
+            ask_until_settled(
+                &asked,
+                |_| async {},
+                move |request| {
+                    let store = sent.clone();
+                    async move { store.send(request).await }
+                },
+                Some(early),
+            ),
+            async {
+                let answer = first.await.expect("the first answer is always sent");
+                (answer, store.start.elapsed())
+            },
+        );
+        assert_eq!(got_it_at, Duration::ZERO, "sent when it arrived");
+        assert!(store.start.elapsed() >= POLL_INTERVAL, "the wait went on");
+        assert!(
+            answer.exports.is_empty(),
+            "the first answer holds no claims"
+        );
+        assert_eq!(answer.unanswered, specifiers(&["lib"]));
+        assert!(!answer.ask_failed);
+        assert_eq!(settled.exports.len(), 1, "the settled answer has them");
+    }
+
+    /// carrick#2613: an ask that got no answer still sends, with every
+    /// package asked left unanswered, so the fact layer fails closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_ask_sends_every_package_asked_as_unanswered() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![String::new()]);
+        let (early, mut first) = tokio::sync::oneshot::channel();
+        let sent = store.clone();
+        ask_until_settled(
+            &asked,
+            |_| async {},
+            move |request| {
+                let store = sent.clone();
+                async move { store.send(request).await }
+            },
+            Some(early),
+        )
+        .await;
+        let answer = first.try_recv().expect("sent on the failed path too");
+        assert!(answer.ask_failed);
+        assert!(answer.exports.is_empty());
+        assert_eq!(answer.unanswered, specifiers(&["lib", "other"]));
     }
 
     #[test]

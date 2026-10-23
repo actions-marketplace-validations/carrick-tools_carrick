@@ -33,9 +33,11 @@ import {
   type CallExpression,
   type ObjectLiteralExpression,
   type ParameterDeclaration,
+  type ConditionalExpression,
   type PropertyAssignment,
   type StringLiteral,
   type Type,
+  type VariableDeclaration,
   type Symbol as TsSymbol,
   ts,
 } from 'ts-morph';
@@ -245,6 +247,13 @@ const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
 const RESPONSE_HELPER_MAX_DEPTH = 4;
 
 /**
+ * How many wrapper calls a handler bound to one is followed through
+ * (carrick#2472 P3-2b): `wrap(trace(async (req, res) => …))` needs two. A
+ * backstop against a pathologically nested initializer.
+ */
+const WRAPPER_CALL_MAX_DEPTH = 3;
+
+/**
  * Members an options object uses to state an HTTP status. A >= 400 status marks
  * the branch an error path, whose shape is not the endpoint's contract.
  */
@@ -321,6 +330,18 @@ interface RecoveredPayload {
   statedTypeNode?: Node;
   /** carrick#2054: see `InferredType.response_modes`. */
   responseModes?: ResponseModes;
+}
+
+/**
+ * The type an assertion states, or undefined when it states none. A const
+ * assertion (`x as const`, `<const>x`) narrows its operand's own type and
+ * names no type: its type node prints as `const`, a name nothing declares
+ * (carrick#2590). The walk stops there rather than reaching for an assertion
+ * further out, which describes a larger value than the read.
+ */
+function statedAssertionType(typeNode: Node | undefined): Node | undefined {
+  if (!typeNode || ts.isConstTypeReference(typeNode.compilerNode)) return undefined;
+  return typeNode;
 }
 
 /**
@@ -933,16 +954,23 @@ export class TypeInferrer {
    * read is the project the scan loaded.
    *
    * Nothing is read past `deadline`: a batch that runs out keeps the readings
-   * it made and publishes none for the rest.
+   * it made and publishes none for the rest, and marks each of the rest
+   * `unwidened_out_of_budget` (carrick#2100). A request that never needed a
+   * reading (a declared return, nothing to mark) or lost it for a reason of
+   * its own (a marking that added a diagnostic) is never marked.
    */
   private addUnwidenedReadings(
     responses: Array<{ request: InferRequestItem; result: InferredType }>,
     extractionConfig: ExtractionConfig | undefined,
     deadline: number
   ): void {
-    const outOfTime = (stage: string): boolean => {
+    const outOfTime = (stage: string, unread: ReadonlyArray<{ result: InferredType }>): boolean => {
       if (performance.now() <= deadline) return false;
-      this.log(`Unwidened reading stopped ${stage}: it ran out of its budget`);
+      this.log(
+        `Unwidened reading stopped ${stage}: it ran out of its budget, ` +
+          `${unread.length} reading(s) not made`
+      );
+      for (const plan of unread) plan.result.unwidened_out_of_budget = true;
       return true;
     };
     interface Plan {
@@ -1003,7 +1031,7 @@ export class TypeInferrer {
     for (const [file, list] of insertionsByFile) insertions.set(file, normalise(list));
     const before = new Map<SourceFile, ReturnType<typeof fileDiagnostics>>();
     for (const file of checkedFiles) {
-      if (outOfTime('before the rewrite')) return;
+      if (outOfTime('before the rewrite', plans)) return;
       before.set(file, fileDiagnostics(file));
     }
     const originals = new Map<SourceFile, string>();
@@ -1019,7 +1047,7 @@ export class TypeInferrer {
       // holds it loses its reading.
       const tainted = new Set<Plan>();
       for (const file of checkedFiles) {
-        if (outOfTime('while checking the rewrite')) return;
+        if (outOfTime('while checking the rewrite', plans)) return;
         const list = insertions.get(file) ?? [];
         for (const at of addedDiagnostics(before.get(file)!, fileDiagnostics(file), list)) {
           const holders = plans.flatMap((plan) => plan.path).filter(
@@ -1034,8 +1062,10 @@ export class TypeInferrer {
         }
       }
 
-      for (const plan of plans) {
-        if (outOfTime('while re-reading')) return;
+      for (const [at, plan] of plans.entries()) {
+        if (outOfTime('while re-reading', plans.slice(at).filter((rest) => !tainted.has(rest)))) {
+          return;
+        }
         if (tainted.has(plan)) {
           this.log(
             `Unwidened reading for ${plan.request.file_path}:${plan.request.line_number} ` +
@@ -1250,6 +1280,22 @@ export class TypeInferrer {
     // envelope would read `body` and publish `string`.
     if (this.serialisedBodyEnvelopeEngages(awaitedType, func)) {
       return this.inferSerialisedBodyEnvelope(request, func);
+    }
+    // A route handler that returns the reply it was handed (`return reply`)
+    // states no body by that return; the reply's type is built from the
+    // route's request type argument (carrick-cloud#2576).
+    const returned = this.returnedExpressions(func);
+    if (
+      returned.length > 0 &&
+      returned.every((expression) =>
+        this.isRouteHandlerParameter(this.unwrapExpressionNode(expression), request)
+      )
+    ) {
+      this.log(
+        `Return at ${request.file_path}:${request.line_number} is an object the ` +
+          'framework handed the handler; it states no body'
+      );
+      return null;
     }
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped && !unwrapResult.verifiedMachinery) {
@@ -1777,6 +1823,18 @@ export class TypeInferrer {
         payloadNode = args[0];
       }
     }
+    // A parameter the route registration hands its handler is never the
+    // route's body: not the reply a handler returns (`return reply`), and not
+    // the request the drill reaches in a call that forwards it
+    // (`return finish(request, reply)`), whose type the framework built from
+    // the route's request type argument (carrick-cloud#2576).
+    if (this.isRouteHandlerParameter(payloadNode, request)) {
+      this.log(
+        `Response payload at ${request.file_path}:${request.line_number} is an object ` +
+          'the framework handed the handler; it states no body'
+      );
+      return null;
+    }
 
     const payloadType = payloadNode.getType();
     let typeString = typeText(payloadType, payloadNode);
@@ -2004,6 +2062,28 @@ export class TypeInferrer {
       return peeled;
     }
     return this.receivingCallOf(located, isReturned);
+  }
+
+  /**
+   * True when `node` is a bare reference to a parameter of the handler the
+   * route registration on the request's line hands in (found as
+   * `registrationAtLine` finds it, wrappers included): the request, the reply
+   * or the context the framework passes, never a body the route sends
+   * (carrick-cloud#2576). Where the parameter's type is declared is not read:
+   * a parameter of any other function is data, whether the repo or an
+   * installed package types it (`.then((account) => reply.send(account))`, a
+   * helper's `account: Account`).
+   */
+  private isRouteHandlerParameter(node: Node, request: InferRequestItem): boolean {
+    if (!Node.isIdentifier(node)) return false;
+    const owners = (node.getSymbol()?.getDeclarations() ?? [])
+      .filter((decl) => Node.isParameterDeclaration(decl))
+      .map((decl) => decl.getParent().compilerNode);
+    if (owners.length === 0) return false;
+    const sourceFile = this.project.getSourceFile(request.file_path);
+    if (!sourceFile) return false;
+    const handler = this.registrationAtLine(sourceFile, request.line_number)?.handler;
+    return handler !== undefined && owners.includes(handler.compilerNode);
   }
 
   /**
@@ -3347,7 +3427,26 @@ export class TypeInferrer {
     // is its response, and a config's type is the config, so either one read
     // as the body publishes the wrong contract. Follow the call's signature to
     // the argument it sends as the body.
-    const inCall = this.requestBodyInCall(unwrapped);
+    let inCall = this.requestBodyInCall(unwrapped);
+    if (inCall.kind === 'none') {
+      // carrick#2628: the argument goes into a function that builds the body
+      // itself. An abstain here is a decision: capture's own re-read of the
+      // locator would publish the argument as the body.
+      const built = this.bodyBuiltByCallee(unwrapped);
+      if (built.kind === 'abstain') {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number}: ${built.why}; ` +
+            'the argument is not the body'
+        );
+        return this.decidedAbstain(request, this.getNodeLocation(unwrapped), {
+          path: '',
+          kind: 'unknown',
+          reason: 'body_built_by_callee',
+          detail: `the located argument is not the request body: ${built.why}`,
+        });
+      }
+      inCall = built;
+    }
     if (inCall.kind === 'body') {
       this.log(
         `Request locator at ${request.file_path}:${request.line_number} names ${inCall.from}; ` +
@@ -3587,10 +3686,15 @@ export class TypeInferrer {
     // (res) => resolve(…)) })`): what the caller receives is what that
     // promise settles with, and the call made in the executor produces it.
     const nearestReturn = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    // A return whose value is an object or array literal built around the
+    // call (`return { ok: true, count: countOf(await client.add(…)) }`) hands
+    // back the caller's own value, which holds the result as one part: it
+    // answers for the call no more than a command table does (carrick#2628).
     const returnStmt =
       nearestReturn &&
       (this.findContainingFunctionForNode(nearestReturn) === func ||
-        this.callIsInReturnedPromiseExecutor(nearestReturn, func))
+        this.callIsInReturnedPromiseExecutor(nearestReturn, func)) &&
+      !this.callIsPartOfReturnedLiteral(callExpr, nearestReturn)
         ? nearestReturn
         : undefined;
     if (returnStmt) {
@@ -3605,8 +3709,9 @@ export class TypeInferrer {
     // the response, so the walk below has nothing to follow, and the call
     // itself would stand as the terminal and publish the transport object.
     // The read is the terminal, as it is when the walk finds it on a binding,
-    // and a call that takes the read and states what it returns says more
-    // than the read does (carrick#1382).
+    // and a call that takes the read and states it (a schema, or a function
+    // that returns it unchanged) says more than the read does (carrick#1382,
+    // carrick#2595).
     const inPlaceRead = this.bodyReadOnCallValue(callExpr);
     if (inPlaceRead) {
       return {
@@ -3625,8 +3730,11 @@ export class TypeInferrer {
       /** The value itself was read: returned, passed, aliased, or body-read. */
       let sawWholeRead = false;
       // Where the call's own value states no type, a call that takes it whole
-      // is the first place the source states one, and the walk follows it
-      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375).
+      // and states it (a schema, or a function that returns it unchanged) is
+      // the first place the source states one, and the walk follows it
+      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375). A
+      // converter, or a declaration whose body cannot be read, states nothing
+      // about the value (carrick#2595).
       const callValue = this.unwrapPromiseType(callExpr.getType());
       const callValueIsUntyped = callValue.isAny() || callValue.isUnknown();
       // A transport response handed whole to a helper is a body read through
@@ -3739,7 +3847,7 @@ export class TypeInferrer {
           !this.usesNamesOnlyByProjection(expr, currentNames)
         ) {
           if (
-            callValueIsUntyped ||
+            (callValueIsUntyped && this.statesTrackedValue(expr, currentNames)) ||
             this.restatesTrackedValue(expr, currentNames) ||
             this.holdsBinaryBodyRead(expr, currentNames) ||
             (callValueIsTransport && this.handsTrackedValueToACall(expr, currentNames))
@@ -3787,18 +3895,55 @@ export class TypeInferrer {
   }
 
   /**
+   * Between `callExpr` and the return statement around it there is an object
+   * or array literal: the call's result is one part of a value the function
+   * builds and returns.
+   */
+  private callIsPartOfReturnedLiteral(callExpr: CallExpression, returnStmt: Node): boolean {
+    const ancestors = callExpr.getAncestors();
+    return ancestors
+      .slice(0, ancestors.indexOf(returnStmt))
+      .some((a) => Node.isObjectLiteralExpression(a) || Node.isArrayLiteralExpression(a));
+  }
+
+  /**
    * `expr` declares a name for what a call returns when it is handed a
    * tracked name whole (`const data: T = await parseJson(response, 'op')`).
    */
   private handsTrackedValueToACall(expr: Node, names: string[]): boolean {
-    if (!Node.isVariableDeclaration(expr)) return false;
-    const init = this.unwrapExpressionNode(expr.getInitializer());
-    return (
-      Node.isCallExpression(init) &&
-      init
-        .getArguments()
-        .some((argument) => this.isIdentifierUsage(this.unwrapExpressionNode(argument), names))
-    );
+    return Node.isVariableDeclaration(expr) && this.callTakingTrackedValue(expr, names) !== undefined;
+  }
+
+  /**
+   * The call whose result `expr` declares or assigns a name for, and the
+   * index of its argument that is a tracked name whole, or undefined.
+   */
+  private callTakingTrackedValue(
+    expr: Node,
+    names: string[]
+  ): { call: CallExpression; index: number } | undefined {
+    const value = Node.isVariableDeclaration(expr)
+      ? expr.getInitializer()
+      : Node.isBinaryExpression(expr) && expr.getOperatorToken().getKind() === SyntaxKind.EqualsToken
+        ? expr.getRight()
+        : undefined;
+    const init = this.unwrapExpressionNode(value);
+    if (!Node.isCallExpression(init)) return undefined;
+    const index = init
+      .getArguments()
+      .findIndex((argument) => this.isIdentifierUsage(this.unwrapExpressionNode(argument), names));
+    return index >= 0 ? { call: init, index } : undefined;
+  }
+
+  /**
+   * `expr` names the result of a call that states the tracked value it takes
+   * (`callStatesItsArgument`): a schema validates it, or the callee returns it
+   * unchanged. A converter's result describes what it built from the value,
+   * not the value (carrick#2595).
+   */
+  private statesTrackedValue(expr: Node, names: string[]): boolean {
+    const taking = this.callTakingTrackedValue(expr, names);
+    return !!taking && this.callStatesItsArgument(taking.call, taking.index);
   }
 
   /** `expr` holds a binary whole-body read taken on a tracked name. */
@@ -4440,7 +4585,10 @@ export class TypeInferrer {
    *    serialiser answering `string` describes what the caller did with the
    *    body, not what the body is, and publishing it would be a
    *    concrete-but-wrong contract where the honest `any` of the read is
-   *    merely unresolved.
+   *    merely unresolved;
+   *  - the call states its argument (`callStatesItsArgument`): a schema
+   *    validates it, or the callee returns it unchanged. A converter's
+   *    object result describes what it built, not the body (carrick#2595).
    */
   private statedPayloadAroundBodyRead(bodyRead: Node): Node | undefined {
     return this.receivingCallOf(
@@ -4448,7 +4596,13 @@ export class TypeInferrer {
       (candidate) =>
         Node.isCallExpression(candidate) &&
         this.callResultIsBound(candidate) &&
-        this.isObjectShape(this.unwrapPromiseType(candidate.getType()))
+        this.isObjectShape(this.unwrapPromiseType(candidate.getType())) &&
+        this.callStatesItsArgument(
+          candidate,
+          candidate
+            .getArguments()
+            .findIndex((argument) => argument.getStart() <= bodyRead.getStart() && bodyRead.getEnd() <= argument.getEnd())
+        )
     );
   }
 
@@ -5598,24 +5752,15 @@ export class TypeInferrer {
     const asExpr = Node.isAsExpression(node)
       ? node
       : node.getFirstAncestorByKind(SyntaxKind.AsExpression);
-    if (asExpr) {
-      const typeNode = asExpr.getTypeNode();
-      if (typeNode) {
-        return typeNode;
-      }
+    const asType = statedAssertionType(asExpr?.getTypeNode());
+    if (asType) {
+      return asType;
     }
 
     const typeAssertion = Node.isTypeAssertion(node)
       ? node
       : node.getFirstAncestorByKind(SyntaxKind.TypeAssertionExpression);
-    if (typeAssertion) {
-      const typeNode = typeAssertion.getTypeNode();
-      if (typeNode) {
-        return typeNode;
-      }
-    }
-
-    return undefined;
+    return statedAssertionType(typeAssertion?.getTypeNode());
   }
 
   /**
@@ -7487,16 +7632,19 @@ export class TypeInferrer {
   }
 
   /**
-   * The handler function referenced by a route-registration call: the first
+   * The handler function referenced by a route-registration call: the LAST
    * argument that is an inline function, or an identifier bound to a function
-   * (typically the 2nd+ arg — the path literal is not function-valued, so it is
-   * skipped naturally). No callee-name check: a call whose argument resolves to
-   * a function is structurally a registration regardless of the framework.
+   * (carrick#2472 P3-2b). The functions before it are middleware
+   * (`route(path).post(auth, audit, handler)`), which runs first and hands on;
+   * reading the first function read a middleware as the route. The path
+   * literal is not function-valued, so it is skipped naturally. No callee-name
+   * check: a call whose argument resolves to a function is structurally a
+   * registration regardless of the framework.
    */
   private handlerFromRegistrationCall(
     call: CallExpression
   ): FunctionLike | undefined {
-    for (const arg of call.getArguments()) {
+    for (const arg of [...call.getArguments()].reverse()) {
       const handler = this.asHandlerFunction(arg);
       if (handler) {
         return handler;
@@ -7539,8 +7687,10 @@ export class TypeInferrer {
    * declaration (via the compiler's definition nodes) and returned when that
    * declaration is — or initializes to — a function. Anything else (a path
    * literal, an object, a non-function binding) yields undefined.
+   * `followWrapperCalls` false reads a binding to a wrapper call as no
+   * function, so a name the wrapper walk meets is never walked again.
    */
-  private asHandlerFunction(node: Node): FunctionLike | undefined {
+  private asHandlerFunction(node: Node, followWrapperCalls = true): FunctionLike | undefined {
     const expr = this.unwrapExpressionNode(node);
 
     if (Node.isArrowFunction(expr) || Node.isFunctionExpression(expr)) {
@@ -7549,7 +7699,7 @@ export class TypeInferrer {
 
     if (Node.isIdentifier(expr)) {
       for (const def of expr.getDefinitionNodes()) {
-        const func = this.functionFromDeclaration(def);
+        const func = this.functionFromDeclaration(def, followWrapperCalls);
         if (func) {
           return func;
         }
@@ -7563,10 +7713,16 @@ export class TypeInferrer {
    * Extract a `FunctionLike` from a declaration node the compiler resolved an
    * identifier to: a function declaration is itself the function; a variable
    * declaration / binding whose initializer is an inline function yields that
-   * function (`const h = async () => { … }`). Import/re-export shims are walked
-   * by ts-morph's `getDefinitionNodes`, so no manual import chasing is needed.
+   * function (`const h = async () => { … }`), and one whose initializer is a
+   * wrapper call yields the function the call wraps
+   * (`const h = wrap<Contract>(async (req, res) => { … })`, carrick#2472
+   * P3-2b; `functionWrappedBy`). Import/re-export shims are walked by
+   * ts-morph's `getDefinitionNodes`, so no manual import chasing is needed.
    */
-  private functionFromDeclaration(decl: Node): FunctionLike | undefined {
+  private functionFromDeclaration(
+    decl: Node,
+    followWrapperCalls = true
+  ): FunctionLike | undefined {
     if (Node.isFunctionDeclaration(decl)) {
       return decl;
     }
@@ -7593,10 +7749,42 @@ export class TypeInferrer {
         if (Node.isArrowFunction(inner) || Node.isFunctionExpression(inner)) {
           return inner;
         }
+        if (followWrapperCalls && Node.isCallExpression(inner)) {
+          return this.functionWrappedBy(inner, 0);
+        }
       }
     }
 
     return undefined;
+  }
+
+  /**
+   * The function a call wraps, for a name bound to that call and used as a
+   * handler (carrick#2472 P3-2b): the call's one argument that is a function
+   * literal, a name bound to one, or another such call, a few calls deep.
+   *
+   * Two conditions keep this to wrappers. The call's own value has to be
+   * callable, because the name is used as a function: `rows.map((row) => …)`
+   * is handed a function and yields a list. And exactly one argument may be a
+   * function: with two there is no saying which of them is wrapped.
+   */
+  private functionWrappedBy(call: CallExpression, depth: number): FunctionLike | undefined {
+    if (depth >= WRAPPER_CALL_MAX_DEPTH) return undefined;
+    if (!this.isCallableType(call.getType())) return undefined;
+    const wrapped: FunctionLike[] = [];
+    for (const arg of call.getArguments()) {
+      const value = this.unwrapExpressionNode(arg);
+      const func =
+        Node.isArrowFunction(value) || Node.isFunctionExpression(value)
+          ? value
+          : Node.isCallExpression(value)
+            ? this.functionWrappedBy(value, depth + 1)
+            : Node.isIdentifier(value)
+              ? this.asHandlerFunction(value, false)
+              : undefined;
+      if (func) wrapped.push(func);
+    }
+    return wrapped.length === 1 ? wrapped[0] : undefined;
   }
 
   /**
@@ -8242,6 +8430,343 @@ export class TypeInferrer {
     return { kind: 'none' };
   }
 
+  /**
+   * carrick#2628: the located node is an argument of a call into a function
+   * whose body the program holds (an in-repo client method,
+   * `client.addTags(project, unique(tags))`), at a parameter that is not a
+   * body slot. What the call sends is decided inside that function, so the
+   * argument is the body only when the function sends it unchanged. One
+   * level, read off each use of the parameter in the function's body:
+   *
+   *  - the use IS the value of a body-named member (`body: tags`,
+   *    `body: JSON.stringify(tags)`) or of a body slot of a call: the
+   *    argument is the body, and its own type stands (`none`);
+   *  - the use sits inside such a value (`body: { tags }`,
+   *    `body: (event ?? {}) as never`): the body is that value, read at the
+   *    function without the casts around it;
+   *  - the use sits inside an object or array literal that is no body value
+   *    (`send(project, [labels])`): the body cannot be told, abstain.
+   *
+   * Uses that disagree abstain. A generic function's body may be typed by
+   * its type parameters, so it abstains too. A library's declaration
+   * (`fetch`, an installed client) has no body to read and is left alone,
+   * and so is an untyped argument (a handler's `request.body` handed to a
+   * helper): it states no contract to mistake, and the untyped-read path
+   * below reads it.
+   */
+  private bodyBuiltByCallee(
+    node: Node
+  ):
+    | { kind: 'none' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string } {
+    const read = this.calleeBodyRead(node, 0);
+    return read.kind === 'passes' ? { kind: 'none' } : read;
+  }
+
+  /**
+   * `bodyBuiltByCallee`, telling apart a callee that sends the argument
+   * unchanged (`passes`) from one that states nothing about it (`none`).
+   * `depth` counts the forwarded locals followed (carrick#2671).
+   */
+  private calleeBodyRead(
+    node: Node,
+    depth: number
+  ):
+    | { kind: 'none' }
+    | { kind: 'passes' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string } {
+    const own = node.getType();
+    if (own.isAny() || own.isUnknown()) return { kind: 'none' };
+    const call = this.receivingCallOf(node, (candidate) => Node.isCallExpression(candidate));
+    if (!call || !Node.isCallExpression(call)) return { kind: 'none' };
+    const index = call
+      .getArguments()
+      .findIndex((a) => a.getPos() <= node.getPos() && node.getEnd() <= a.getEnd());
+    if (index < 0) return { kind: 'none' };
+    if (this.requestBodySlots(call)[index]) return { kind: 'none' };
+
+    const callee = this.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration();
+    if (
+      !callee ||
+      !(
+        Node.isFunctionDeclaration(callee) ||
+        Node.isMethodDeclaration(callee) ||
+        Node.isArrowFunction(callee) ||
+        Node.isFunctionExpression(callee)
+      )
+    ) {
+      return { kind: 'none' };
+    }
+    const body = callee.getBody();
+    if (!body) return { kind: 'none' };
+    const program = this.project.getProgram().compilerObject;
+    if (
+      isExternalOrigin(
+        program,
+        callee.getSourceFile().compilerNode,
+        this.repoRoot,
+        externalImportsOf(this.project)
+      )
+    ) {
+      return { kind: 'none' };
+    }
+    const param = callee.getParameters()[index];
+    if (!param || param.isRestParameter()) return { kind: 'none' };
+    const paramName = param.getNameNode();
+    if (!Node.isIdentifier(paramName)) return { kind: 'none' };
+    const paramSymbol = paramName.getSymbol()?.compilerSymbol;
+    if (!paramSymbol) return { kind: 'none' };
+
+    const checker = this.project.getTypeChecker().compilerObject;
+    const uses = body.getDescendantsOfKind(SyntaxKind.Identifier).filter((id) => {
+      const parent = id.getParent();
+      const symbol =
+        parent && Node.isShorthandPropertyAssignment(parent)
+          ? checker.getShorthandAssignmentValueSymbol(parent.compilerNode)
+          : id.getSymbol()?.compilerSymbol;
+      return symbol === paramSymbol;
+    });
+
+    const from = 'a call into a function that builds the request body inside itself';
+    let passedThrough = false;
+    const built: Node[] = [];
+    for (const use of uses) {
+      // carrick#2668: `data ? JSON.stringify(data) : undefined` tests the
+      // argument before it sends it; the test is no body.
+      if (this.inSendNothingTest(use, body)) continue;
+      const value = this.bodyValueAround(use, body);
+      if (value === use) {
+        passedThrough = true;
+        continue;
+      }
+      if (value) {
+        built.push(value);
+        continue;
+      }
+      // carrick#2671: the use builds a local (`const payload = { ...input,
+      // code: norm(input.code) }`) the function then sends unchanged, itself
+      // or through a helper that passes it on as the body. The body is that
+      // local.
+      const forwarded = this.forwardedLocalHolding(use, body, depth);
+      if (forwarded) {
+        built.push(forwarded);
+        continue;
+      }
+      const ancestors = use.getAncestors();
+      const insideLiteral = ancestors
+        .slice(0, ancestors.indexOf(body))
+        .some((a) => Node.isObjectLiteralExpression(a) || Node.isArrayLiteralExpression(a));
+      if (insideLiteral) {
+        return {
+          kind: 'abstain',
+          why: `the located argument goes into a value the called function builds and does not send as a body (${from})`,
+        };
+      }
+    }
+    if (built.length === 0) return passedThrough ? { kind: 'passes' } : { kind: 'none' };
+    if (passedThrough) {
+      return { kind: 'abstain', why: `the called function both sends the argument and builds a body from it (${from})` };
+    }
+    if (callee.getTypeParameters().length > 0) {
+      return { kind: 'abstain', why: `the called function is generic, so the body it builds may be typed by its type parameters (${from})` };
+    }
+    const types = built.map((value) => this.sentValue(value));
+    const texts = new Set(types.map((value) => typeText(value.getType(), value)));
+    if (texts.size !== 1) {
+      return { kind: 'abstain', why: `the called function builds more than one body from the argument (${from})` };
+    }
+    const at = types[0];
+    const type = at.getType();
+    if (type.isTypeParameter() || printedTypeHoldsTopType([...texts][0])) {
+      return { kind: 'abstain', why: `the body the called function builds is not fully typed (${from})` };
+    }
+    return { kind: 'body_type', type, at, from };
+  }
+
+  /**
+   * The request body value `use` is part of, inside `scope`: the value of a
+   * body-named object member, or the argument at a body slot of a call,
+   * looking through parentheses, casts, `await` and a `JSON.stringify`
+   * around it. `use` itself when it is that value whole.
+   */
+  private bodyValueAround(use: Node, scope: Node): Node | undefined {
+    let current: Node = use;
+    while (current !== scope) {
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (
+        Node.isShorthandPropertyAssignment(parent) &&
+        current === use &&
+        BODY_MEMBER_NAMES.has(parent.getName())
+      ) {
+        return use;
+      }
+      if (
+        Node.isPropertyAssignment(parent) &&
+        parent.getInitializer() === current &&
+        BODY_MEMBER_NAMES.has(parent.getName())
+      ) {
+        return this.isSameValue(current, use) ? use : current;
+      }
+      if (Node.isCallExpression(parent)) {
+        const index = parent.getArguments().indexOf(current);
+        if (index >= 0 && this.requestBodySlots(parent)[index]?.kind === 'body') {
+          return this.isSameValue(current, use) ? use : current;
+        }
+      }
+      current = parent;
+    }
+    return undefined;
+  }
+
+  /**
+   * carrick#2671: the `const` local whose initializer holds `use`, inside
+   * `scope`, when `scope` sends that local unchanged as the body: whole in a
+   * body slot, or as an argument into a function that passes it on as its
+   * body. The local's name, so its declared type is read. Undefined when the
+   * local is never sent, when a further body is built from it, or when a
+   * function lies between `use` and the declaration.
+   */
+  private forwardedLocalHolding(use: Node, scope: Node, depth: number): Node | undefined {
+    if (depth >= 2) return undefined;
+    let current: Node = use;
+    let declaration: VariableDeclaration | undefined;
+    while (current !== scope) {
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (
+        Node.isArrowFunction(parent) ||
+        Node.isFunctionExpression(parent) ||
+        Node.isFunctionDeclaration(parent) ||
+        Node.isMethodDeclaration(parent)
+      ) {
+        return undefined;
+      }
+      if (Node.isVariableDeclaration(parent) && parent.getInitializer() === current) {
+        declaration = parent;
+        break;
+      }
+      current = parent;
+    }
+    if (!declaration) return undefined;
+    if (declaration.getVariableStatement()?.getDeclarationKind() !== VariableDeclarationKind.Const) {
+      return undefined;
+    }
+    const name = declaration.getNameNode();
+    if (!Node.isIdentifier(name)) return undefined;
+    const symbol = name.getSymbol()?.compilerSymbol;
+    if (!symbol) return undefined;
+
+    const checker = this.project.getTypeChecker().compilerObject;
+    let sent = false;
+    for (const ref of scope.getDescendantsOfKind(SyntaxKind.Identifier)) {
+      if (ref === name) continue;
+      const parent = ref.getParent();
+      const refSymbol =
+        parent && Node.isShorthandPropertyAssignment(parent)
+          ? checker.getShorthandAssignmentValueSymbol(parent.compilerNode)
+          : ref.getSymbol()?.compilerSymbol;
+      if (refSymbol !== symbol) continue;
+      if (this.inSendNothingTest(ref, scope)) continue;
+      const value = this.bodyValueAround(ref, scope);
+      if (value === ref) {
+        sent = true;
+        continue;
+      }
+      if (value) return undefined;
+      if (parent && Node.isCallExpression(parent) && parent.getArguments().includes(ref)) {
+        const onward = this.calleeBodyRead(ref, depth + 1);
+        if (onward.kind === 'passes') {
+          sent = true;
+          continue;
+        }
+        if (onward.kind !== 'none') return undefined;
+      }
+    }
+    return sent ? name : undefined;
+  }
+
+  /** `value` is `use` behind what `sentValue` sees through. */
+  private isSameValue(value: Node, use: Node): boolean {
+    return this.sentValue(value) === use;
+  }
+
+  /**
+   * The value a body slot sends when it sends anything, behind parentheses,
+   * casts, `await`, a `JSON.stringify`, and (carrick#2668) a choice whose
+   * other side sends nothing: `x ? JSON.stringify(x) : undefined`,
+   * `x || null`, `x ?? undefined`. A `?? {}` sends `{}`, so it is a body the
+   * function builds and is not seen through.
+   */
+  private sentValue(value: Node): Node {
+    let current = value;
+    for (;;) {
+      let inner = this.unwrapJsonStringifyArg(this.unwrapExpressionNode(current));
+      if (Node.isConditionalExpression(inner)) {
+        inner = this.sendingBranch(inner) ?? inner;
+      } else if (Node.isBinaryExpression(inner)) {
+        const operator = inner.getOperatorToken().getKind();
+        if (
+          (operator === SyntaxKind.BarBarToken || operator === SyntaxKind.QuestionQuestionToken) &&
+          this.sendsNothing(inner.getRight(), false)
+        ) {
+          inner = inner.getLeft();
+        }
+      }
+      if (inner === current) return current;
+      current = inner;
+    }
+  }
+
+  /**
+   * The branch of `choice` that sends something, when its other branch sends
+   * nothing (`undefined`, `null`, `void 0`, or `{}` spread into a request).
+   */
+  private sendingBranch(choice: ConditionalExpression): Node | undefined {
+    const whenTrue = choice.getWhenTrue();
+    const whenFalse = choice.getWhenFalse();
+    if (this.sendsNothing(whenFalse, true) && !this.sendsNothing(whenTrue, true)) return whenTrue;
+    if (this.sendsNothing(whenTrue, true) && !this.sendsNothing(whenFalse, true)) return whenFalse;
+    return undefined;
+  }
+
+  /** `undefined`, `null`, `void 0`, or (where `emptyObject`) `{}`. */
+  private sendsNothing(node: Node, emptyObject: boolean): boolean {
+    const value = this.unwrapExpressionNode(node);
+    if (Node.isNullLiteral(value) || Node.isVoidExpression(value)) return true;
+    if (Node.isIdentifier(value) && value.getText() === 'undefined') return true;
+    return (
+      emptyObject &&
+      Node.isObjectLiteralExpression(value) &&
+      value.getProperties().length === 0
+    );
+  }
+
+  /**
+   * carrick#2668, #2664: `use` sits in the test of a choice whose other side
+   * sends nothing (`body ? JSON.stringify(body) : null`,
+   * `...(body === undefined ? {} : { body: JSON.stringify(body) })`). The
+   * test only decides whether the argument is sent.
+   */
+  private inSendNothingTest(use: Node, scope: Node): boolean {
+    let current: Node = use;
+    while (current !== scope) {
+      const parent = current.getParent();
+      if (!parent) return false;
+      if (
+        Node.isConditionalExpression(parent) &&
+        parent.getCondition() === current &&
+        this.sendingBranch(parent)
+      ) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  }
+
   /** A string, a string literal, a template literal, or a union of strings. */
   private isStringLikeType(type: Type): boolean {
     return (
@@ -8860,25 +9385,10 @@ export class TypeInferrer {
     found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; at: Node; how: string }>,
     stateNode: (rank: number, typeNode: Node | undefined, at: Node, how: string) => void
   ): void {
-    const schemaCandidates: Node[] = [];
-    const callee = call.getExpression();
-    if (Node.isPropertyAccessExpression(callee)) schemaCandidates.push(callee.getExpression());
-    call.getArguments().forEach((argument, at) => {
-      if (at !== index) schemaCandidates.push(this.unwrapExpressionNode(argument));
-    });
-    for (const candidate of schemaCandidates) {
-      const candidateType = candidate.getType();
-      if (
-        !this.schemaOutputType(candidateType, candidate) &&
-        !this.schemaInputType(candidateType, candidate)
-      ) {
-        continue;
-      }
-      const contract = this.schemaContract(candidate, 'input');
-      if (contract) {
-        found.push({ rank: 1, text: contract.text, provenance: contract.provenance, at: call, how: 'a schema it is handed to' });
-        return;
-      }
+    const contract = this.schemaHandedArgument(call, index);
+    if (contract) {
+      found.push({ rank: 1, text: contract.text, provenance: contract.provenance, at: call, how: 'a schema it is handed to' });
+      return;
     }
 
     const passThrough = this.passThroughFunction(call, index);
@@ -8904,6 +9414,45 @@ export class TypeInferrer {
     const text = this.structuralTextFromType(parameterType, call);
     if (!text || /\b(any|unknown)\b/.test(text)) return;
     found.push({ rank: 4, text, at: call, how: 'the parameter of a call it is handed to' });
+  }
+
+  /**
+   * The input contract of a schema `call` validates its argument at `index`
+   * with: its receiver (`Schema.safeParse(body)`) or one of its other
+   * arguments (`parse(Schema, body)`), or null. A candidate counts only when
+   * it declares schema types, so no method or library name is matched
+   * (carrick#1166).
+   */
+  private schemaHandedArgument(call: CallExpression, index: number): DeclaredContract | null {
+    const candidates: Node[] = [];
+    const callee = call.getExpression();
+    if (Node.isPropertyAccessExpression(callee)) candidates.push(callee.getExpression());
+    call.getArguments().forEach((argument, at) => {
+      if (at !== index) candidates.push(this.unwrapExpressionNode(argument));
+    });
+    for (const candidate of candidates) {
+      const candidateType = candidate.getType();
+      if (
+        !this.schemaOutputType(candidateType, candidate) &&
+        !this.schemaInputType(candidateType, candidate)
+      ) {
+        continue;
+      }
+      const contract = this.schemaContract(candidate, 'input');
+      if (contract) return contract;
+    }
+    return null;
+  }
+
+  /**
+   * `call`'s result describes the value it takes at argument `index`: it
+   * validates it with a schema, or its callee returns it unchanged
+   * (`passThroughFunction`). Any other call builds something new from the
+   * value, and its result describes what it built, never the value it was
+   * handed (carrick#2595).
+   */
+  private callStatesItsArgument(call: CallExpression, index: number): boolean {
+    return index >= 0 && (!!this.schemaHandedArgument(call, index) || !!this.passThroughFunction(call, index));
   }
 
   /**
