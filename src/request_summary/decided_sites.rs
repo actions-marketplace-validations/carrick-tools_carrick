@@ -61,11 +61,13 @@ use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_tar
 pub mod boundaries;
 mod composed;
 mod instances;
+mod procedures;
 pub use boundaries::RouteBoundaries;
 pub use composed::Composed;
 pub use instances::{
     InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
 };
+pub use procedures::{Procedure, ProcedureLabels};
 
 /// The hop discovery records where a walk enters a function through a value
 /// the call runs (carrick#2432, [`super::discovery`]).
@@ -549,6 +551,11 @@ pub struct DecidedSite {
     /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
     /// left out.
     pub composed_trimmed: bool,
+    /// With the receiver trace on, for a procedure op's site (its label
+    /// names it by its key, carrick#2474 R6c), the paths the adapters that
+    /// serve its router serve it at ([`procedures`]); `None` for every
+    /// other site. Never part of a record's state.
+    pub procedure: Option<Procedure>,
 }
 
 impl DecidedSite {
@@ -715,6 +722,10 @@ pub struct Decided {
     /// it (carrick#2474 R5a). Read by nothing yet; never part of a record's
     /// state.
     pub boundaries: RouteBoundaries,
+    /// With the receiver trace on, each value the procedure pass stopped
+    /// at with no procedure to count it on (carrick#2474 R6c), once per
+    /// adapter.
+    pub procedure_stops: usize,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -984,6 +995,20 @@ fn filled(pieces: &[Piece], call: &CallIr) -> Vec<Piece> {
     }))
 }
 
+/// One key of a value that is a whole parameter: of the function the call
+/// is written in, or of one around it when the call sits in a function
+/// written inside that one (`span(() => fetch(url, init))` reads `init`'s
+/// `method` as a key of the enclosing function's parameter). `None` when
+/// the value is anything else.
+fn keyed(pieces: &[Piece], key: &str) -> Option<Piece> {
+    match pieces {
+        [Piece::Param(index, name)] => Some(Piece::ParamKey(*index, key.to_string(), name.clone())),
+        [Piece::Outer(depth, inner)] => keyed(std::slice::from_ref(&**inner), key)
+            .map(|piece| Piece::Outer(*depth, Box::new(piece))),
+        _ => None,
+    }
+}
+
 /// The argument positions `pieces` reads, as the callee's own parameters.
 fn parameter_positions(pieces: &[Piece]) -> BTreeSet<usize> {
     pieces
@@ -1007,12 +1032,9 @@ fn slot_value(call: &CallIr, slot: &ArgSlot) -> Vec<Piece> {
             .fields
             .get(key)
             .map_or(vec![Piece::Unknown], Value::pieces),
-        (Some(key), Value::Str(pieces)) => match pieces.as_slice() {
-            [Piece::Param(index, name)] => {
-                vec![Piece::ParamKey(*index, key.clone(), name.clone())]
-            }
-            _ => vec![Piece::Unknown],
-        },
+        (Some(key), Value::Str(pieces)) => {
+            keyed(pieces, key).map_or(vec![Piece::Unknown], |piece| vec![piece])
+        }
         _ => vec![Piece::Unknown],
     }
 }
@@ -1129,12 +1151,9 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
             },
             (None, _) => MethodValue::Pieces(vec![Piece::Unknown]),
         },
-        (Some(key), Value::Str(pieces)) => match pieces.as_slice() {
-            [Piece::Param(index, name)] => {
-                MethodValue::Pieces(vec![Piece::ParamKey(*index, key.to_string(), name.clone())])
-            }
-            _ => MethodValue::Pieces(vec![Piece::Unknown]),
-        },
+        (Some(key), Value::Str(pieces)) => {
+            MethodValue::Pieces(vec![keyed(pieces, key).unwrap_or(Piece::Unknown)])
+        }
         _ => MethodValue::Pieces(vec![Piece::Unknown]),
     }
 }
@@ -1354,6 +1373,7 @@ impl<'a> Walk<'a, '_> {
             instances,
             composed: Vec::new(),
             composed_trimmed: false,
+            procedure: None,
         });
     }
 
@@ -1528,6 +1548,7 @@ impl<'a> Walk<'a, '_> {
                 instances: instances.clone(),
                 composed: Vec::new(),
                 composed_trimmed: false,
+                procedure: None,
             });
         }
     }
@@ -1581,7 +1602,15 @@ pub fn decided_sites(
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
 ) -> Decided {
-    decide(inputs, root, discovered, labels, None, &[])
+    decide(
+        inputs,
+        root,
+        discovered,
+        labels,
+        None,
+        &[],
+        &ProcedureLabels::default(),
+    )
 }
 
 /// [`decided_sites`] with the receiver trace on (carrick#2474 R2a): each
@@ -1589,7 +1618,8 @@ pub fn decided_sites(
 /// makers the store labels (`makers`), one end per caller that hands one in
 /// ([`DecidedSite::instances`]), through the scopes the store's scope
 /// members open (`scopes`), and the full path it is served at under them
-/// and the mounts ([`DecidedSite::composed`], R2b).
+/// and the mounts ([`DecidedSite::composed`], R2b), and each procedure op's
+/// site the paths its router is served at (`procedures`, R6c).
 pub fn decided_sites_traced(
     inputs: &RequestSummaryInputs,
     root: &Path,
@@ -1597,8 +1627,17 @@ pub fn decided_sites_traced(
     labels: &[SiteLabel],
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
+    procedures: &ProcedureLabels,
 ) -> Decided {
-    decide(inputs, root, discovered, labels, Some(makers), scopes)
+    decide(
+        inputs,
+        root,
+        discovered,
+        labels,
+        Some(makers),
+        scopes,
+        procedures,
+    )
 }
 
 fn decide(
@@ -1608,6 +1647,7 @@ fn decide(
     labels: &[SiteLabel],
     makers: Option<&[MakerLabel]>,
     scopes: &[ScopeLabel],
+    procedures: &ProcedureLabels,
 ) -> Decided {
     let calls = Calls::index(inputs);
     let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
@@ -1791,6 +1831,18 @@ fn decide(
                 (site.composed, site.composed_trimmed) =
                     composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
             }
+            procedures::Pass {
+                calls: &calls,
+                inputs,
+                root,
+                makers,
+                scopes,
+                index,
+                mounts: &mounts,
+                labels: procedures,
+                site_labels: labels,
+            }
+            .run(&mut out, discovered);
             mounts
         }
         _ => composed::Mounts::default(),
