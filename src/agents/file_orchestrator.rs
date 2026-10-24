@@ -1461,6 +1461,16 @@ fn template_pattern_matches(quasis: &[String], topic: &str) -> bool {
     remaining.ends_with(last.as_str())
 }
 
+/// What the documentation fold does to a graph, by row
+/// ([`FileOrchestrator::documented_folds`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DocumentedFolds {
+    /// Rows that take the documentation's `descriptor_route` label.
+    pub(crate) folded_into: Vec<bool>,
+    /// Documentation rows that go.
+    pub(crate) drop: Vec<bool>,
+}
+
 /// A mount-site binding, resolved back to the file that defines it.
 ///
 /// `child_node` is the name the MOUNTING file registered (`sessionsRoutes`);
@@ -3603,10 +3613,17 @@ impl FileOrchestrator {
         // raises none, which is exactly the module a consumer needs read for
         // it. Seeded from the files already parsed for their symbol tables, so
         // the on-demand parse only runs for a module no analyzed file was.
+        //
+        // With the fact layer choosing the reader's files, a member whose
+        // request is a call through a server-framework export is a route
+        // registration, not a request (carrick#2745): it never enters the cache.
+        let server_facts = fact_files.as_ref().filter(|_| choosing_files);
         let mut member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::new();
         for pf in &pending {
             if let Ok(canonical) = Path::new(&pf.path_str).canonicalize() {
-                member_cache.insert(canonical, pf.request_members.clone());
+                let mut index = pf.request_members.clone();
+                Self::drop_server_framework_members(&mut index, &canonical, server_facts);
+                member_cache.insert(canonical, index);
             }
         }
 
@@ -3747,10 +3764,11 @@ impl FileOrchestrator {
                         let mut indexes: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
                         for path in ring {
                             if !member_cache.contains_key(path) {
-                                let index = parse_file(path, &cm, &handler)
+                                let mut index = parse_file(path, &cm, &handler)
                                     .as_ref()
                                     .map(|module| collect_request_members(module, &cm))
                                     .unwrap_or_default();
+                                Self::drop_server_framework_members(&mut index, path, server_facts);
                                 member_cache.insert(path.clone(), index);
                             }
                             if let Some(index) = member_cache.get(path) {
@@ -3820,9 +3838,14 @@ impl FileOrchestrator {
                                     continue;
                                 }
                                 if !member_cache.contains_key(&path) {
-                                    let index = parse_file(&path, &cm, &handler)
+                                    let mut index = parse_file(&path, &cm, &handler)
                                         .map(|module| collect_request_members(&module, &cm))
                                         .unwrap_or_default();
+                                    Self::drop_server_framework_members(
+                                        &mut index,
+                                        &path,
+                                        server_facts,
+                                    );
                                     member_cache.insert(path.clone(), index);
                                 }
                                 if let Some(index) = member_cache.get(&path) {
@@ -3976,6 +3999,15 @@ impl FileOrchestrator {
         }
 
         if let Some(facts) = &fact_files {
+            debug!(
+                "fact files: server-framework calls {} in {} file(s)",
+                facts
+                    .server_framework_calls
+                    .values()
+                    .map(|lines| lines.len())
+                    .sum::<usize>(),
+                facts.server_framework_calls.len()
+            );
             log_fact_files(
                 facts,
                 pending.iter().map(|pf| pf.prompt_path.as_str()),
@@ -10724,6 +10756,32 @@ impl FileOrchestrator {
     /// Where each request member the scan read is declared, keyed by name
     /// (carrick#656).
     ///
+    /// Drop the members of `module` whose request is a call through a
+    /// server-framework export (carrick#2745): `srv.get("/health", handler)`
+    /// has a request's shape and is a route registration. The store's role for
+    /// the export decides, so this reads no syntax. With no facts (the switch
+    /// is off) it keeps every member.
+    fn drop_server_framework_members(
+        index: &mut RequestMemberIndex,
+        module: &Path,
+        facts: Option<&crate::request_summary::fact_files::FactFiles>,
+    ) {
+        let Some(facts) = facts else {
+            return;
+        };
+        index.retain(|name, member| {
+            let registration = facts.server_framework_call(module, member.request_line);
+            if registration {
+                debug!(
+                    "fact files: member {name} at {}:{} is a server-framework call, not a request",
+                    module.display(),
+                    member.request_line
+                );
+            }
+            !registration
+        });
+    }
+
     /// `member_cache` holds every module a member was read for, canonical path
     /// to index; `analysed` maps those paths to the `file_results` key of the
     /// files this scan analysed. A member in a module nothing analysed has no
@@ -12095,6 +12153,26 @@ impl FileOrchestrator {
     /// operation. With several, every row stays: which one the documentation
     /// describes is not something the paths can say.
     pub(crate) fn fold_documented_operations(graph: &mut MountGraph) -> usize {
+        let folds = Self::documented_folds(graph);
+        Self::apply_documented_folds(graph, &folds)
+    }
+
+    /// What [`Self::fold_documented_operations`] does to `graph`, by row,
+    /// before it does it: which rows take the documentation's label, and
+    /// which documentation rows go. A caller that keeps a projection of the
+    /// graph (carrick#2474 R5b) follows the same marks.
+    pub(crate) fn documented_folds(graph: &MountGraph) -> DocumentedFolds {
+        Self::documented_folds_onto(graph, |_| true)
+    }
+
+    /// [`Self::documented_folds`], where a documentation row whose partners
+    /// include one `may_take` refuses (by index) stays: a row written with
+    /// no types (carrick#2474 R5b) does not take the documentation's place,
+    /// so the documentation's types are not lost.
+    pub(crate) fn documented_folds_onto(
+        graph: &MountGraph,
+        may_take: impl Fn(usize) -> bool,
+    ) -> DocumentedFolds {
         let documentation = |endpoint: &ResolvedEndpoint| {
             endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
                 && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
@@ -12121,6 +12199,9 @@ impl FileOrchestrator {
                 })
                 .map(|(other, _)| other)
                 .collect();
+            if !partners.iter().all(|partner| may_take(*partner)) {
+                continue;
+            }
             match partners.as_slice() {
                 [] => {}
                 [partner] if !folded_into[*partner] => {
@@ -12137,16 +12218,22 @@ impl FileOrchestrator {
                 ),
             }
         }
-        for (endpoint, folded) in graph.endpoints.iter_mut().zip(&folded_into) {
+        DocumentedFolds { folded_into, drop }
+    }
+
+    /// Apply `folds`, read from `graph` by [`Self::documented_folds`]: how
+    /// many documentation rows went.
+    pub(crate) fn apply_documented_folds(graph: &mut MountGraph, folds: &DocumentedFolds) -> usize {
+        for (endpoint, folded) in graph.endpoints.iter_mut().zip(&folds.folded_into) {
             if *folded {
                 endpoint.resolution_source = Some(ResolutionSource::DescriptorRoute);
             }
         }
-        let folded = drop.iter().filter(|dropped| **dropped).count();
+        let folded = folds.drop.iter().filter(|dropped| **dropped).count();
         if folded > 0 {
             debug!("Documented operations folded into the handler row serving them: {folded}");
         }
-        let mut keep = drop.iter().map(|dropped| !dropped);
+        let mut keep = folds.drop.iter().map(|dropped| !dropped);
         graph.endpoints.retain(|_| keep.next().unwrap_or(true));
         folded
     }
@@ -21476,6 +21563,53 @@ export { routes };
         );
         assert!(resolved.is_empty(), "{resolved:?}");
         assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// carrick#2745: with the fact layer choosing files, a member whose
+    /// request is a call through a server-framework export is a route
+    /// registration and leaves the index; every other member stays, and with
+    /// no facts nothing moves.
+    #[test]
+    fn a_server_framework_call_is_no_request_member() {
+        let mut registration = ring_member("GET", "/health");
+        registration.request_line = 9;
+        let mut sender = ring_member("GET", "/api/v1/status");
+        sender.request_line = 4;
+        let index = RequestMemberIndex::from([
+            ("createServer".to_string(), registration),
+            ("readStatus".to_string(), sender),
+        ]);
+        let facts = crate::request_summary::fact_files::FactFiles {
+            server_framework_calls: BTreeMap::from([(
+                "src/app.ts".to_string(),
+                BTreeSet::from([9]),
+            )]),
+            ..Default::default()
+        };
+
+        let mut dropped = index.clone();
+        FileOrchestrator::drop_server_framework_members(
+            &mut dropped,
+            Path::new("/repo/src/app.ts"),
+            Some(&facts),
+        );
+        assert_eq!(dropped.keys().collect::<Vec<_>>(), ["readStatus"]);
+
+        let mut off = index.clone();
+        FileOrchestrator::drop_server_framework_members(
+            &mut off,
+            Path::new("/repo/src/app.ts"),
+            None,
+        );
+        assert_eq!(off.len(), 2);
+
+        let mut elsewhere = index;
+        FileOrchestrator::drop_server_framework_members(
+            &mut elsewhere,
+            Path::new("/repo/src/status.ts"),
+            Some(&facts),
+        );
+        assert_eq!(elsewhere.len(), 2);
     }
 
     /// A member two modules declare is attributed to neither: a site naming it
