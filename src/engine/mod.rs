@@ -1529,9 +1529,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // during its own analysis, and here, with every service in hand, the
     // records are matched and the routes they resolve are written. A
     // held-back service's records are read and it is never written. A
-    // carried service is never written and records nothing until R5c (its
-    // boundaries are empty), so on `--changed-only` a route whose boundary
-    // only a carried service fills counts `unmatched_boundary`. Each
+    // carried service is never written, and its boundaries are the ones its
+    // stored blob holds (R5c), so on `--changed-only` a route whose boundary
+    // only a carried service fills resolves as it does in a full scan. Each
     // service states its fallbacks once its counts are in.
     {
         let mut services: Vec<route_boundaries::ServiceRoutes<'_>> = runs
@@ -2321,6 +2321,7 @@ impl ServiceRun {
             .as_ref()
             .map(crate::call_through::StoredCallThrough::sites)
             .unwrap_or_default();
+        let boundaries = stored.route_boundaries.clone().unwrap_or_default();
         Self {
             label: service
                 .service_name
@@ -2332,7 +2333,7 @@ impl ServiceRun {
             held_back: false,
             carried: true,
             call_through,
-            boundaries: Default::default(),
+            boundaries,
             fallbacks: None,
         }
     }
@@ -2608,6 +2609,7 @@ impl ServiceScan {
         // Stored with the blob, for a later run that carries this service
         // (carrick#2378).
         data.call_through = crate::call_through::StoredCallThrough::of(&analysis.call_through);
+        data.route_boundaries = Some(analysis.route_boundaries.clone()).filter(|b| !b.is_empty());
         Ok(ServiceRun {
             label: label.to_string(),
             data,
@@ -5626,6 +5628,24 @@ struct TracedWrite {
     added: std::ops::Range<usize>,
 }
 
+/// A graph row's `file_location` as the file it names, that file relative
+/// to `repo_root` (a [`normalize_protocol_file`] path), and its line.
+fn row_place(location: &str, repo_root: &Path) -> Option<(String, String, u32)> {
+    let (file, line) = location.rsplit_once(':')?;
+    let line = line.parse().ok()?;
+    let normal = normalize_protocol_file(Path::new(file));
+    let relative = normal
+        .strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .unwrap_or(normal);
+    let relative = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some((file.to_string(), relative, line))
+}
+
 /// The rows a scope or a host decides, at every traced route's site: the
 /// writer [`apply_traced_routes`] (one service, before the payload is built)
 /// and [`crate::route_boundaries`] (across services, at the join point)
@@ -5645,21 +5665,7 @@ fn write_traced_routes(
     }
     let applied = &mut write.applied;
     let repo_root = normalize_protocol_file(Path::new(repo_path));
-    let place = |location: &str| -> Option<(String, String, u32)> {
-        let (file, line) = location.rsplit_once(':')?;
-        let line = line.parse().ok()?;
-        let normal = normalize_protocol_file(Path::new(file));
-        let relative = normal
-            .strip_prefix(&repo_root)
-            .map(Path::to_path_buf)
-            .unwrap_or(normal);
-        let relative = relative
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        Some((file.to_string(), relative, line))
-    };
+    let place = |location: &str| row_place(location, &repo_root);
     // The graph names its files as the walk did (repo-relative, or under
     // the repo path): a written row names its file the same way.
     let prefix = mount_graph
@@ -8077,6 +8083,7 @@ fn build_cloud_data_from_mount_graph(
         possible_calls: None,
         possible_calls_omitted: None,
         call_through: None,
+        route_boundaries: None,
     }
 }
 
@@ -13296,6 +13303,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         }
     }
 
@@ -14268,6 +14276,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         relativize_cloud_paths(
@@ -14487,6 +14496,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -14542,6 +14552,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         }];
 
         // Test Config merging
@@ -14642,6 +14653,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -15383,6 +15395,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -15443,6 +15456,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -15516,6 +15530,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 possible_calls: None,
                 possible_calls_omitted: None,
                 call_through: None,
+                route_boundaries: None,
             }
         }
 
@@ -15598,6 +15613,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -15822,6 +15838,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -15973,6 +15990,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         attach_external_call_candidates(
@@ -16101,6 +16119,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         attach_external_call_candidates(
@@ -16223,6 +16242,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -27728,6 +27748,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         }
     }
 

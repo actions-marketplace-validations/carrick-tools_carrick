@@ -21,6 +21,8 @@
 //! give, and each host whose path is not read is counted (carrick#2474 Q5,
 //! ruled (ii) by David on 2026-10-23).
 
+mod documentation;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -43,11 +45,7 @@ pub(super) struct ServiceRoutes<'a> {
     pub(super) boundaries: &'a RouteBoundaries,
     /// Analysed in this run, and so written. A held-back service is read for
     /// its boundaries and never changed. A carried one is never changed and
-    /// has no boundaries until carrick#2474 R5c: on `--changed-only`, a
-    /// route whose boundary only a carried service fills counts
-    /// `routes_across_untraced_unmatched_boundary` (or, where its site also
-    /// serves it in its own service, keeps that path and counts the
-    /// boundary as an unread host).
+    /// brings the boundaries its stored blob holds (carrick#2474 R5c).
     pub(super) writable: bool,
 }
 
@@ -75,6 +73,7 @@ pub(super) fn settle(
         .map(|(name, service)| (name.as_str(), service.boundaries))
         .collect();
     let mut traced: Vec<Vec<TracedRoute>> = vec![Vec::new(); services.len()];
+    let mut composed: Vec<documentation::Composed> = Vec::new();
     for resolved in boundaries::resolve(&facts, FAN_OUT) {
         let Ok(index) = resolved.service.parse::<usize>() else {
             continue;
@@ -91,6 +90,13 @@ pub(super) fn settle(
                 .or_default() += 1;
             continue;
         }
+        composed.push(documentation::Composed {
+            service: index,
+            file: resolved.file.clone(),
+            line: resolved.line,
+            method: resolved.method.clone(),
+            scope_files: resolved.scope_files,
+        });
         traced[index].push(TracedRoute {
             file: resolved.file,
             line: resolved.line,
@@ -130,6 +136,9 @@ pub(super) fn settle(
             "receiver trace: routes across services written at the join point"
         );
     }
+    // A documentation row of one service folds onto the handler row another
+    // composed through a call in its files (carrick#2474 R5d).
+    documentation::fold(services, &composed, repo_path, &mut counts);
     counts
 }
 
