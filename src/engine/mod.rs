@@ -4012,6 +4012,7 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             protocol_extractions.library = library;
+            let server_claims = server_claims_of(&claims, &semantics_root);
             let declarations = member_declarations(
                 crate::site_questions::enabled()
                     && crate::request_summary::discovery::receiver_trace_enabled(),
@@ -4252,6 +4253,7 @@ async fn analyze_current_repo_incremental(
                 &protocol_requests,
                 &protocol_infer,
                 &payload_infer,
+                server_claims.as_ref(),
                 &mut cloud_data,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Types);
@@ -4997,6 +4999,22 @@ fn library_rows(
         read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
     )
+}
+
+/// The settled server-framework claims a service's `infer` request reads
+/// route handlers' parameters through (carrick#2674), verified again by the
+/// sidecar from `from_dir`; `None` when the service has none.
+fn server_claims_of(
+    claims: &[crate::library_claims::ExportClaims],
+    from_dir: &Path,
+) -> Option<crate::services::type_sidecar::ServerClaims> {
+    let checks = crate::library_claims::server_checks(claims);
+    (!checks.is_empty()).then(|| crate::services::type_sidecar::ServerClaims {
+        from_dir: from_dir.to_string_lossy().into_owned(),
+        scan_root: None,
+        type_packages: crate::library_claims::server_type_packages(claims),
+        checks,
+    })
 }
 
 /// The service's site rows (carrick#2439): every call discovery finds that
@@ -8020,6 +8038,7 @@ fn resolve_types_if_available(
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     payload_infer: &[crate::services::type_sidecar::InferRequestItem],
+    server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
@@ -8055,6 +8074,7 @@ fn resolve_types_if_available(
                 extra_explicit,
                 extra_infer,
                 payload_infer,
+                server_claims,
             ) {
                 Ok(type_resolution) => {
                     debug!(
@@ -10862,6 +10882,7 @@ async fn analyze_current_repo(
     let (library, claims) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
+    let server_claims = server_claims_of(&claims, &service_root);
     let declarations = member_declarations(
         crate::site_questions::enabled()
             && crate::request_summary::discovery::receiver_trace_enabled(),
@@ -11062,6 +11083,7 @@ async fn analyze_current_repo(
         &protocol_requests,
         &protocol_infer,
         &payload_infer,
+        server_claims.as_ref(),
         &mut cloud_data,
     );
 
@@ -16814,6 +16836,92 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 (13, Some(chain)),
                 (7, None),
             ]
+        );
+    }
+
+    /// carrick#2726: a model row whose id is the span of a call joins no
+    /// candidate when its file is read again with none offered, and reaches
+    /// the withdrawal with no span. Its id still names the call: a silent
+    /// outer call whose argument awaits an injected function. The row is
+    /// withdrawn there even though its text writes only the inner call, as
+    /// it is when the id joins. The same row with a line id is placed by its
+    /// text and kept, and so is one whose id names no call at exactly that
+    /// span.
+    #[test]
+    fn a_model_row_whose_id_names_a_silent_call_is_withdrawn_with_no_span() {
+        use crate::agents::file_analyzer_agent::{
+            DataCallResult, FileAnalysisResult, ResolutionSource,
+        };
+        let outer = "guard.check(\n    await deps.del(id),\n    \"removed\",\n  )";
+        let use_source = format!(
+            "import * as guard from \"./guard\";\n\nexport async function remove(deps: {{ del: (id: string) => Promise<boolean> }}, id: string) {{\n  {outer};\n}}\n"
+        );
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source.as_str()),
+            (
+                "src/guard.ts",
+                "export function check(ok: boolean, label: string): void {\n  if (!ok) {\n    throw new Error(label);\n  }\n}\n",
+            ),
+        ]);
+        let path = dir.path().join("src/use.ts");
+        let silent = summaries_of(&discovery)
+            .silent(&path)
+            .cloned()
+            .unwrap_or_default();
+        let lo = site_start(&use_source, outer);
+        let hi = lo + u32::try_from(outer.len()).unwrap();
+        assert!(silent.contains(&lo), "the outer call is silent: {silent:?}");
+        // The line `await deps.del(id)` is written on.
+        let line = 5;
+        let row = |id: String| DataCallResult {
+            candidate_id: id,
+            line_number: line,
+            target: "/items/:id".to_string(),
+            method: Some("DELETE".to_string()),
+            call_kind: None,
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: Some("await deps.del(id)".to_string()),
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            dispatch: None,
+            resolution_source: Some(ResolutionSource::Model),
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                row(format!("span:{lo}-{hi}")),
+                row(format!("@line:{line}")),
+                row(format!("span:{lo}-{}", hi + 1)),
+            ],
+            ..Default::default()
+        };
+        let withdrawn = crate::agents::file_orchestrator::FileOrchestrator::withdraw_silent_sites(
+            &mut result,
+            &silent,
+            &path,
+            &use_source,
+        );
+        let kept: Vec<&str> = result
+            .data_calls
+            .iter()
+            .map(|call| call.candidate_id.as_str())
+            .collect();
+        assert_eq!(withdrawn, 1, "kept: {kept:?}");
+        assert_eq!(
+            kept,
+            vec![format!("@line:{line}"), format!("span:{lo}-{}", hi + 1)]
         );
     }
 
