@@ -28,9 +28,7 @@ use crate::{
     },
     call_base::{resolve_call_base, stated_base, written_base},
     cloud_storage::{ManifestRole, ManifestTypeKind},
-    compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
-    engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
         WholeUrlFallbackMap, base_default_states_a_path, exported_env_aliases,
@@ -59,7 +57,7 @@ use crate::{
     swc_scanner::{
         CandidateTarget, ControllerRouteBinding, DecoratorRoute, PubsubAnchorOp,
         RouteDescriptorEndpoint, SwcScanner, collect_import_sources, is_producer_route_path,
-        normalize_path_params, parse_standalone_module,
+        normalize_path_params,
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
@@ -712,12 +710,6 @@ pub struct ProcessingStats {
     /// route nothing else states. Each is kept at the model's line with no
     /// span, rather than taking that call's span (carrick#1448).
     pub model_routes_kept_without_a_site: usize,
-    /// Model endpoint rows whose `candidate_id` names no listed site, kept at
-    /// the model's own line with no span because the file's source states the
-    /// route's path in a dispatch position: an equality operand, a `case`
-    /// test or a `startsWith` argument (carrick#2382). Also counted in
-    /// `model_only_rows`.
-    pub model_routes_kept_on_a_path_literal: usize,
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
@@ -760,16 +752,6 @@ pub struct ProcessingStats {
     /// would classify, counted so a free pass is distinguishable from an empty
     /// one (carrick#997 item 8).
     pub candidates_awaiting_model: usize,
-    /// Bare literal candidates the receiver's type classified (carrick#695),
-    /// split by the role it stated. Both are subsets of what
-    /// `unemitted_literal_candidates` would have counted before the arm
-    /// existed, which is what makes a row diff on this change readable.
-    pub receiver_classified_endpoints: usize,
-    pub receiver_classified_calls: usize,
-    /// Bare literal candidates asked about whose receiver type resolved to
-    /// nothing usable — on a checkout with no installed dependencies that is
-    /// every dependency-typed receiver, so the count is the install signal.
-    pub receiver_unresolved: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -807,9 +789,6 @@ const ROUTE_DESCRIPTOR_PATTERN: &str = "route-descriptor";
 /// `pattern_matched` tag for endpoints emitted deterministically from a route
 /// table that binds a path to an imported controller instance (#580).
 const CLASS_CONTROLLER_PATTERN: &str = "class-controller-route";
-
-/// Pattern tag for a route whose ROLE the receiver's type stated (carrick#695).
-const RECEIVER_TYPE_PATTERN: &str = "receiver-type-route";
 
 /// `pattern_matched` tag for endpoints emitted deterministically from a class
 /// that declares its routes with decorators (carrick#732).
@@ -904,84 +883,6 @@ impl DispatchWitnesses {
             Some(Some(witnesses)) => witnesses.witnessed(value),
             _ => true,
         }
-    }
-}
-
-// FROZEN (old path, 2026-10-21): `RouteLiteralWitness` and its impl only.
-// Deletions and safety fixes only. Fixes for wrong or missing rows go in guard
-// sites with chains (carrick#2474 R4). Delete after R4, with discovery on by
-// default and a clean four-repo replay (carrick#2474).
-/// The route paths a file's source states in a dispatch position
-/// (carrick#2382), read by [`compared_route_literals`]: a literal compared by
-/// equality, a `case` test, or a `startsWith` argument, directly or through a
-/// top-level constant.
-///
-/// The join keeps a model route whose echoed id names no listed site when
-/// this witness states its path. It records values, not byte spans, so it has
-/// no span base to agree with the candidate map on.
-#[derive(Debug, Default)]
-struct RouteLiteralWitness {
-    /// Values compared by equality or written as a `case` test.
-    equal: Vec<String>,
-    /// Values passed to `startsWith`.
-    prefixes: Vec<String>,
-}
-
-impl RouteLiteralWitness {
-    /// The witness in `content`, parsed with a source map of its own. `None`
-    /// when it does not parse, which states nothing. `file_path` decides the
-    /// syntax only.
-    fn of_source(file_path: &str, content: &str) -> Option<Self> {
-        let (_, module) = parse_standalone_module(Path::new(file_path), content)?;
-        let mut witness = Self::default();
-        for found in compared_route_literals(&module) {
-            let value = FileOrchestrator::canonicalize_route_path(&found.value);
-            match found.position {
-                ComparisonPosition::Equality | ComparisonPosition::Case => {
-                    witness.equal.push(value)
-                }
-                ComparisonPosition::StartsWith => witness.prefixes.push(value),
-            }
-        }
-        Some(witness)
-    }
-
-    /// Whether the source states `route_path`.
-    ///
-    /// By equality or `case`: the same number of segments, every literal
-    /// segment equal, and a parameter only where the row has one, so
-    /// `"/items"` states `/items` and `"/items/"` does not state `/items/:id`.
-    /// By `startsWith`, and only for a path with a parameter: the literal is
-    /// the path's literal segments before its first parameter, with or
-    /// without the trailing slash, so `"/items/"` states `/items/:id`. A path
-    /// whose first segment is a parameter has no witness.
-    fn states(&self, route_path: &str) -> bool {
-        let canonical = FileOrchestrator::canonicalize_route_path(route_path);
-        let segments: Vec<&str> = canonical.split('/').collect();
-        let is_param = |segment: &str| segment.starts_with(':') || segment.starts_with('*');
-        let Some(first_param) = segments.iter().position(|segment| is_param(segment)) else {
-            return self.equal.contains(&canonical);
-        };
-        if first_param <= 1 {
-            return false;
-        }
-        let equal = self.equal.iter().any(|value| {
-            let theirs: Vec<&str> = value.split('/').collect();
-            theirs.len() == segments.len()
-                && theirs.iter().zip(&segments).all(|(theirs, ours)| {
-                    match (is_param(theirs), is_param(ours)) {
-                        (true, true) => true,
-                        (false, false) => theirs == ours,
-                        _ => false,
-                    }
-                })
-        });
-        let prefix = segments[..first_param].join("/");
-        equal
-            || self
-                .prefixes
-                .iter()
-                .any(|value| value.strip_suffix('/').unwrap_or(value) == prefix)
     }
 }
 
@@ -1791,12 +1692,8 @@ impl ResolutionSource {
             Self::FileBasedRoute
             | Self::DescriptorRoute
             | Self::ClassController
-            | Self::DecoratorRoute => 1,
-            // Above the bare literal it replaces, below every source that
-            // states the TARGET as well as the role: a resolved member or a
-            // whole-URL binding knows where the request goes, and this knows
-            // only what the receiver is.
-            Self::ReceiverType => 1,
+            | Self::DecoratorRoute
+            | Self::ReceiverType => 1,
             Self::InlineLiteral | Self::Model => 0,
             // Never arbitrated here: a declared operation (carrick#831) is
             // not a statement about a call SITE, so it never competes for one.
@@ -2355,12 +2252,6 @@ impl FileOrchestrator {
         // (carrick#1403, carrick#1384); the analyzer-input path still resolves
         // relatively until carrick#474.
         service_modules: &WorkspaceIndex,
-        // The warm type sidecar for THIS service, when one is up. Read once,
-        // before the model pass, to answer what the receiver of a bare
-        // `x.verb("/lit", arg)` site is (carrick#695). `None` — no sidecar, a
-        // sidecar that never became ready, or a failed request — leaves every
-        // such site exactly where it was: the model's to classify.
-        sidecar: Option<&TypeSidecar>,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -2841,9 +2732,6 @@ impl FileOrchestrator {
                     route_endpoints,
                     descriptor_endpoints,
                     decorator_endpoints,
-                    // No call-site candidates here by construction, so
-                    // no receiver to ask about.
-                    &HashMap::new(),
                     // Its request summaries are emitted once they are
                     // composed ([`LateSummaryFile`]).
                     &BTreeMap::new(),
@@ -4085,20 +3973,6 @@ impl FileOrchestrator {
         // is asked anything: a fact the source states outright is not the
         // model's to lose by staying silent.
         //
-        // Before it runs, the one class of candidate the deterministic layer
-        // could never state a row for gets its answer: a bare
-        // `x.verb("/lit", arg)` states a path and a verb but no role, and the
-        // role is a property of the RECEIVER's type (carrick#695). One batched
-        // sidecar request for the whole service, resolved into a per-file
-        // span -> role map that the arm below reads like any other input.
-        let receiver_roles = Self::resolve_receiver_roles(
-            sidecar,
-            pending
-                .iter()
-                .map(|pf| (pf.path_str.as_str(), pf.content.as_str(), &pf.candidate_map)),
-            framework_detection,
-            &mut stats,
-        );
         //
         // The rest of this layer reads the request summaries, which may still
         // be waiting on library semantics the scan is asking about again
@@ -4470,7 +4344,6 @@ impl FileOrchestrator {
                     &[],
                     &[],
                     &[],
-                    &HashMap::new(),
                     summary_rows,
                     &env_schema,
                     // Its rows skip the passes after the join.
@@ -4482,7 +4355,6 @@ impl FileOrchestrator {
                 stats.total_data_calls += result.data_calls.len() - calls_before;
             }
         }
-        let empty_roles: HashMap<u32, ReceiverRole> = HashMap::new();
         let mut analyzed = analyzed;
         for (pf, _) in &mut analyzed {
             let file = Path::new(&pf.path_str);
@@ -4500,7 +4372,6 @@ impl FileOrchestrator {
                 &pf.route_endpoints,
                 &pf.descriptor_endpoints,
                 &pf.decorator_endpoints,
-                receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
                 summaries.rows(file).unwrap_or(&no_summary_rows),
                 &env_schema,
                 true,
@@ -4530,19 +4401,10 @@ impl FileOrchestrator {
                         std::mem::take(&mut pf.resolved),
                         &mut stats.deterministic_rows_emitted,
                     );
-                    // Read only when an endpoint's id names no listed site,
-                    // the one case the join asks it about (carrick#2382).
-                    let path_literals = model
-                        .endpoints
-                        .iter()
-                        .any(|endpoint| !pf.candidate_map.contains_key(&endpoint.candidate_id))
-                        .then(|| RouteLiteralWitness::of_source(&pf.path_str, &pf.content))
-                        .flatten();
                     Self::join_model_rows(
                         &mut adjusted,
                         model,
                         &pf.candidate_map,
-                        path_literals.as_ref(),
                         &overrules,
                         &pf.path_str,
                         pf.route_module_claimed,
@@ -4747,10 +4609,6 @@ impl FileOrchestrator {
         debug!(
             "  - Model routes kept at their own line with no site: {}",
             stats.model_routes_kept_without_a_site
-        );
-        debug!(
-            "  - Model routes kept at their own line on a path literal the file compares: {}",
-            stats.model_routes_kept_on_a_path_literal
         );
         debug!(
             "  - Model statements discarded as contradictions: {}",
@@ -5117,6 +4975,7 @@ impl FileOrchestrator {
                         return false;
                     };
                     infer_requests.push(InferRequestItem {
+                        member: None,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -5140,6 +4999,7 @@ impl FileOrchestrator {
                         return false;
                     }
                     infer_requests.push(InferRequestItem {
+                        member: None,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -5155,6 +5015,7 @@ impl FileOrchestrator {
                 }
                 InferLocator::Line => {
                     infer_requests.push(InferRequestItem {
+                        member: None,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -6174,6 +6035,7 @@ impl FileOrchestrator {
                 }
                 let request = match role {
                     ManifestRole::Consumer => InferRequestItem {
+                        member: None,
                         file_path: file_abs,
                         line_number: line,
                         span_start: None,
@@ -6193,6 +6055,7 @@ impl FileOrchestrator {
                         param_name: None,
                     },
                     ManifestRole::Producer => InferRequestItem {
+                        member: None,
                         // Anchor the containing-function search on the payload
                         // binding's own line when present (the handler may start
                         // lines away from the subscribe call the op is keyed on).
@@ -6452,6 +6315,7 @@ impl FileOrchestrator {
                 continue;
             };
             requests.push(InferRequestItem {
+                member: None,
                 file_path: file.clone(),
                 line_number: declared.line,
                 span_start: Some(crate::utils::sidecar_position(content, declared.lo)),
@@ -6620,6 +6484,7 @@ impl FileOrchestrator {
             let dedup_key = format!("{}|{}|{}", anchor_file, anchor_line, alias);
             if seen.insert(dedup_key) {
                 requests.push(InferRequestItem {
+                    member: None,
                     file_path: anchor_file,
                     line_number: anchor_line,
                     span_start,
@@ -8091,10 +7956,6 @@ impl FileOrchestrator {
         route_endpoints: &[EndpointResult],
         descriptor_endpoints: &[EndpointResult],
         decorator_endpoints: &[EndpointResult],
-        // What the compiler says the receiver of each bare literal candidate
-        // IS, keyed by the candidate's span start (carrick#695). Empty when no
-        // sidecar answered, which is exactly today's behaviour.
-        receiver_roles: &HashMap<u32, ReceiverRole>,
         // What each call site's callee sends, from the request summaries
         // (carrick#1555), keyed by span start. A site may reach more than
         // one request.
@@ -8393,49 +8254,6 @@ impl FileOrchestrator {
                         ResolutionSource::NewUrl,
                         None,
                     ))),
-                });
-            }
-            // FROZEN (old path, 2026-10-21): this `ReceiverType` arm only.
-            // Deletions and safety fixes only. Fixes for wrong or missing rows
-            // go in library claims (the store's role) and compiler rows
-            // (`decl_package`). Delete when the server-framework pick
-            // (carrick-cloud#2378) and the store rebuild (carrick-cloud#2379)
-            // are in, with discovery on by default and a clean four-repo replay
-            // (carrick#2474, R7).
-            // The ROLE of a bare `x.verb("/lit", arg)` site, read off what its
-            // receiver IS (carrick#695). The path and the verb are the site's
-            // own literals, exactly as `InlineLiteral` already reads them; the
-            // only thing the type decides is which side of the boundary the
-            // site sits on — which is why no rule about the call's SHAPE
-            // appears here (ruling, 2026-09-05). An unresolved receiver
-            // contributes no entry to the map at all, so this arm is silent on
-            // a checkout with no installed dependencies.
-            if let Some(role) = receiver_roles.get(&candidate.span_start)
-                && let RequestShapeSignal::Known(shape) = &candidate.request_shape
-                && let Some(path) =
-                    Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-            {
-                let row = match role {
-                    ReceiverRole::Client => ResolvedRow::Call(Box::new(Self::deterministic_call(
-                        candidate,
-                        line,
-                        path.clone(),
-                        Some(shape.method.clone()),
-                        ResolutionSource::ReceiverType,
-                        None,
-                    ))),
-                    ReceiverRole::Server => ResolvedRow::Endpoint(Box::new(
-                        Self::receiver_typed_endpoint(candidate, line, &path, &shape.method),
-                    )),
-                };
-                claim(Resolved {
-                    method: Some(shape.method.clone()),
-                    url: path,
-                    span,
-                    line,
-                    source: ResolutionSource::ReceiverType,
-                    emits: true,
-                    row,
                 });
             }
 
@@ -8898,198 +8716,6 @@ impl FileOrchestrator {
         }
     }
 
-    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
-    // fixes only. Fixes for wrong or missing rows go in library claims (the
-    // store's role) and compiler rows (`decl_package`). Delete when the
-    // server-framework pick (carrick-cloud#2378) and the store rebuild
-    // (carrick-cloud#2379) are in, with discovery on by default and a clean
-    // four-repo replay (carrick#2474, R7).
-    /// The route row a server-typed receiver states (carrick#695).
-    ///
-    /// Every field is the site's own: the receiver identifier owns the route
-    /// (it is what a mount chain is keyed on), the verb is the member invoked,
-    /// the path is the first-argument literal. Nothing is inferred about the
-    /// handler — the model still fills the response anchors when it returns a
-    /// row at this span.
-    fn receiver_typed_endpoint(
-        candidate: &CandidateTarget,
-        line: i32,
-        path: &str,
-        method: &str,
-    ) -> EndpointResult {
-        EndpointResult {
-            handler_declaration_line: None,
-            registration_literal: None,
-            candidate_id: candidate.candidate_id.clone(),
-            line_number: line,
-            owner_node: candidate
-                .receiver_ident
-                .clone()
-                .unwrap_or_else(|| candidate.callee_object.clone()),
-            method: method.to_string(),
-            path: path.to_string(),
-            handler_name: candidate
-                .enclosing_function
-                .clone()
-                .unwrap_or_else(|| candidate.callee_property.clone().unwrap_or_default()),
-            pattern_matched: RECEIVER_TYPE_PATTERN.to_string(),
-            call_expression_span_start: Some(candidate.span_start),
-            call_expression_span_end: Some(candidate.span_end),
-            payload_expression_text: None,
-            payload_expression_line: None,
-            response_expression_text: None,
-            response_expression_line: None,
-            emission_style: None,
-            primary_type_symbol: None,
-            type_import_source: None,
-            dispatch: None,
-            resolution_source: Some(ResolutionSource::ReceiverType),
-            // A registration call, not a file-router module.
-            view_module: false,
-        }
-    }
-
-    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
-    // fixes only. Fixes for wrong or missing rows go in library claims (the
-    // store's role) and compiler rows (`decl_package`). Delete when the
-    // server-framework pick (carrick-cloud#2378) and the store rebuild
-    // (carrick-cloud#2379) are in, with discovery on by default and a clean
-    // four-repo replay (carrick#2474, R7).
-    /// Ask the type sidecar what the receiver of every bare
-    /// `x.verb("/lit", arg)` site is, and map the answers onto roles
-    /// (carrick#695).
-    ///
-    /// One batched request for the whole service: the sidecar is warm and
-    /// span-addressed, so the cost is one round trip regardless of how many
-    /// sites there are. Every failure mode — no sidecar, a sidecar that never
-    /// became ready, a request error, a receiver that did not resolve, a
-    /// package in neither detection list — yields no entry, which leaves the
-    /// site exactly where it is today: the model's to classify.
-    ///
-    /// The spans go out in the sidecar's own numbering, not the scanner's
-    /// (carrick#805). A candidate carries an SWC position: a UTF-8 byte offset
-    /// counted from [`SWC_SPAN_BASE`]. The sidecar resolves it against ts-morph
-    /// positions, which TypeScript counts in UTF-16 code units from zero. The
-    /// two agree on an ASCII file and diverge, cumulatively, from a file's
-    /// first multi-byte character onwards, so an unconverted span past one
-    /// resolved to the enclosing call or to nothing at all — and on a repo
-    /// written in a language with accented characters that was almost every
-    /// site in the service.
-    ///
-    /// Converted here rather than stored converted, because the byte span is
-    /// what joins this pass's answers back to the candidate, and
-    /// `candidate_id` — built from the same numbers — keys the raw
-    /// model-result cache.
-    fn resolve_receiver_roles<'a>(
-        sidecar: Option<&TypeSidecar>,
-        files: impl Iterator<Item = (&'a str, &'a str, &'a HashMap<String, CandidateTarget>)>,
-        detection: &DetectionResult,
-        stats: &mut ProcessingStats,
-    ) -> HashMap<String, HashMap<u32, ReceiverRole>> {
-        let mut roles: HashMap<String, HashMap<u32, ReceiverRole>> = HashMap::new();
-        let Some(sidecar) = sidecar else {
-            debug!("Receiver classification skipped: no type sidecar");
-            return roles;
-        };
-        // With neither list populated nothing can be classified, and the
-        // request would be pure cost.
-        if detection.frameworks.is_empty() && detection.data_fetchers.is_empty() {
-            debug!("Receiver classification skipped: detection named no package");
-            return roles;
-        }
-        // The lists a role is decided against. A run where every site comes
-        // back unresolved is ambiguous without them — the package the receiver
-        // resolved to may simply not be on either list (carrick#1260).
-        debug!(
-            "Receiver classification lists: server={:?} client={:?}",
-            detection.frameworks, detection.data_fetchers
-        );
-
-        // alias -> (file, span). The alias is the join key on the way back.
-        let mut sites: HashMap<String, (String, u32)> = HashMap::new();
-        let mut requests: Vec<InferRequestItem> = Vec::new();
-        for (path_str, content, candidate_map) in files {
-            let mut candidates: Vec<&CandidateTarget> = candidate_map
-                .values()
-                .filter(|candidate| candidate.protocol == Protocol::Http)
-                .filter(|candidate| candidate.receiver_ident.is_some())
-                .filter(|candidate| matches!(candidate.request_shape, RequestShapeSignal::Known(_)))
-                .filter(|candidate| {
-                    Self::route_literal_from_snippet(candidate.path_snippet.as_deref()).is_some()
-                })
-                .collect();
-            candidates.sort_by_key(|candidate| candidate.span_start);
-            for candidate in candidates {
-                let alias = format!("Receiver_{}_{}", requests.len(), candidate.span_start);
-                sites.insert(alias.clone(), (path_str.to_string(), candidate.span_start));
-                requests.push(InferRequestItem {
-                    file_path: path_str.to_string(),
-                    line_number: u32::try_from(candidate.line_number).unwrap_or(1).max(1),
-                    span_start: Some(crate::utils::sidecar_position(
-                        content,
-                        candidate.span_start,
-                    )),
-                    span_end: Some(crate::utils::sidecar_position(content, candidate.span_end)),
-                    expression_text: None,
-                    expression_line: None,
-                    infer_kind: InferKind::ReceiverType,
-                    alias: Some(alias),
-                    param_name: None,
-                });
-            }
-        }
-        if requests.is_empty() {
-            debug!("Receiver classification: no bare literal candidate to ask about");
-            return roles;
-        }
-
-        let response = match sidecar.infer_types(&requests, None) {
-            Ok(response) => response,
-            Err(e) => {
-                warn!(
-                    "[FileOrchestrator] receiver classification unavailable ({} site(s)): {}",
-                    requests.len(),
-                    e
-                );
-                return roles;
-            }
-        };
-        let inferred = response.inferred_types.unwrap_or_default();
-        for entry in &inferred {
-            let Some((path_str, span)) = sites.get(&entry.alias) else {
-                continue;
-            };
-            match classify_receiver(
-                &entry.type_string,
-                entry.declaring_package.as_deref(),
-                &detection.frameworks,
-                &detection.data_fetchers,
-            ) {
-                Some(role) => {
-                    match role {
-                        ReceiverRole::Server => stats.receiver_classified_endpoints += 1,
-                        ReceiverRole::Client => stats.receiver_classified_calls += 1,
-                    }
-                    roles
-                        .entry(path_str.clone())
-                        .or_default()
-                        .insert(*span, role);
-                }
-                None => stats.receiver_unresolved += 1,
-            }
-        }
-        // A site the sidecar returned nothing at all for is unresolved too.
-        stats.receiver_unresolved += requests.len().saturating_sub(inferred.len());
-        debug!(
-            "Receiver classification: {} site(s) asked, {} route(s), {} call(s), {} unresolved",
-            requests.len(),
-            stats.receiver_classified_endpoints,
-            stats.receiver_classified_calls,
-            stats.receiver_unresolved
-        );
-        roles
-    }
-
     /// Put the deterministic rows into the file's result, in source order.
     ///
     /// One row per span. A route that duplicates one already present is
@@ -9180,15 +8806,13 @@ impl FileOrchestrator {
     /// candidate keeps no span, exactly as before, and is placed by its line.
     /// A model row with no deterministic twin is kept as its own row.
     ///
-    /// `path_literals` is what the file's source compares a path against
-    /// (carrick#2382). `None` states nothing: an endpoint whose id names no
-    /// listed site is then dropped and counted.
+    /// An endpoint whose id names no listed site is dropped and counted
+    /// (carrick#2382).
     #[allow(clippy::too_many_arguments)]
     fn join_model_rows(
         result: &mut FileAnalysisResult,
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
-        path_literals: Option<&RouteLiteralWitness>,
         overrules: &[Resolved],
         file_path: &str,
         route_module_claimed: bool,
@@ -9273,8 +8897,6 @@ impl FileOrchestrator {
             );
         }
         for mut endpoint in cases.into_iter().chain(plain) {
-            // Kept only on a path literal the file compares (carrick#2382).
-            let mut on_a_path_literal = false;
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
             // call that states a route path, or — for a route whose
@@ -9361,22 +8983,6 @@ impl FileOrchestrator {
                         // at the model's own line with no span, the way an
                         // unjoinable data call is kept.
                         Some(_) => None,
-                        // The id names no listed site, but the file compares
-                        // a path against this route's own path, which is how
-                        // a service with no router states a route
-                        // (carrick#2382). The row is kept the way the arm
-                        // above keeps one, at its own line with no span. The
-                        // method stays the model's reading: a guard on the
-                        // method cannot be tied to one branch. A file the
-                        // scanner listed no candidate for was sent whole
-                        // (carrick#462) and keeps the drop.
-                        None if !candidate_map.is_empty()
-                            && path_literals
-                                .is_some_and(|literals| literals.states(&endpoint.path)) =>
-                        {
-                            on_a_path_literal = true;
-                            None
-                        }
                         None => {
                             dropped.push(format!(
                                 "{} {} (candidate_id '{}')",
@@ -9399,20 +9005,6 @@ impl FileOrchestrator {
                     endpoint.call_expression_span_start = Some(candidate.span_start);
                     endpoint.call_expression_span_end = Some(candidate.span_end);
                     Self::settle_registration_literal(&mut endpoint, candidate, file_path, stats);
-                }
-                None if on_a_path_literal => {
-                    debug!(
-                        "Keeping the model's {} {} in {} at its own line {} with no span: \
-                         the id it echoed ('{}') names no listed site, and the file compares \
-                         a path against this route's path",
-                        endpoint.method,
-                        endpoint.path,
-                        file_path,
-                        endpoint.line_number,
-                        endpoint.candidate_id
-                    );
-                    endpoint.call_expression_span_start = None;
-                    endpoint.call_expression_span_end = None;
                 }
                 None => {
                     debug!(
@@ -9617,9 +9209,6 @@ impl FileOrchestrator {
                 }
                 None => {
                     stats.model_only_rows += 1;
-                    if on_a_path_literal {
-                        stats.model_routes_kept_on_a_path_literal += 1;
-                    }
                 }
             }
             result.endpoints.push(endpoint);
@@ -14751,7 +14340,6 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &HashMap::new(),
-            None,
             &[],
             "src/client.ts",
             false,
@@ -14894,7 +14482,6 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &candidate_map,
-            None,
             &[],
             "src/client.ts",
             false,
@@ -19259,39 +18846,23 @@ export { routes };
         }
     }
 
+    /// A route row a structural source stated at a call, as the join sees it.
+    fn structural_registration(owner: &str, path: &str, start: u32, end: u32) -> EndpointResult {
+        let mut endpoint = synthetic_endpoint("GET", path);
+        endpoint.candidate_id = format!("{owner}-{path}");
+        endpoint.line_number = 12;
+        endpoint.owner_node = owner.to_string();
+        endpoint.handler_name = "get".to_string();
+        endpoint.registration_literal = None;
+        endpoint.call_expression_span_start = Some(start);
+        endpoint.call_expression_span_end = Some(end);
+        endpoint.resolution_source = Some(ResolutionSource::DescriptorRoute);
+        endpoint
+    }
+
     fn bare_literal_map(receiver: &str, path: &str) -> HashMap<String, CandidateTarget> {
         let candidate = bare_literal_candidate(receiver, path);
         HashMap::from([(candidate.candidate_id.clone(), candidate)])
-    }
-
-    #[test]
-    fn a_server_typed_receiver_emits_the_route_the_site_states() {
-        let candidates = bare_literal_map("app", "/widgets");
-        let (result, stats) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/app.ts",
-            false,
-            &HashMap::from([(100, ReceiverRole::Server)]),
-        );
-
-        assert_eq!(result.data_calls.len(), 0);
-        assert_eq!(result.endpoints.len(), 1);
-        let endpoint = &result.endpoints[0];
-        assert_eq!(endpoint.method, "GET");
-        assert_eq!(endpoint.path, "/widgets");
-        // The receiver owns the route, so a mount chain keyed on it resolves.
-        assert_eq!(endpoint.owner_node, "app");
-        assert_eq!(
-            endpoint.resolution_source,
-            Some(ResolutionSource::ReceiverType)
-        );
-        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     #[test]
@@ -19312,7 +18883,9 @@ export { routes };
         reported.response_expression_text = Some("formatTaskResponse(task)".to_string());
         reported.response_expression_line = Some(14);
 
-        let (result, stats) = emit_and_join_with_receivers(
+        let structural = structural_registration("router", "/:taskId", 100, 140);
+
+        let (result, stats) = emit_and_join_with(
             FileAnalysisResult {
                 endpoints: vec![reported],
                 ..Default::default()
@@ -19322,10 +18895,9 @@ export { routes };
             &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            &[],
+            &[structural],
             "src/api/tasks/tasks.router.ts",
             false,
-            &HashMap::from([(100, ReceiverRole::Server)]),
         );
 
         assert_eq!(
@@ -19342,7 +18914,7 @@ export { routes };
         // The structural layer stated this route, so it keeps the claim.
         assert_eq!(
             endpoint.resolution_source,
-            Some(ResolutionSource::ReceiverType)
+            Some(ResolutionSource::FileBasedRoute)
         );
         // The model's reading of the path and the literal both survive: which
         // of them the mount chain serves is carrick#1145's question.
@@ -19380,7 +18952,7 @@ export { routes };
         reported.handler_name = "anonymous".to_string();
         reported.owner_node = "v2".to_string();
 
-        let (result, _) = emit_and_join_with_receivers(
+        let (result, _) = emit_and_join_with(
             FileAnalysisResult {
                 endpoints: vec![reported],
                 ..Default::default()
@@ -19390,10 +18962,12 @@ export { routes };
             &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            &[],
+            &[
+                structural_registration("v1", "/:taskId", 50, 90),
+                structural_registration("v2", "/:taskId", 100, 140),
+            ],
             "src/api/tasks/tasks.router.ts",
             false,
-            &HashMap::from([(50, ReceiverRole::Server), (100, ReceiverRole::Server)]),
         );
 
         let rows: Vec<_> = result
@@ -19415,36 +18989,10 @@ export { routes };
             "the model's row must fold onto its own registration: {rows:?}"
         );
     }
-
-    #[test]
-    fn a_client_typed_receiver_emits_the_request_the_site_states() {
-        let candidates = bare_literal_map("api", "/widgets");
-        let (result, stats) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/client.ts",
-            false,
-            &HashMap::from([(100, ReceiverRole::Client)]),
-        );
-
-        assert_eq!(result.endpoints.len(), 0);
-        assert_eq!(result.data_calls.len(), 1);
-        let call = &result.data_calls[0];
-        assert_eq!(call.method.as_deref(), Some("GET"));
-        assert_eq!(call.target, "/widgets");
-        assert_eq!(call.resolution_source, Some(ResolutionSource::ReceiverType));
-        assert_eq!(stats.unemitted_literal_candidates, 0);
-    }
-
     #[test]
     fn an_unclassified_receiver_leaves_the_site_exactly_as_it_was() {
         let candidates = bare_literal_map("thing", "/widgets");
-        let (result, stats) = emit_and_join_with_receivers(
+        let (result, stats) = emit_and_join_with(
             FileAnalysisResult::default(),
             &candidates,
             &HashMap::new(),
@@ -19453,9 +19001,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/thing.ts",
-            // The bare-checkout case: no answer for this span.
             false,
-            &HashMap::new(),
         );
 
         assert_eq!(result.endpoints.len(), 0);
@@ -19475,7 +19021,7 @@ export { routes };
     #[test]
     fn a_quoted_word_that_is_not_a_path_is_not_an_unclassified_route_site() {
         let candidates = bare_literal_map("Deno.env", "LEDGER_URL");
-        let (result, stats) = emit_and_join_with_receivers(
+        let (result, stats) = emit_and_join_with(
             FileAnalysisResult::default(),
             &candidates,
             &HashMap::new(),
@@ -19485,52 +19031,12 @@ export { routes };
             &[],
             "src/config.ts",
             false,
-            &HashMap::new(),
         );
 
         assert_eq!(result.endpoints.len(), 0);
         assert_eq!(result.data_calls.len(), 0);
         assert_eq!(stats.unemitted_literal_candidates, 0);
         assert!(stats.unemitted_literal_sites.is_empty());
-    }
-
-    #[test]
-    fn a_source_that_states_the_target_outranks_the_receiver() {
-        // An imported request member knows the target as well as the role, so
-        // it must keep the span: the receiver arm knows only the role.
-        let candidates = bare_literal_map("api", "/widgets");
-        let resolved_members = HashMap::from([(
-            100u32,
-            ResolvedMember {
-                name: "fetchWidget".to_string(),
-                member: crate::imported_request_member::RequestMember {
-                    method: "POST".to_string(),
-                    target: "/v2/widgets".to_string(),
-                    request_line: 3,
-                    body: None,
-                },
-            },
-        )]);
-        let (result, _) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &resolved_members,
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/consumer.ts",
-            false,
-            &HashMap::from([(100, ReceiverRole::Server)]),
-        );
-
-        assert_eq!(result.endpoints.len(), 0);
-        assert_eq!(result.data_calls.len(), 1);
-        assert_eq!(result.data_calls[0].target, "/v2/widgets");
-        assert_eq!(
-            result.data_calls[0].resolution_source,
-            Some(ResolutionSource::ImportedMember)
-        );
     }
 
     fn candidate_with_snippet(id: &str, snippet: Option<&str>) -> CandidateTarget {
@@ -19571,17 +19077,17 @@ export { routes };
         file_path: &str,
         route_module_claimed: bool,
     ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_with_receivers(
+        emit_and_join_core(
             model,
             candidate_map,
             resolved_members,
             local_wrapper_calls,
             aliases,
             whole_url_fallbacks,
+            &LiteralBaseMap::new(),
             route_endpoints,
             file_path,
             route_module_claimed,
-            &HashMap::new(),
         )
     }
 
@@ -19603,66 +19109,6 @@ export { routes };
             &[],
             file_path,
             false,
-            &HashMap::new(),
-            None,
-        )
-    }
-
-    /// The same seam with the source a file's path literals are read from
-    /// (carrick#2382).
-    fn emit_and_join_with_source(
-        model: FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-        route_endpoints: &[EndpointResult],
-        source: &str,
-        file_path: &str,
-        route_module_claimed: bool,
-    ) -> (FileAnalysisResult, ProcessingStats) {
-        let path_literals =
-            RouteLiteralWitness::of_source(file_path, source).expect("the source parses");
-        emit_and_join_core(
-            model,
-            candidate_map,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &LiteralBaseMap::new(),
-            route_endpoints,
-            file_path,
-            route_module_claimed,
-            &HashMap::new(),
-            Some(&path_literals),
-        )
-    }
-
-    /// The same seam with the carrick#695 receiver answers supplied.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_and_join_with_receivers(
-        model: FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-        resolved_members: &HashMap<u32, ResolvedMember>,
-        local_wrapper_calls: &[LocalWrapperCall],
-        aliases: &EnvAliasMap,
-        whole_url_fallbacks: &WholeUrlFallbackMap,
-        route_endpoints: &[EndpointResult],
-        file_path: &str,
-        route_module_claimed: bool,
-        receiver_roles: &HashMap<u32, ReceiverRole>,
-    ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_core(
-            model,
-            candidate_map,
-            resolved_members,
-            local_wrapper_calls,
-            aliases,
-            whole_url_fallbacks,
-            &LiteralBaseMap::new(),
-            route_endpoints,
-            file_path,
-            route_module_claimed,
-            receiver_roles,
-            None,
         )
     }
 
@@ -19680,8 +19126,6 @@ export { routes };
         route_endpoints: &[EndpointResult],
         file_path: &str,
         route_module_claimed: bool,
-        receiver_roles: &HashMap<u32, ReceiverRole>,
-        path_literals: Option<&RouteLiteralWitness>,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
         let resolved = FileOrchestrator::resolve_candidates(
@@ -19695,7 +19139,6 @@ export { routes };
             route_endpoints,
             &[],
             &[],
-            receiver_roles,
             &BTreeMap::new(),
             &EnvSchemaIndex::default(),
             true,
@@ -19710,7 +19153,6 @@ export { routes };
             &mut result,
             model,
             candidate_map,
-            path_literals,
             &overrules,
             file_path,
             route_module_claimed,
@@ -20444,179 +19886,6 @@ export { routes };
         let (forced, stats) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
         assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
-    }
-
-    // --- carrick#2382: a made-up id kept on a path literal the file compares -
-
-    /// One listed candidate that states no route path: a call the handler
-    /// makes, so no route row can anchor on it.
-    fn one_listed_call() -> HashMap<String, CandidateTarget> {
-        HashMap::from([("c1".to_string(), candidate_with_snippet("c1", None))])
-    }
-
-    /// A model route at line 3 with an id that names no listed site.
-    fn route_with_a_made_up_id(method: &str, path: &str) -> EndpointResult {
-        let mut row = endpoint_with_candidate(path, "endpoint:made-up");
-        row.method = method.to_string();
-        row.line_number = 3;
-        row
-    }
-
-    fn join_on_source(
-        rows: Vec<EndpointResult>,
-        candidates: &HashMap<String, CandidateTarget>,
-        source: &str,
-    ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_with_source(
-            FileAnalysisResult {
-                endpoints: rows,
-                ..Default::default()
-            },
-            candidates,
-            &[],
-            source,
-            "src/worker.ts",
-            false,
-        )
-    }
-
-    /// Each comparison form the language writes a route with keeps the row,
-    /// at the model's own line with no span, as the listed-id arm keeps one.
-    #[test]
-    fn a_made_up_id_route_is_kept_when_the_file_compares_a_path_against_it() {
-        for (source, method, path) in [
-            ("if (pathname === \"/items\") {}", "GET", "/items"),
-            (
-                "switch (pathname) { case \"/health\": break; }",
-                "GET",
-                "/health",
-            ),
-            (
-                "if (pathname.startsWith(\"/items/\")) {}",
-                "DELETE",
-                "/items/:id",
-            ),
-            (
-                "if (pathname.startsWith(ITEM_PREFIX)) {}\nconst ITEM_PREFIX = \"/items/\";",
-                "DELETE",
-                "/items/:id",
-            ),
-            ("if (pathname === `/items`) {}", "POST", "/items"),
-        ] {
-            let (result, stats) = join_on_source(
-                vec![route_with_a_made_up_id(method, path)],
-                &one_listed_call(),
-                source,
-            );
-            assert_eq!(result.endpoints.len(), 1, "{source}");
-            let row = &result.endpoints[0];
-            assert_eq!((row.method.as_str(), row.path.as_str()), (method, path));
-            assert_eq!(row.line_number, 3, "the model's own line: {source}");
-            assert_eq!(row.call_expression_span_start, None, "{source}");
-            assert_eq!(row.call_expression_span_end, None, "{source}");
-            assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
-            assert_eq!(stats.model_routes_kept_on_a_path_literal, 1, "{source}");
-            assert_eq!(stats.model_only_rows, 1, "{source}");
-            assert_eq!(stats.model_routes_kept_without_a_site, 0, "{source}");
-            assert_eq!(stats.model_endpoints_dropped_unanchored, 0, "{source}");
-        }
-    }
-
-    /// A path the file states nowhere in a dispatch position is no witness,
-    /// so the row is dropped and counted as before.
-    #[test]
-    fn a_made_up_id_route_with_no_compared_path_literal_is_dropped_and_counted() {
-        for (source, path) in [
-            ("export default {};", "/items"),
-            ("await fetch(\"/items\", { method: \"POST\" });", "/items"),
-            ("const routes = { \"/items\": list };", "/items"),
-            ("if (pathname === \"/items/\") {}", "/items/:id"),
-            ("if (pathname.startsWith(\"/\")) {}", "/:id"),
-            ("if (pathname === \"/:id\") {}", "/:id"),
-            (
-                "const P = \"/items\";\nfunction f(P) { return pathname === P; }",
-                "/items",
-            ),
-        ] {
-            let (result, stats) = join_on_source(
-                vec![route_with_a_made_up_id("GET", path)],
-                &one_listed_call(),
-                source,
-            );
-            assert!(result.endpoints.is_empty(), "{source}");
-            assert_eq!(stats.model_endpoints_dropped_unanchored, 1, "{source}");
-            assert_eq!(
-                stats.model_endpoints_dropped_unanchored_sites,
-                vec![format!("src/worker.ts:3 GET {path}")],
-                "{source}"
-            );
-            assert_eq!(stats.model_routes_kept_on_a_path_literal, 0, "{source}");
-        }
-    }
-
-    /// A force-analyzed file offered no candidate (carrick#462), so a witness
-    /// does not keep its rows: the drop and its count stay.
-    #[test]
-    fn a_force_analyzed_file_keeps_the_drop_whatever_its_source_compares() {
-        let (result, stats) = join_on_source(
-            vec![route_with_a_made_up_id("GET", "/items")],
-            &HashMap::new(),
-            "if (pathname === \"/items\") {}",
-        );
-        assert!(result.endpoints.is_empty());
-        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
-        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
-    }
-
-    /// In a module a routing convention claimed, the witness never admits a
-    /// row the convention's route set excludes (carrick#703): the row is
-    /// discarded there and counted as a claimed-module discard, not a drop.
-    #[test]
-    fn a_witnessed_made_up_id_route_in_a_claimed_module_is_discarded_by_the_convention() {
-        let derived = synthetic_endpoint("GET", "/settings/builds");
-        let (result, stats) = emit_and_join_with_source(
-            FileAnalysisResult {
-                endpoints: vec![route_with_a_made_up_id("POST", "/api/build-settings")],
-                ..Default::default()
-            },
-            &one_listed_call(),
-            std::slice::from_ref(&derived),
-            "if (pathname === \"/api/build-settings\") {}",
-            "app/routes/settings.builds.tsx",
-            true,
-        );
-        assert_eq!(result.endpoints.len(), 1, "{:?}", result.endpoints);
-        assert_eq!(result.endpoints[0].path, "/settings/builds");
-        assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 1);
-        assert_eq!(stats.model_endpoints_dropped_unanchored, 0);
-        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
-        assert_eq!(stats.model_only_rows, 0);
-    }
-
-    /// A case of a body-dispatching handler with a made-up id is kept as a
-    /// model case row, the way the listed-id arm keeps one (carrick#2048).
-    #[test]
-    fn a_witnessed_made_up_id_case_is_kept_as_a_model_case_row() {
-        let mut case = route_with_a_made_up_id("PATCH", "/things");
-        case.dispatch = Some(crate::dispatch::Dispatch {
-            location: crate::dispatch::DispatchLocation::Body,
-            field: "action".to_string(),
-            value: "archive".to_string(),
-        });
-        let (result, stats) = join_on_source(
-            vec![case],
-            &one_listed_call(),
-            "if (url.pathname === \"/things\") {}",
-        );
-        assert_eq!(result.endpoints.len(), 1);
-        let row = &result.endpoints[0];
-        assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
-        assert_eq!(
-            row.dispatch.as_ref().map(|d| d.value.as_str()),
-            Some("archive")
-        );
-        assert_eq!(row.call_expression_span_start, None);
-        assert_eq!(stats.model_routes_kept_on_a_path_literal, 1);
     }
 
     /// carrick#2382: a candidate that holds a route literal and states no
