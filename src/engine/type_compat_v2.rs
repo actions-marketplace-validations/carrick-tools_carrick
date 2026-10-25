@@ -517,6 +517,9 @@ pub(crate) fn derive_capture_anchors(
     // carrick#1842: the aliases whose published text is a body read as raw
     // text, marked by the same inference that supplied the text.
     let mut raw_text: HashSet<&str> = HashSet::new();
+    // carrick#2814: the aliases whose handler works with no body sent, marked
+    // by the same inference that supplied the text.
+    let mut absent_body: HashSet<&str> = HashSet::new();
     for inf in inferred {
         if let Some(text) = usable_inferred_text(&inf.type_string) {
             if inferred_text.contains_key(inf.alias.as_str()) {
@@ -526,6 +529,9 @@ pub(crate) fn derive_capture_anchors(
             printed_names.insert(inf.alias.as_str(), &inf.printed_names);
             if inf.raw_text_read {
                 raw_text.insert(inf.alias.as_str());
+            }
+            if inf.absent_body_tolerated {
+                absent_body.insert(inf.alias.as_str());
             }
             if let Some(unwidened) = inf
                 .unwidened_type_string
@@ -562,6 +568,7 @@ pub(crate) fn derive_capture_anchors(
                 source_file: Some(repo_relative(&request.file_path, repo_root)),
                 printed_names: names.clone(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             })
             .collect();
         anchors.sort_by(|a, b| a.alias().cmp(b.alias()));
@@ -616,6 +623,7 @@ pub(crate) fn derive_capture_anchors(
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: request.array_depth.filter(|d| *d > 0),
             consumer_response: request.consumer_response,
+            absent_body_tolerated: absent_body.contains(alias),
         });
     }
 
@@ -643,6 +651,7 @@ pub(crate) fn derive_capture_anchors(
                     source_file: Some(repo_relative(&request.file_path, repo_root)),
                     printed_names: names.clone(),
                     raw_text_read: false,
+                    absent_body_tolerated: false,
                 });
             anchors.push(CaptureAnchor::Literal {
                 alias: alias.to_string(),
@@ -651,6 +660,7 @@ pub(crate) fn derive_capture_anchors(
                 source_file: Some(repo_relative(&request.file_path, repo_root)),
                 printed_names: names,
                 raw_text_read: raw_text.contains(alias),
+                absent_body_tolerated: absent_body.contains(alias),
             });
             anchors.extend(unwidened);
             anchors.extend(mode_anchors(alias, request));
@@ -667,6 +677,7 @@ pub(crate) fn derive_capture_anchors(
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             });
             continue;
         }
@@ -684,6 +695,7 @@ pub(crate) fn derive_capture_anchors(
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             });
             continue;
         }
@@ -730,6 +742,7 @@ pub(crate) fn derive_capture_anchors(
             source_file: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
         });
     }
 
@@ -751,6 +764,7 @@ pub(crate) fn derive_capture_anchors(
             source_file: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
         });
     }
 
@@ -1323,6 +1337,7 @@ pub(crate) fn backfill_anchors(
                     source_file: anchor.source_file().map(str::to_string),
                     printed_names: Vec::new(),
                     raw_text_read: false,
+                    absent_body_tolerated: false,
                 }
             } else {
                 anchor.clone()
@@ -4042,6 +4057,68 @@ mod tests {
         assert!(unmarked.get("raw_text_read").is_none(), "{unmarked}");
     }
 
+    /// carrick#2814: a route body whose handler works with no body sent is
+    /// marked on the literal anchor that publishes the inference's text, and
+    /// no other anchor.
+    #[test]
+    fn an_absent_body_tolerated_mark_rides_the_literal_anchor_that_publishes_it() {
+        let request = |alias: &str| InferRequestItem {
+            member: None,
+            file_path: "/repo/src/routes.ts".to_string(),
+            line_number: 4,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::RequestBody,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        };
+        let mut tolerant = inferred("Endpoint_a_Request", "{ limit?: number }", None, None);
+        tolerant.infer_kind = InferKind::RequestBody;
+        tolerant.absent_body_tolerated = true;
+        let mut strict = inferred("Endpoint_b_Request", "{ limit?: number }", None, None);
+        strict.infer_kind = InferKind::RequestBody;
+        let anchors = derive_capture_anchors(
+            &[],
+            &[request("Endpoint_a_Request"), request("Endpoint_b_Request")],
+            &[],
+            &[tolerant, strict],
+            &[
+                "Endpoint_a_Request".to_string(),
+                "Endpoint_b_Request".to_string(),
+                "Endpoint_c_Request".to_string(),
+            ],
+            "/repo",
+        );
+        let marks: Vec<(&str, bool)> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    absent_body_tolerated,
+                    ..
+                } => (alias.as_str(), *absent_body_tolerated),
+                other => panic!("expected a literal anchor, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                ("Endpoint_a_Request", true),
+                ("Endpoint_b_Request", false),
+                ("Endpoint_c_Request", false),
+            ]
+        );
+        let wire = serde_json::to_value(&anchors[0]).unwrap();
+        assert_eq!(wire["absent_body_tolerated"], serde_json::json!(true));
+        let unmarked = serde_json::to_value(&anchors[1]).unwrap();
+        assert!(
+            unmarked.get("absent_body_tolerated").is_none(),
+            "{unmarked}"
+        );
+    }
+
     #[test]
     fn a_consumer_is_to_blame_only_for_a_type_a_retype_can_settle() {
         let verdict = |side: Option<VerdictSide>, gate: Option<&str>| {
@@ -4574,6 +4651,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         }
@@ -4640,6 +4718,48 @@ mod tests {
                 ("Endpoint_consumer_Response", true),
                 ("Endpoint_producer_Response", false),
             ]
+        );
+    }
+
+    /// carrick#2814: a route whose body type the model named is published by
+    /// a symbol anchor. The inferrer's absent-body mark for its alias rides
+    /// that anchor too; an alias the inferrer did not mark carries none.
+    #[test]
+    fn an_absent_body_tolerated_mark_rides_the_symbol_anchor_that_publishes_it() {
+        let explicit = vec![
+            order_explicit("Endpoint_a_Request"),
+            order_explicit("Endpoint_b_Request"),
+        ];
+        let mut tolerant = inferred("Endpoint_a_Request", "{ limit?: number }", None, None);
+        tolerant.infer_kind = InferKind::RequestBody;
+        tolerant.absent_body_tolerated = true;
+        let mut strict = inferred("Endpoint_b_Request", "{ limit?: number }", None, None);
+        strict.infer_kind = InferKind::RequestBody;
+
+        let anchors =
+            derive_capture_anchors(&explicit, &[], &[], &[tolerant, strict], &[], "/repo");
+
+        let marks: Vec<(&str, bool)> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Symbol {
+                    alias,
+                    absent_body_tolerated,
+                    ..
+                } => (alias.as_str(), *absent_body_tolerated),
+                other => panic!("expected symbol anchors, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            vec![("Endpoint_a_Request", true), ("Endpoint_b_Request", false)]
+        );
+        let wire = serde_json::to_value(&anchors[0]).unwrap();
+        assert_eq!(wire["absent_body_tolerated"], serde_json::json!(true));
+        let unmarked = serde_json::to_value(&anchors[1]).unwrap();
+        assert!(
+            unmarked.get("absent_body_tolerated").is_none(),
+            "{unmarked}"
         );
     }
 
@@ -5864,6 +5984,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         };
@@ -6000,6 +6121,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         };
@@ -6077,6 +6199,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         }
     }
 
@@ -6097,6 +6220,7 @@ mod tests {
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             },
         ];
         let records = vec![
@@ -6337,6 +6461,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             }],
             &HashMap::new(),
             None,
@@ -6482,6 +6607,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             source_file: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
         }];
         let asked = || {
             std::fs::read_to_string(&attempts)
@@ -6768,6 +6894,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         };
@@ -7994,6 +8121,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         }];
         let mut billing_anchors = vec![CaptureAnchor::Symbol {
             alias: consumer_alias.clone(),
@@ -8002,6 +8130,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         }];
         let mut orders_manifest = vec![entry(
             key.clone(),
@@ -8047,6 +8176,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             });
             billing_anchors.push(CaptureAnchor::Literal {
                 alias: consumer.clone(),
@@ -8055,6 +8185,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             });
             orders_manifest.push(entry(
                 pair.key.clone(),
@@ -8145,6 +8276,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             source_file: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
         };
         let mut anchors = vec![literal(&producer, "{ items: { id: string; }[]; }")];
         let mut manifest = vec![entry(
@@ -8465,6 +8597,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                     source_file: None,
                     printed_names: Vec::new(),
                     raw_text_read: false,
+                    absent_body_tolerated: false,
                 }],
                 &HashMap::new(),
                 None,
@@ -8933,6 +9066,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                     source_file: None,
                     printed_names: Vec::new(),
                     raw_text_read: false,
+                    absent_body_tolerated: false,
                 }],
                 &HashMap::new(),
                 None,
@@ -9103,6 +9237,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             }],
             &HashMap::new(),
             None,
@@ -9699,6 +9834,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         });
         let backfill = HashMap::from([("Missing".to_string(), "{ count: number }".to_string())]);
         let (dir, artifact) = run_capture(
@@ -9779,6 +9915,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
                 consumer_response: false,
+                absent_body_tolerated: false,
             },
             CaptureAnchor::Symbol {
                 alias: "Pub_OrderPlacedEvent".to_string(),
@@ -9787,6 +9924,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
                 consumer_response: false,
+                absent_body_tolerated: false,
             },
         ];
         // The scanner-side literal text for the operation (what v1 resolution
@@ -9856,6 +9994,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
                 consumer_response: false,
+                absent_body_tolerated: false,
             }],
             &HashMap::new(),
             None,
@@ -10037,6 +10176,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             }],
             &HashMap::new(),
             None,

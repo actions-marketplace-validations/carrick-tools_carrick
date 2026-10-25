@@ -197,6 +197,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     anchor_origin: AnchorOriginSchema,
     array_depth: z.number().int().nonnegative().optional(),
     consumer_response: z.boolean().optional(),
+    absent_body_tolerated: z.literal(true).optional(),
   }),
   z.object({
     kind: z.literal('handler_return'),
@@ -236,6 +237,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
       )
       .optional(),
     raw_text_read: z.literal(true).optional(),
+    absent_body_tolerated: z.literal(true).optional(),
   }),
 ]);
 
