@@ -20,6 +20,8 @@ use std::sync::OnceLock;
 const SERVICES: [&str; 4] = ["api", "cli", "client", "web"];
 
 const COMMANDS: &str = "packages/cli/src/commands.ts";
+const TYPED_COMMANDS: &str = "packages/cli/src/typed-commands.ts";
+const TYPED: &str = "packages/client/src/typed.ts";
 const HOOKS: &str = "apps/web/src/hooks.ts";
 const REQUESTS: &str = "packages/client/src/requests.ts";
 const TOOLS: &str = "packages/cli/src/tools.ts";
@@ -413,24 +415,104 @@ fn a_stale_type_at_a_corrected_row_is_found() {
 }
 
 /// carrick#1601: a call of a function that does not hand back its request's
-/// parsed body unchanged is worth that function's own result. The function
-/// called wraps the body in an envelope (`readRunStamped`), or the client
-/// method called returns a member of what a transport returns (`Client.send`
-/// reads `.data` of a request spec's value, whose shape nothing here
-/// states). The row still takes the operation, and the type anchored there
-/// goes: judged against the producer, it would read as a break that is not
-/// there.
+/// body is worth that function's own result. The function called wraps the
+/// body in an envelope (`readRunStamped`), or the chain from it holds the
+/// transport's result itself, with no step read off it (`runOf`). The row
+/// still takes the operation, and the type anchored there goes: judged
+/// against the producer, it would read as a break that is not there.
 #[test]
 fn a_corrected_row_whose_call_returns_another_shape_carries_no_type() {
     assert_eq!(
         row_at("cli", COMMANDS, 151).reaches,
         Some(format!("{REQUESTS}:51"))
     );
-    for line in [9, 46, 151] {
+    for line in [151, 186] {
         let entries = consumer_entries_at("cli", COMMANDS, line);
         assert!(
             entries.is_empty(),
             "no type is carried from a call that returns another shape ({COMMANDS}:{line}): {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(COMMANDS, line), []);
+    }
+}
+
+/// carrick#2377: the chain from the call's callee to the request reads
+/// exactly one step off the transport's value, and that step is the Fetch
+/// standard's `Response.json()`: a class member returns a function's parsed
+/// `fetch`. The type the caller declared is the request's body, so it is kept
+/// under the reached operation and judged against its producer.
+#[test]
+fn a_call_through_a_function_that_parses_a_fetch_keeps_its_type() {
+    let entries = consumer_entries_at("cli", TYPED_COMMANDS, 15);
+    assert!(
+        entries.iter().any(|entry| {
+            entry["type_kind"] == "response"
+                && entry["path"] == "/api/v1/runs/:id"
+                && entry["primary_type_symbol"] == "Run"
+        }),
+        "{TYPED_COMMANDS}:15 keeps its Run: {entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(TYPED_COMMANDS, 15),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// carrick#2377: a client wrapper that reads a member of a library client's
+/// result (`.data` here, `.status` in another) is not taken as handing back
+/// the body: which member holds it is the library store's to state
+/// (carrick-cloud#2639). The row still takes the operation, keeps no type,
+/// and so gets no verdict, where a guess would give a false one.
+#[test]
+fn a_wrapper_that_reads_a_member_of_a_library_clients_result_abstains() {
+    for (file, line) in [(COMMANDS, 9), (COMMANDS, 46), (TYPED_COMMANDS, 8)] {
+        assert!(
+            row_at("cli", file, line).reaches.is_some(),
+            "{file}:{line} still takes the request it reaches"
+        );
+        let entries = consumer_entries_at("cli", file, line);
+        assert!(
+            entries.is_empty(),
+            "{file}:{line} carries no type: {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(file, line), []);
+    }
+}
+
+/// carrick#2377: a chain that holds the transport's result with no step read
+/// (`runOf`), maps the value through another function (`toView`), or reads
+/// the helper's member and then the run's own, is not the request's body. The
+/// row takes the operation and the type goes.
+#[test]
+fn a_chain_that_builds_reads_twice_or_passes_through_another_function_drops_its_type() {
+    for (file, line) in [(COMMANDS, 176), (TYPED_COMMANDS, 22), (TYPED_COMMANDS, 29)] {
+        assert!(
+            row_at("cli", file, line).reaches.is_some(),
+            "{file}:{line} still takes the request it reaches"
+        );
+        let entries = consumer_entries_at("cli", file, line);
+        assert!(
+            entries.is_empty(),
+            "{file}:{line} carries no type: {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(file, line), []);
+    }
+}
+
+/// The client methods whose helper never gets its `T` read a member of a
+/// library client's result, so they abstain like the others; no unknown type
+/// reaches a verdict. (A proven chain with a bare top type is dropped and
+/// counted apart: unit test `a_bare_top_type_is_no_type_to_carry`.)
+#[test]
+fn a_client_method_with_a_helper_that_is_never_given_its_type_carries_nothing() {
+    for line in [21, 64, 101, 164] {
+        let entries = consumer_entries_at("cli", COMMANDS, line);
+        assert!(
+            entries.is_empty(),
+            "no type is carried ({COMMANDS}:{line}): {entries:#?}"
         );
         assert_eq!(response_verdicts_at(COMMANDS, line), []);
     }
@@ -492,7 +574,7 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(12 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(15 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -525,9 +607,10 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 145 and 157 of `commands.ts` keep their response entry.
+    // Lines 145 and 157 of `commands.ts` and line 15 of `typed-commands.ts`
+    // keep their response entry.
     assert!(
-        settled_line().contains("2 kept the response type and lost the request type)"),
+        settled_line().contains("3 kept the response type and lost the request type)"),
         "{}",
         settled_line()
     );
@@ -668,8 +751,8 @@ fn every_request_row_is_unchanged() {
         )
     };
     requests.sort_by_key(|(site, _, _)| {
-        site.rsplit_once(':')
-            .and_then(|(_, line)| line.parse::<u32>().ok())
+        let (file, line) = site.rsplit_once(':').unwrap();
+        (file.to_string(), line.parse::<u32>().unwrap())
     });
     assert_eq!(
         requests,
@@ -694,6 +777,22 @@ fn every_request_row_is_unchanged() {
             ),
             (
                 format!("{REQUESTS}:51"),
+                "GET /api/v1/runs/:id".to_string(),
+                "env_base_path".to_string()
+            ),
+            // `typed.ts`: two specs and a `fetch` on the declared base.
+            (
+                format!("{TYPED}:13"),
+                "GET /api/v1/runs/:id".to_string(),
+                "request_spec".to_string()
+            ),
+            (
+                format!("{TYPED}:19"),
+                "GET /api/v1/runs/:id".to_string(),
+                "request_spec".to_string()
+            ),
+            (
+                format!("{TYPED}:24"),
                 "GET /api/v1/runs/:id".to_string(),
                 "env_base_path".to_string()
             ),
