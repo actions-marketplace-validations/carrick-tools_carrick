@@ -754,6 +754,8 @@ pub struct Decided {
 
 /// A discovered call whose request is decided lower down its chain
 /// (carrick#2614): `await login(…)` where `login`'s own call writes the path.
+/// Also each call of the function whose body writes a decided site
+/// ([`callers_above`], carrick#2704).
 /// The call is not a second request; the site at `site_file:site_line` is.
 /// Recorded only where each hop from this call down to the site is the
 /// definition [`RequestSummaryInputs::reach`] reads off the compiler's `call`
@@ -768,6 +770,10 @@ pub struct Through {
     pub line: u32,
     pub site_file: String,
     pub site_line: u32,
+    /// The caller's line holds a call besides the through call and the calls
+    /// written around it (carrick#2704): a reader row there may be that
+    /// other call's, so a disagreeing one is not folded.
+    pub other_call: bool,
 }
 
 /// The [`Through`] from `chain[0]` to the site at `chain[to]`, when `to` is
@@ -796,7 +802,45 @@ fn through(
         line: chain[0].call.site.line,
         site_file: relative(root, chain[to].file),
         site_line: chain[to].call.site.line,
+        other_call: false,
     })
+}
+
+/// The calls of the function whose body writes each decided site, as
+/// [`Through`]s to that site (carrick#2704). A site decided where discovery
+/// listed no call above it (a walk up the callers, or a request written in a
+/// function handed to a package: `span(name, () => http.get(path))`) still
+/// has callers that make its request, and a reader row at one is that
+/// request read again. A site written in a function nested in its owner
+/// counts only where that function is an argument of a call: one the owner
+/// returns or stores is not run by calling the owner. Each hop is checked as
+/// [`through`] checks it.
+fn callers_above(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    calls: &Calls<'_>,
+    sites: &[DecidedSite],
+) -> Vec<Through> {
+    let mut out = Vec::new();
+    for site in sites.iter().filter(|site| site.key.is_none()) {
+        let Some(placed) = calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+        else {
+            continue;
+        };
+        let Some(key) = placed.key else {
+            continue;
+        };
+        if placed.depth > 0 && placed.host.is_none() {
+            continue;
+        }
+        for caller in calls.callers_of(placed.file, key) {
+            if let Some(mut through) = through(inputs, root, &[*caller, placed], 1) {
+                through.other_call = calls.other_call_on_line(caller);
+                out.push(through);
+            }
+        }
+    }
+    out
 }
 
 /// One call, where it is written: its file, the definition key of the
@@ -931,6 +975,18 @@ impl<'a> Calls<'a> {
 
     fn at_span(&self, file: &Path, span_start: u32, span_end: u32) -> Option<Placed<'a>> {
         self.by_span.get(&(file, span_start, span_end)).copied()
+    }
+
+    /// Whether a call besides `placed` and the calls written around it sits
+    /// on `placed`'s line in its file.
+    fn other_call_on_line(&self, placed: &Placed<'a>) -> bool {
+        let (start, end) = (placed.call.site.span_start, placed.call.site.span_end);
+        self.by_span.values().any(|other| {
+            other.file == placed.file
+                && other.call.site.line == placed.call.site.line
+                && (other.call.site.span_start, other.call.site.span_end) != (start, end)
+                && !(other.call.site.span_start <= start && end <= other.call.site.span_end)
+        })
     }
 
     fn target(&self, placed: &Placed<'a>) -> Option<&(PathBuf, String)> {
@@ -1913,6 +1969,8 @@ fn decide(
             walk.up(&chain, &top, end, &mut Vec::new());
         }
     }
+    out.through
+        .extend(callers_above(inputs, root, &calls, &out.sites));
     let mounts = match (makers, &index) {
         (Some(makers), Some(index)) => {
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
