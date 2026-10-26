@@ -103,6 +103,26 @@ pub struct JoinedFinding {
     /// The type the SENDING side of that direction states, capped the same
     /// way. See [`super::contract::Item::actual_type`].
     pub actual_type: Option<String>,
+    /// Whether every row behind the pairing is one the source states:
+    /// `fact` or `candidate`, the finding's own [`crate::findings::EdgeSource`]
+    /// in its wire spelling. `None` when the scan could not state it. What
+    /// `check --changed` reads to decide whether a problem fails the run.
+    pub edge_source: Option<String>,
+}
+
+/// A call no producer in the workspace serves: the join's missing-endpoint
+/// finding, kept apart from [`JoinedFinding`] because it is not a verdict on
+/// a pair and the index folds no row verdict from it. Only `check --changed`
+/// reads it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct JoinedUnmatched {
+    pub method: String,
+    pub path: String,
+    /// `"file:line"` of each call site, repo-relative.
+    pub call_sites: Vec<String>,
+    /// Those of `call_sites` whose base is set at run time
+    /// ([`crate::call_base::CallBaseKind::Injected`]).
+    pub injected: Vec<String>,
 }
 
 /// Everything the join learned, in the shape the indexer reads it.
@@ -112,6 +132,8 @@ pub struct LocalJoin {
     pub operations: Vec<JoinedOperation>,
     pub matches: Vec<JoinedMatch>,
     pub findings: Vec<JoinedFinding>,
+    /// The calls that reach no route, in the analyzer's order.
+    pub unmatched: Vec<JoinedUnmatched>,
     /// Whether the type check ran over the join. The join is a subprocess
     /// whose output the indexer swallows, so a skip reaches the build's
     /// output and `carrick status` only through this (carrick#1490).
@@ -128,7 +150,22 @@ pub enum JoinTypeCheck {
 
 impl LocalJoin {
     /// Project a finished cross-repo analysis.
-    pub fn from_results(results: &ApiAnalysisResult, type_check: JoinTypeCheck) -> Self {
+    pub fn from_results(
+        results: &ApiAnalysisResult,
+        type_check: JoinTypeCheck,
+        call_bases: &std::collections::HashMap<
+            (String, String),
+            crate::call_base::CallBaseResolution,
+        >,
+    ) -> Self {
+        // The call sites whose base is set at run time (carrick#649's
+        // `injected`): the scanner sees the expression and not the value, so
+        // it cannot tell a service in this workspace from an outside API.
+        let injected: std::collections::BTreeSet<&str> = call_bases
+            .iter()
+            .filter(|(_, base)| base.kind == crate::call_base::CallBaseKind::Injected)
+            .map(|((_, location), _)| location.as_str())
+            .collect();
         let mut operations: Vec<JoinedOperation> = results
             .endpoints
             .iter()
@@ -201,11 +238,35 @@ impl LocalJoin {
             ))
         });
 
+        let unmatched = results
+            .findings
+            .iter()
+            .filter_map(|finding| match finding {
+                crate::findings::Finding::MissingEndpoint {
+                    method,
+                    path,
+                    call_sites,
+                    ..
+                } => Some(JoinedUnmatched {
+                    method: method.clone(),
+                    path: path.clone(),
+                    call_sites: call_sites.clone(),
+                    injected: call_sites
+                        .iter()
+                        .filter(|site| injected.contains(site.as_str()))
+                        .cloned()
+                        .collect(),
+                }),
+                _ => None,
+            })
+            .collect();
+
         Self {
             scanner_version: env!("CARGO_PKG_VERSION").to_string(),
             operations,
             matches,
             findings,
+            unmatched,
             type_check,
         }
     }
@@ -238,6 +299,7 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             detail,
             verdict_state,
             direction,
+            edge_source,
             ..
         } => {
             let (expected, actual) = typed_sides(*direction, producer_type, consumer_type);
@@ -252,6 +314,7 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
                 direction: direction.map(wire_direction),
                 expected_type: expected,
                 actual_type: actual,
+                edge_source: wire_edge_source(*edge_source),
             })
         }
         crate::findings::Finding::MethodMismatch {
@@ -261,6 +324,7 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             call_sites,
             expected_method,
             verdict_state,
+            edge_source,
             ..
         } => Some(JoinedFinding {
             kind: "method_mismatch".to_string(),
@@ -277,6 +341,7 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             direction: None,
             expected_type: None,
             actual_type: None,
+            edge_source: wire_edge_source(*edge_source),
         }),
         _ => None,
     }
@@ -333,6 +398,14 @@ fn wire_direction(kind: crate::cloud_storage::ManifestTypeKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
+}
+
+/// The finding's edge source in its wire spelling (`fact`, `candidate`).
+fn wire_edge_source(source: Option<crate::findings::EdgeSource>) -> Option<String> {
+    serde_json::to_value(source?)
+        .ok()?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// The finding's verdict state in the spelling both contracts print.

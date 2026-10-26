@@ -60,6 +60,7 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
                 param: 0,
                 param_name: Some("order".to_string()),
             }),
+            key: None,
         },
         payloads,
         basis: Default::default(),
@@ -256,6 +257,7 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
 fn item(alias: &str, line: u32) -> InferRequestItem {
     InferRequestItem {
         member: None,
+        result: None,
         file_path: FILE.to_string(),
         line_number: line,
         span_start: None,

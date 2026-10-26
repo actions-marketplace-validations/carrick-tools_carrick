@@ -152,6 +152,7 @@ fn infer(
         sidecar.infer_types(
             &[InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: 1,
                 span_start: None,
@@ -183,6 +184,7 @@ fn capture(sidecar: TypeSidecar, alias: &'static str) -> (TypeSidecar, SidecarEr
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+                absent_body_tolerated: false,
             }],
             "/out",
             None,

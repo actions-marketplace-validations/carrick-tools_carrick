@@ -1,5 +1,101 @@
 # Changelog
 
+## [0.3.133](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.132...carrick-v0.3.133) (2026-10-26)
+
+
+### Features
+
+* **init:** Codex session-start hook and a trust line true on every surface ([#2852](https://github.com/carrick-tools/carrick/issues/2852)) ([bdbc7a4](https://github.com/carrick-tools/carrick/commit/bdbc7a4717d1894c57751bc2c78c27c73f8725f5))
+* **init:** write a Carrick check section into AGENTS.md ([#2831](https://github.com/carrick-tools/carrick/issues/2831)) ([ca0fed2](https://github.com/carrick-tools/carrick/commit/ca0fed2a165dba9f975e57b303646d158b1a0b0b)), closes [#2828](https://github.com/carrick-tools/carrick/issues/2828)
+
+
+### Bug Fixes
+
+* **check:** exit 2 when a check covered none of the files it was asked about ([#2853](https://github.com/carrick-tools/carrick/issues/2853)) ([0fe08d0](https://github.com/carrick-tools/carrick/commit/0fe08d05d8119d31cfc81c163b26ead36957cd54)), closes [#2850](https://github.com/carrick-tools/carrick/issues/2850)
+* **init:** replace the scaffold's session-start entry so a session gets one session-start message; its prompt reminder and search nudge stay ([#2855](https://github.com/carrick-tools/carrick/issues/2855)) ([f959666](https://github.com/carrick-tools/carrick/commit/f959666682c0260e9548f546cde1df80d6c2ab52))
+* **local:** after-edit hook skips a re-check known not to fit, one call per patch ([#2857](https://github.com/carrick-tools/carrick/issues/2857)) ([8fc1829](https://github.com/carrick-tools/carrick/commit/8fc182981c8e0b893857acc357c36a9263d0f759))
+* **local:** name an edit's new functions without waiting on the re-scan ([#2849](https://github.com/carrick-tools/carrick/issues/2849)) ([#2856](https://github.com/carrick-tools/carrick/issues/2856)) ([84b3c52](https://github.com/carrick-tools/carrick/commit/84b3c522910e7f1f0951b83007c5a660f06c2f27))
+
+## [0.3.132](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.131...carrick-v0.3.132) (2026-10-26)
+
+
+### Features
+
+* **local:** carrick check --changed checks every changed file in one pass ([#2825](https://github.com/carrick-tools/carrick/issues/2825)) ([3042be1](https://github.com/carrick-tools/carrick/commit/3042be1df494874c169c82739c1e47d4e5f6e811))
+* **local:** carrick check takes several files, and --changed lists only facts ([#2827](https://github.com/carrick-tools/carrick/issues/2827)) ([#2834](https://github.com/carrick-tools/carrick/issues/2834)) ([37334d6](https://github.com/carrick-tools/carrick/commit/37334d6aff3cb1d195e49cbbf2036c38820d4eb0))
+
+
+### Bug Fixes
+
+* **call_through:** a call on a factory's value reaches the request the compiler's call row names ([#2822](https://github.com/carrick-tools/carrick/issues/2822), [#2823](https://github.com/carrick-tools/carrick/issues/2823)) ([#2830](https://github.com/carrick-tools/carrick/issues/2830)) ([132eeeb](https://github.com/carrick-tools/carrick/commit/132eeebe48e36fedc62f3c7ab3c8bf2978ae0728))
+* **local:** check --changed fails only on new facts, scans changed services only ([#2838](https://github.com/carrick-tools/carrick/issues/2838)) ([c0d5572](https://github.com/carrick-tools/carrick/commit/c0d5572076dc3b7943f6c8bde27e21f5f0df6a39))
+* **local:** hosted rows replay under the cloud's service slug; a current checkout is read in without a re-read ([#2841](https://github.com/carrick-tools/carrick/issues/2841)) ([a208d66](https://github.com/carrick-tools/carrick/commit/a208d66a36c0bae86ba541d7c4398f60d521585f))
+* **local:** refresh re-reads only the services an edit moved, and carries the rest from the hosted index ([#2845](https://github.com/carrick-tools/carrick/issues/2845)) ([7813f60](https://github.com/carrick-tools/carrick/commit/7813f60a63606ca491ae18acc404bfbb0e223a5a))
+* **scope:** skip services the change did not touch on unbuilt checkouts and init-dirty indexes ([#2842](https://github.com/carrick-tools/carrick/issues/2842)) ([280bd1d](https://github.com/carrick-tools/carrick/commit/280bd1d8d0ebb5b6d26f83818ca9b66c13e7600f))
+* **sidecar:** absent body is compatible only where the receiver's handler tolerates it ([#2815](https://github.com/carrick-tools/carrick/issues/2815)) ([c957a76](https://github.com/carrick-tools/carrick/commit/c957a7658cb7d5807208cb7f16988da54bbb9adb))
+
+
+### Performance
+
+* **local:** re-scan the services a change reaches side by side ([#2844](https://github.com/carrick-tools/carrick/issues/2844)) ([bc6d99d](https://github.com/carrick-tools/carrick/commit/bc6d99d4d3260a13bb0bc593e216a3b56278330b))
+
+## [0.3.131](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.130...carrick-v0.3.131) (2026-10-25)
+
+
+### Features
+
+* **call-through:** a corrected row keeps its consumer type when the chain hands back the request's body ([#2377](https://github.com/carrick-tools/carrick/issues/2377) slice 1) ([#2806](https://github.com/carrick-tools/carrick/issues/2806)) ([213fa9d](https://github.com/carrick-tools/carrick/commit/213fa9d7ad2f0d77d4117ed5a483a768447be937))
+* **decided-sites:** a request a sibling service decides is a site at this service's call ([#2618](https://github.com/carrick-tools/carrick/issues/2618) slice 2) ([#2780](https://github.com/carrick-tools/carrick/issues/2780)) ([f9a46a9](https://github.com/carrick-tools/carrick/commit/f9a46a9238ab44d8f45b65bf4fd3669f335bf399))
+* **discovery:** follow a function a factory declares and returns through a bound fetch ([#2432](https://github.com/carrick-tools/carrick/issues/2432) A2) ([#2782](https://github.com/carrick-tools/carrick/issues/2782)) ([386f716](https://github.com/carrick-tools/carrick/commit/386f7164b0da070eab54da701752ce3a269fe918))
+* **discovery:** walk a function a library call runs ([#2634](https://github.com/carrick-tools/carrick/issues/2634) slice 2) ([#2778](https://github.com/carrick-tools/carrick/issues/2778)) ([6724e32](https://github.com/carrick-tools/carrick/commit/6724e32c1aa4c010214aa19157655aca1c17a6ef))
+* **engine:** the scan reads the services a service calls into ([#2618](https://github.com/carrick-tools/carrick/issues/2618) slice 3) ([#2787](https://github.com/carrick-tools/carrick/issues/2787)) ([d702edc](https://github.com/carrick-tools/carrick/commit/d702edc17b73d25be3ace038c4a3e037684d08b6))
+* **scanner:** a call straight into another service's function states the request it reaches ([#2773](https://github.com/carrick-tools/carrick/issues/2773)) ([#2785](https://github.com/carrick-tools/carrick/issues/2785)) ([8711263](https://github.com/carrick-tools/carrick/commit/8711263df4088dbb86768bb52fc8f302cea5a63c))
+
+
+### Bug Fixes
+
+* **discovery:** read a class its service never constructs through its constructor ([#2811](https://github.com/carrick-tools/carrick/issues/2811)) ([1c59c84](https://github.com/carrick-tools/carrick/commit/1c59c8439b02f068312e45107a839f15e04b7657))
+* **fact-files:** withdraw reader rows at calls into a GraphQL client ([#2763](https://github.com/carrick-tools/carrick/issues/2763)) ([#2777](https://github.com/carrick-tools/carrick/issues/2777)) ([1b3752d](https://github.com/carrick-tools/carrick/commit/1b3752d5b8d11f4e30d03bf89499a127f00df5a9))
+* **scanner:** a request in an exported object-literal member folds its callers' rows ([#2793](https://github.com/carrick-tools/carrick/issues/2793)) ([#2799](https://github.com/carrick-tools/carrick/issues/2799)) ([a2bef17](https://github.com/carrick-tools/carrick/commit/a2bef1725671d9e91bc2d763b563e5a82ad5a064))
+* **sidecar:** a consumer that reads no response body is compatible, with a note ([#2807](https://github.com/carrick-tools/carrick/issues/2807)) ([69c775f](https://github.com/carrick-tools/carrick/commit/69c775f3d7725572fdbb6ed7a407cfd9bafdeeff))
+* **sidecar:** an elided payload locator binds the node it opens, never one member ([#2802](https://github.com/carrick-tools/carrick/issues/2802)) ([#2803](https://github.com/carrick-tools/carrick/issues/2803)) ([fd9fba0](https://github.com/carrick-tools/carrick/commit/fd9fba0420f157de01664f3bd56d60014b76a1fb))
+* **sidecar:** retype abstains where writing one type argument turns off inference of the callee's others ([#2800](https://github.com/carrick-tools/carrick/issues/2800)) ([#2801](https://github.com/carrick-tools/carrick/issues/2801)) ([ed3d7a4](https://github.com/carrick-tools/carrick/commit/ed3d7a43f5c4bbc04e60869d75c779b07eaf5cf5))
+* **site:** a caller row that misreads a fact its callee states folds onto it ([#2704](https://github.com/carrick-tools/carrick/issues/2704)) ([#2791](https://github.com/carrick-tools/carrick/issues/2791)) ([10e3945](https://github.com/carrick-tools/carrick/commit/10e394557ba0d8673b3ae9d640bfc011c73822aa))
+
+
+### Refactoring
+
+* **scan:** delete the wrapper passes C8 folds, C9, C10, C12 ([#2440](https://github.com/carrick-tools/carrick/issues/2440) batch B) ([#2680](https://github.com/carrick-tools/carrick/issues/2680)) ([b9f49db](https://github.com/carrick-tools/carrick/commit/b9f49db15af8e8ceafdaa05b2f3619c958a07f28))
+
+## [0.3.130](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.129...carrick-v0.3.130) (2026-10-24)
+
+
+### Features
+
+* **check:** a request pair decided over no body is judged without a probe ([#2674](https://github.com/carrick-tools/carrick/issues/2674) piece 1) ([#2767](https://github.com/carrick-tools/carrick/issues/2767)) ([802c4cf](https://github.com/carrick-tools/carrick/commit/802c4cf721e0e83e253aa6051bde7a36468dcbae))
+* **routes:** a file route's compared methods come from the guard IR ([#2740](https://github.com/carrick-tools/carrick/issues/2740)) ([#2758](https://github.com/carrick-tools/carrick/issues/2758)) ([f381d31](https://github.com/carrick-tools/carrick/commit/f381d31f1cb7b8a31392e84795f98849496b3ae1))
+* **scanner:** the receiver trace ignores router mounts made in files only tests import ([#2775](https://github.com/carrick-tools/carrick/issues/2775) slice A) ([#2781](https://github.com/carrick-tools/carrick/issues/2781)) ([ffce80f](https://github.com/carrick-tools/carrick/commit/ffce80fec1c9548fd40eb406a2a54adea5050b65))
+* **sidecar:** request_config infer kind ([#2674](https://github.com/carrick-tools/carrick/issues/2674) P3-1a sidecar case) ([#2765](https://github.com/carrick-tools/carrick/issues/2765)) ([2eeec71](https://github.com/carrick-tools/carrick/commit/2eeec71e86824839fe628e73b688ab02c4f8b73b))
+* **site-payloads:** carry request options through spread/rest and decide no body ([#2674](https://github.com/carrick-tools/carrick/issues/2674) P3-1a) ([#2766](https://github.com/carrick-tools/carrick/issues/2766)) ([10b07e7](https://github.com/carrick-tools/carrick/commit/10b07e7d9d467b87d057f601fbcd271020277322))
+* **trace:** procedure routes take their key paths ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R6c) ([#2760](https://github.com/carrick-tools/carrick/issues/2760)) ([8fa330d](https://github.com/carrick-tools/carrick/commit/8fa330d48a9ec4ffe761fa96f8413109e3ef4daa))
+
+
+### Bug Fixes
+
+* **call_through:** list call flows in source order so side_calls are stable ([#2759](https://github.com/carrick-tools/carrick/issues/2759)) ([#2770](https://github.com/carrick-tools/carrick/issues/2770)) ([cee9155](https://github.com/carrick-tools/carrick/commit/cee91559e290392bf1e048df8c1a43507d249aa1))
+* **dispatch:** count below-band dispatch rows apart from model rows ([#2693](https://github.com/carrick-tools/carrick/issues/2693)) ([#2771](https://github.com/carrick-tools/carrick/issues/2771)) ([4cb9cf9](https://github.com/carrick-tools/carrick/commit/4cb9cf9c756dc9bb73293c769956e44d9e56af75))
+* **scan:** a request inside a handed callback reads keyed slots through the enclosing helper's parameter ([#2783](https://github.com/carrick-tools/carrick/issues/2783)) ([efac225](https://github.com/carrick-tools/carrick/commit/efac225730e4cc057f953639f6b2bf3d0b8c4864))
+* **sidecar:** a body read in a catch clause is not the call's response type ([#2756](https://github.com/carrick-tools/carrick/issues/2756)) ([#2764](https://github.com/carrick-tools/carrick/issues/2764)) ([3aae639](https://github.com/carrick-tools/carrick/commit/3aae639f47716592cb357b768bdbb87410517109))
+* **sidecar:** read a config spread before deciding no body ([#2762](https://github.com/carrick-tools/carrick/issues/2762)) ([#2769](https://github.com/carrick-tools/carrick/issues/2769)) ([db565e4](https://github.com/carrick-tools/carrick/commit/db565e49bba29f2bd4bf65c94b961fa91db299ad))
+
+
+### Refactoring
+
+* **join:** delete the route-literal witness ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R7 D2) ([#2717](https://github.com/carrick-tools/carrick/issues/2717)) ([6d2f8c9](https://github.com/carrick-tools/carrick/commit/6d2f8c91d557cbf27c3599080790efa9e223c32a))
+* **routes:** delete the request-method guard collector ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R7 D3) ([#2718](https://github.com/carrick-tools/carrick/issues/2718)) ([3a86063](https://github.com/carrick-tools/carrick/commit/3a860631dd56b29f5207269ef9d9a05ce959119d))
+* **scanner:** delete Signal 4b (C1), the request-helper register signal ([#2440](https://github.com/carrick-tools/carrick/issues/2440)) ([#2678](https://github.com/carrick-tools/carrick/issues/2678)) ([fa7036c](https://github.com/carrick-tools/carrick/commit/fa7036c7d5f5bda6fec87d9988aa2beab225c807))
+* **scanner:** delete the typed-receiver route arm ([#2441](https://github.com/carrick-tools/carrick/issues/2441) D1) ([#2768](https://github.com/carrick-tools/carrick/issues/2768)) ([bab8fdf](https://github.com/carrick-tools/carrick/commit/bab8fdf227e3d4afabf2426cce6adbcd4edd9e3f))
+
 ## [0.3.129](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.128...carrick-v0.3.129) (2026-10-24)
 
 

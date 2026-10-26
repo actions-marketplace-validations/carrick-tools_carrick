@@ -19,7 +19,9 @@
 // hosted read this machine has not yet made signed in and connected. On a
 // workspace `carrick index` has just indexed, nothing is re-read.
 // carrick#985 is the other half of that saving, inside `refresh`: a repo whose
-// local blob is already current should be fetched for rather than scanned.
+// tree has not moved under any file a scan reads since the hosted commit is
+// read in from the hosted index rather than re-read (`current_hosted_blobs`
+// in `src/local_mode/index.rs`), so a fresh clone of main costs the download.
 //
 // What it reports is read back from `carrick status`, not assumed from an
 // exit code: a refresh that scanned fine can still have been refused the
@@ -53,7 +55,7 @@ export type NativeRun = (
 
 export type HostedDownload =
   /** The hosted rows are on this machine, for `services` services. */
-  | { kind: "downloaded"; services: number; reread: boolean }
+  | { kind: "downloaded"; services: number; reread: boolean; readFromHosted: string[] }
   /** The hosted blob predates this CLI, so its rows were not replayed. */
   | { kind: "version_mismatch"; services: number; reread: boolean }
   /**
@@ -458,7 +460,10 @@ function classify(status: StatusResult | null, problem: string | null, reread: b
     if (state !== "commit_missing") return { kind: "local_only", services, state, reread };
     return { kind: "local_only", services, state, reread, missing: missingCommits(status) };
   }
-  return { kind: "downloaded", services: enriched.length, reread };
+  // The repos whose services stand in from the hosted scan, whose types were
+  // captured with dependencies installed (carrick#2839).
+  const readFromHosted = (status.repos ?? []).filter((repo) => repo.read_from_hosted === true).map((repo) => repo.repo);
+  return { kind: "downloaded", services: enriched.length, reread, readFromHosted };
 }
 
 /**

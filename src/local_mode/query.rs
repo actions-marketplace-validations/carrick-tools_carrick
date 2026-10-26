@@ -122,6 +122,7 @@ pub fn answer(
             &repo_root,
             &relative,
             &indexed_at,
+            &index.indexed_at,
         )),
         (Freshness::Recheck, Mode::Check) => Some((
             None,
@@ -271,6 +272,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
             services.push(StatusService {
                 hosted: service.enrichment.hosted.clone(),
                 hosted_state: service.enrichment.hosted_state.clone(),
+                hosted_failure: replay_refusal(&service.enrichment),
                 service: service.name.clone(),
                 repo: repo.path.clone(),
                 index_commit: service.commit.clone(),
@@ -313,6 +315,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
             outside_every_service: outside_total,
             stale_files: outside,
             stale_files_truncated: outside_truncated,
+            read_from_hosted: repo.read_from_hosted,
         });
     }
 
@@ -351,6 +354,7 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         stale_since: Some(indexed_at.to_string()),
         reason: Some(reason.to_string()),
         new_functions: Vec::new(),
+        known_miss: false,
     }
 }
 
@@ -366,6 +370,7 @@ fn rechecked(
     repo_root: &Path,
     relative: &str,
     indexed_at: &str,
+    index_generation: &str,
 ) -> (Option<Vec<IndexedItem>>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
@@ -379,11 +384,12 @@ fn rechecked(
                     stale_since: Some(indexed_at.to_string()),
                     reason: Some(reason),
                     new_functions: Vec::new(),
+                    known_miss: false,
                 },
             );
         }
     };
-    match super::recheck::run(&workspace, repo_root, relative) {
+    match super::recheck::run(&workspace, repo_root, relative, index_generation) {
         Ok(fresh) => (
             Some(fresh.items),
             Recheck {
@@ -392,6 +398,7 @@ fn rechecked(
                 stale_since: None,
                 reason: None,
                 new_functions: fresh.new_functions,
+                known_miss: false,
             },
         ),
         Err(degraded) => (
@@ -401,10 +408,11 @@ fn rechecked(
                 elapsed_ms: degraded.elapsed.as_millis() as u64,
                 stale_since: Some(indexed_at.to_string()),
                 reason: Some(degraded.reason),
-                // A re-check that did not run extracted nothing, so it has
-                // nothing to compare: silence here is "not asked", never
-                // "nothing new".
-                new_functions: Vec::new(),
+                // Named from a parse that ran before the re-scan, so a re-scan
+                // that missed its budget still says what the edit added
+                // (carrick#2849).
+                new_functions: degraded.new_functions,
+                known_miss: degraded.known_miss,
             },
         ),
     }
@@ -611,7 +619,7 @@ fn verdict_for(
 }
 
 /// The read model, or why there is no answer.
-fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
+pub(super) fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
     let index_file = workspace_root
         .join(super::workspace::INDEX_DIR)
         .join("index.json");
@@ -666,6 +674,28 @@ fn scanned_changes<'a>(repo_root: &Path, changed: impl Iterator<Item = &'a Strin
     changed
         .filter(|file| crate::file_finder::is_scanned_source(&repo_root.join(file), repo_root))
         .count()
+}
+
+/// Why the hosted rows were not replayed onto a service, for the one line
+/// `carrick status` states per reason. `None` when they were, and for the
+/// states whose own sentence is the boundary note's (not signed in, not
+/// connected, no index yet).
+fn replay_refusal(enrichment: &super::hosted::ServiceEnrichment) -> Option<String> {
+    use super::hosted::HostedState;
+    match enrichment.hosted_state {
+        HostedState::Enriched => None,
+        HostedState::CommitMissing => enrichment.hosted.as_ref().map(|hosted| {
+            format!(
+                "the hosted index was built at commit {}, which this clone does not have, so no \
+                 file can be compared with it",
+                &hosted.commit[..hosted.commit.len().min(7)]
+            )
+        }),
+        HostedState::VersionMismatch => {
+            Some("the hosted index was written in an older index format than this CLI reads".into())
+        }
+        _ => enrichment.failure.clone(),
+    }
 }
 
 pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
@@ -1232,6 +1262,7 @@ mod drift_tests {
                 name: "service-repo".to_string(),
                 files: Default::default(),
                 uses: None,
+                read_from_hosted: false,
             }],
             type_check: None,
         };
@@ -1249,6 +1280,50 @@ mod drift_tests {
         let text = answer.render();
         assert!(!text.contains("carrick.json"), "{text}");
         assert!(!text.contains(".claude"), "{text}");
+    }
+
+    /// carrick#2839: `status` says which repos were read in from the hosted
+    /// index, so `carrick init` does not tell them to install dependencies for
+    /// types the hosted scan already holds. A repo scanned here says nothing.
+    #[test]
+    fn status_names_the_repos_read_in_from_the_hosted_index() {
+        let (dir, commit) = committed_repo(&[("src/main.ts", "export const a = 1;")]);
+        let repo = dir.path();
+        let mut index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_source_key: None,
+            hosted_checked_at: None,
+            version: crate::local_mode::read_model::READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            repos: vec![IndexedRepo {
+                path: repo.to_string_lossy().into_owned(),
+                services: vec![service(None, &commit)],
+                name: "service-repo".to_string(),
+                files: Default::default(),
+                uses: None,
+                read_from_hosted: true,
+            }],
+            type_check: None,
+        };
+        let index_dir = repo.join(crate::local_mode::workspace::INDEX_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        crate::local_mode::workspace::write_self_ignore(&index_dir).unwrap();
+        index.write(&index_dir.join("index.json")).unwrap();
+        let hosted = serde_json::to_value(status(repo).unwrap()).unwrap();
+        assert_eq!(hosted["repos"][0]["read_from_hosted"], true, "{hosted}");
+
+        index.repos[0].read_from_hosted = false;
+        index.write(&index_dir.join("index.json")).unwrap();
+        let scanned = serde_json::to_value(status(repo).unwrap()).unwrap();
+        assert!(
+            scanned["repos"][0].get("read_from_hosted").is_none(),
+            "{scanned}"
+        );
     }
 
     /// Straight after onboarding, `status` and the session-start hook reported
@@ -1287,6 +1362,7 @@ mod drift_tests {
                 services: vec![service(Some("apps/gateway"), &commit)],
                 files: Default::default(),
                 uses: None,
+                read_from_hosted: false,
             }],
             type_check: None,
         };
@@ -1342,6 +1418,7 @@ mod drift_tests {
             services: vec![service(None, "")],
             files: Default::default(),
             uses: None,
+            read_from_hosted: false,
         };
         let index = LocalIndex {
             hosted_identity: None,
@@ -1413,6 +1490,7 @@ mod drift_tests {
                     services: vec![service(None, "")],
                     files: Default::default(),
                     uses,
+                    read_from_hosted: false,
                 }],
                 type_check: None,
             };

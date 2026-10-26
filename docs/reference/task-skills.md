@@ -181,7 +181,7 @@ Three parts, in the order they fire:
 
 | Part | Governed code | What it does |
 |---|---|---|
-| `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | already re-extracts the edited file; now also answers with `recheck.new_functions`, the functions it declares that the index does not hold (`docs/local-mode-output.md`) |
+| `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | answers with `recheck.new_functions`, the functions the edited file declares that the index does not hold (`docs/local-mode-output.md`), from a parse of that file that does not wait on the re-scan, so a re-scan that misses its budget still records them (carrick#2849) |
 | `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/reuse.ts` | records those names for the session under `~/.carrick/sessions/<session_id>.json`, outside every repository, and prints not one byte about them |
 | `carrick hook stop` (Claude Code) or `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/user-prompt.ts`, `drain` in `npm/carrick/src/hook/reuse.ts` | names the accumulated set once and points at this skill |
 
@@ -248,8 +248,11 @@ surviving path is re-checked and recorded exactly as a Claude Code edit is.
 **The file.** `carrick init` writes `.codex/hooks.json` — Codex's project config
 layer (`ConfigLayerSource::Project`), which nests its groups under a `hooks` key
 in the same shape a `.claude` settings file does, so the merge, the reader and
-the remover are the ones in `settings.ts`. It holds two entries: `PostToolUse`
-with matcher `apply_patch` (matchers are regexes) and `UserPromptSubmit`. A file
+the remover are the ones in `settings.ts`. It holds three entries: `SessionStart`
+(the index map before the agent's first move; `hook session-start` prints it as
+`hookSpecificOutput.additionalContext` when Codex runs it, and as plain text
+under Claude Code), `PostToolUse` with matcher `apply_patch` (matchers are
+regexes) and `UserPromptSubmit`. A file
 the user already has is merged into entry by entry; an entry is recognised as
 ours by the command it runs, which is the same rule the `.claude` file follows.
 `carrick remove` takes those entries out, and deletes the file — and the
@@ -259,8 +262,10 @@ not read its own install as a dirty tree.
 
 **One step init cannot take for you.** A project hook is untrusted until Codex
 records its hash, and an untrusted hook is discovered and never run
-(`hook_trust_status` in `discovery.rs`). Codex asks at its next start; `carrick
-init` says so on the line that reports the file.
+(`hook_trust_status` in `discovery.rs`). Only the `codex` terminal app asks, at its next start, and its
+default is to carry on without them; `codex exec` skips untrusted hooks without saying so, and the editor
+extension and desktop app hold no prompt of their own (read from Codex 0.154's source, not run). `carrick init`
+says so on the line that reports the file.
 
 `carrick doctor` reports a missing or outdated Codex entry the way it reports
 the Claude ones, and only where the workspace holds a `.codex/` directory — that

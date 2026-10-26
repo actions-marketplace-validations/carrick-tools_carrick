@@ -540,9 +540,9 @@ pub struct Recheck {
     /// Functions this file declares in the working tree that the index does
     /// not hold under that name (carrick#1330).
     ///
-    /// The re-check already re-extracts the file, so this costs one set
-    /// difference on top of work that has been done. Empty on a `none` — a
-    /// re-check that did not run extracted nothing to compare — and empty,
+    /// Named from one parse of the file before the re-scan starts, so it does
+    /// not wait on the re-scan: a `none` that missed its budget still carries
+    /// it (carrick#2849). Empty when the index could not be read, and empty,
     /// which is the usual answer, when the edit added no function.
     ///
     /// It is a NAME comparison against one commit, and both halves of that
@@ -551,6 +551,14 @@ pub struct Recheck {
     /// against is `index_commit` on the answer around this block.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_functions: Vec<NewFunction>,
+    /// True on a `none` that did not try: an earlier re-check of this repo
+    /// missed its budget against this same index, so this one skipped the
+    /// re-scan and answered at once (`recheck.rs`, "known misses"). The
+    /// verdicts are the indexed ones until the next `index` or `refresh`;
+    /// `carrick check --changed` is the fresh read on such a repo. Absent on
+    /// every other answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub known_miss: bool,
 }
 
 /// One function the working tree declares and the index does not.
@@ -736,6 +744,11 @@ pub struct StatusService {
     pub hosted: Option<super::hosted::HostedProvenance>,
     #[serde(default)]
     pub hosted_state: super::hosted::HostedState,
+    /// Why the hosted rows were not replayed onto this service, when the read
+    /// recorded a reason. Printed once per reason above the boundary lines,
+    /// so a refused replay is not one clause at the end of a long sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_failure: Option<String>,
     pub service: String,
     /// Absolute path of the repo this service belongs to. Services of one repo
     /// share a commit and a changed-file count, and this is what says so.
@@ -792,6 +805,10 @@ pub struct StatusRepo {
     /// Up to [`MAX_STALE_FILES`] of THOSE, repo-relative.
     pub stale_files: Vec<String>,
     pub stale_files_truncated: bool,
+    /// The repo's services were read in from the hosted index, not scanned on
+    /// this machine (carrick#2839): their types are the hosted scan's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_from_hosted: bool,
 }
 
 /// What `carrick status` answers: the workspace, not a file.
@@ -914,6 +931,25 @@ impl StatusOutput {
         }
         for line in self.type_check.iter().flat_map(|check| check.lines()) {
             out.push_str(&format!("  {line}\n"));
+        }
+        // Once per reason: a monorepo whose replay was refused for one cause
+        // used to say it at the end of every service's boundary sentence.
+        let mut refused: Vec<(&str, usize)> = Vec::new();
+        for reason in self
+            .services
+            .iter()
+            .filter(|service| service.hosted_state != super::hosted::HostedState::Enriched)
+            .filter_map(|service| service.hosted_failure.as_deref())
+        {
+            match refused.iter_mut().find(|(seen, _)| *seen == reason) {
+                Some((_, count)) => *count += 1,
+                None => refused.push((reason, 1)),
+            }
+        }
+        for (reason, count) in refused {
+            out.push_str(&format!(
+                "  hosted rows not replayed onto {count} service(s): {reason}\n"
+            ));
         }
         out.push('\n');
         for service in &self.services {
@@ -1231,6 +1267,7 @@ mod tests {
             stale_since: None,
             reason: None,
             new_functions: Vec::new(),
+            known_miss: false,
         });
         let text = fresh.render();
         assert!(
@@ -1250,6 +1287,7 @@ mod tests {
             stale_since: Some("2026-09-13T22:26:26Z".to_string()),
             reason: Some("the re-scan ran past the budget".to_string()),
             new_functions: Vec::new(),
+            known_miss: false,
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
@@ -1268,6 +1306,7 @@ mod tests {
             stale_since: Some("2026-09-13T22:26:26Z".to_string()),
             reason: Some("the file has not changed since the index".to_string()),
             new_functions: Vec::new(),
+            known_miss: false,
         });
         let text = unchanged.render();
         assert!(
@@ -1528,10 +1567,12 @@ mod hosted_wire_tests {
                     "scripts/seed.ts".to_string(),
                 ],
                 stale_files_truncated: false,
+                read_from_hosted: false,
             }],
             services: vec![StatusService {
                 hosted: None,
                 hosted_state: Default::default(),
+                hosted_failure: None,
                 service: "gateway".to_string(),
                 repo: "/repos/monorepo".to_string(),
                 index_commit: "abc1234".to_string(),
@@ -1568,6 +1609,28 @@ mod hosted_wire_tests {
             "{text}"
         );
         assert!(text.contains("changed  tools/release.ts"), "{text}");
+    }
+
+    /// A refused replay is stated once per reason, with how many services it
+    /// covers, before the per-service boundary lines (carrick#985).
+    #[test]
+    fn the_status_render_says_once_why_the_hosted_rows_were_not_replayed() {
+        let mut output = status_output();
+        let mut second = output.services[0].clone();
+        second.service = "billing".to_string();
+        for service in [&mut output.services[0], &mut second] {
+            service.hosted_state = super::super::hosted::HostedState::ReadFailed;
+            service.hosted_failure = Some("the reason".to_string());
+        }
+        output.services.push(second);
+        let text = output.render();
+        assert_eq!(
+            text.matches("hosted rows not replayed onto 2 service(s): the reason")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(!status_output().render().contains("not replayed"));
     }
 
     /// A spend on the output changes nothing a person reads. What a run costs

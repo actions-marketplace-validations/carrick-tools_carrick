@@ -600,11 +600,12 @@ for (const [path, handler] of Object.entries(table)) {
 export default api;
 "#;
 
-/// PR #2687 review: a table's keys share their loop's call, so the trace
-/// cannot say which key a site is; it writes none of them, and no key's
-/// route is written at another key's line.
+/// carrick#2730: a table's keys share their loop's call span, and each key's
+/// record finds its own site by the key. With the trace on, each key is its
+/// own route, written at its handler's line, and no key's path sits at
+/// another key's line. The trace off writes none of them.
 #[test]
-fn routes_a_loop_registers_from_a_table_are_not_written() {
+fn each_key_of_a_loop_registered_table_is_its_own_route() {
     let table_rows = |trace: Option<&str>| -> Vec<String> {
         let blobs = scan_runs(
             "receiver-scopes",
@@ -620,7 +621,29 @@ fn routes_a_loop_registers_from_a_table_are_not_written() {
             .filter(|row| row.starts_with("src/table.ts:"))
             .collect()
     };
-    assert_eq!(table_rows(Some("1")), table_rows(None));
+    let on = table_rows(Some("1"));
+    let line_of = |name: &str| {
+        LOOP_TABLE
+            .lines()
+            .position(|line| line.starts_with(&format!("function {name}(")))
+            .unwrap()
+            + 1
+    };
+    let at = |name: &str, path: &str| {
+        on.iter()
+            .filter(|row| {
+                row.starts_with(&format!(
+                    "src/table.ts:{} GET {path} library_claim",
+                    line_of(name)
+                ))
+            })
+            .count()
+    };
+    assert_eq!(at("list", "/t/list"), 1, "{on:#?}");
+    assert_eq!(at("show", "/t/show"), 1, "{on:#?}");
+    assert_eq!(at("list", "/t/show"), 0, "{on:#?}");
+    assert_eq!(at("show", "/t/list"), 0, "{on:#?}");
+    assert_ne!(on, table_rows(None));
 }
 
 /// Every HTTP producer manifest entry of the blobs, as `file:line METHOD
@@ -704,17 +727,18 @@ fn routes_across_services_take_the_receiving_scope() {
             // onto it in its own service.
             "packages/routes/src/admin.ts:5 GET /api/v1/admin/users descriptor_route app",
             // Added: no row stood there. With no type anchor this scan, the
-            // documentation of the same operation keeps its row.
-            "packages/routes/src/admin.ts:6 POST /api/v1/admin/users library_claim app",
-            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users descriptor_route __route_descriptor__",
+            // documentation of the same operation folds onto it (carrick#2742)
+            // and its manifest entries stay at the documentation's site: one
+            // row, typed by the documentation.
+            "packages/routes/src/admin.ts:6 POST /api/v1/admin/users descriptor_route app",
             // The host's audit routes are documented here, in another
             // service (carrick#2474 R5d): `audit.ts:6` holds types and takes
             // the documentation's place, `audit.ts:7` was added untyped and
             // the documentation of it stays.
             "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} descriptor_route __route_descriptor__",
-            "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
-            // Q5 (ii): the path two hosts state; the third is counted.
-            "packages/routes/src/orders.ts:4 GET /api/v1/orders library_claim app",
+            // Q5 (ii): the path two hosts state; the third is counted. Its
+            // documentation (`docs.ts:4`) folds onto the added row.
+            "packages/routes/src/orders.ts:4 GET /api/v1/orders descriptor_route app",
             // The package's own app serves the same routes at its root
             // (PR #2734 review): that chain stays in the service, and its
             // path stands beside the hosts'.
@@ -765,18 +789,32 @@ fn routes_across_services_take_the_receiving_scope() {
             "packages/server/src/audit.ts:6 GET /api/v1/audit/events response Endpoint_cf8ea45ffddd4018_Response_Atde8b764d1203983c",
         ]
     );
-    // Each row's endpoint key, flat key and manifest key are one string.
+    // Every manifest entry has a row with its method and path in its own
+    // service. A documentation row folded onto an added row keeps its entries
+    // at the documentation's own site (carrick#2742), so the join is by
+    // key, as the cloud reads it, not by site.
     for entry in producer_manifest(&on) {
-        let (site, rest) = entry.split_once(' ').unwrap();
+        let (_site, rest) = entry.split_once(' ').unwrap();
         let (method, rest) = rest.split_once(' ').unwrap();
         let path = rest.split(' ').next().unwrap();
         assert!(
             graph
                 .iter()
-                .any(|row| row.starts_with(&format!("{site} {method} {path} "))),
+                .any(|row| row.split(' ').skip(1).take(2).eq([method, path])),
             "{entry} has no row at its key: {graph:#?}"
         );
     }
+    // One operation, one row per service: no method and path twice in the
+    // routes service.
+    let routes_rows: Vec<String> = graph
+        .iter()
+        .filter(|row| row.starts_with("packages/routes/"))
+        .map(|row| row.split(' ').skip(1).take(2).collect::<Vec<_>>().join(" "))
+        .collect();
+    let mut seen = routes_rows.clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), routes_rows.len(), "{routes_rows:?}");
     let counts = |service: &str| -> Vec<String> {
         fallbacks[service]
             .iter()

@@ -25,6 +25,7 @@ import {
   hookCommand,
   mergeCarrickHooks,
   ownEntryPoint,
+  removeCarrickHooks,
 } from "../src/init/settings.ts";
 import { PROJECT_RULE, planProject, projectStep, reposPhrase, type Project, type ProjectPrompts } from "../src/init/projects.ts";
 import {
@@ -464,12 +465,8 @@ test("the hook entries land beside everything else the settings file holds", () 
     {
       permissions: { allow: ["Bash(ls:*)"] },
       hooks: {
-        SessionStart: [
-          { hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/session-start.sh"' }] },
-        ],
-        PreToolUse: [
-          { matcher: "Grep", hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/search-gate.sh"' }] },
-        ],
+        SessionStart: [{ hooks: [{ type: "command", command: "./my-own-start.sh" }] }],
+        PreToolUse: [{ matcher: "Grep", hooks: [{ type: "command", command: "./my-own-gate.sh" }] }],
       },
     },
     null,
@@ -479,9 +476,9 @@ test("the hook entries land beside everything else the settings file holds", () 
   const written = JSON.parse(merged.body);
   assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
   assert.equal(written.hooks.PreToolUse.length, 1);
-  // The hosted index's session-start script survives, with ours after it.
+  // The user's own session-start script survives, with ours after it.
   assert.equal(written.hooks.SessionStart.length, 2);
-  assert.match(written.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
+  assert.equal(written.hooks.SessionStart[0].hooks[0].command, "./my-own-start.sh");
   assert.equal(written.hooks.SessionStart[1].hooks[0].command, "carrick hook session-start");
   assert.equal(written.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
   // The Read hook (carrick#2069) is its own group beside the Edit one.
@@ -493,6 +490,55 @@ test("the hook entries land beside everything else the settings file holds", () 
   // rather than by anything the user has to add.
   assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
   assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
+});
+
+// carrick#2854: the hosted scaffold's hook pack wires the same session-start
+// message init does, so a session got it twice. Init replaces the pack's
+// session-start entry (the exact `$CLAUDE_PROJECT_DIR/.claude/session-start.sh`
+// command the scaffold writes) and keeps the pack's prompt reminder and search
+// nudge, which init has nothing in place of, and every entry of the user's.
+test("init replaces the scaffold's session-start entry and keeps its nudges and the user's own", () => {
+  const pack = (name: string) => ({ type: "command", command: `"$CLAUDE_PROJECT_DIR/.claude/${name}.sh"` });
+  const scaffolded = JSON.stringify(
+    {
+      permissions: { allow: ["Bash(ls:*)"] },
+      hooks: {
+        SessionStart: [{ hooks: [pack("session-start")] }],
+        UserPromptSubmit: [{ hooks: [pack("turn-reminder")] }],
+        PreToolUse: [
+          { matcher: "Grep", hooks: [pack("search-gate")] },
+          { matcher: "Bash", hooks: [pack("search-gate")] },
+          // The user's own hook, sharing nothing with the pack but the event.
+          { matcher: "Bash", hooks: [{ type: "command", command: "./guard.sh" }] },
+        ],
+        // A different script in the same directory is the user's, not the pack's.
+        Stop: [{ hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/notify.sh"' }] }],
+      },
+    },
+    null,
+    2,
+  );
+  const merged = mergeCarrickHooks(scaffolded);
+  const written = JSON.parse(merged.body);
+  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
+  assert.deepEqual(
+    written.hooks.SessionStart.map((group: { hooks: Array<{ command: string }> }) => group.hooks[0]!.command),
+    ["carrick hook session-start"],
+    "one session-start message",
+  );
+  assert.deepEqual(written.hooks.UserPromptSubmit, [{ hooks: [pack("turn-reminder")] }]);
+  assert.deepEqual(written.hooks.PreToolUse, [
+    { matcher: "Grep", hooks: [pack("search-gate")] },
+    { matcher: "Bash", hooks: [pack("search-gate")] },
+    { matcher: "Bash", hooks: [{ type: "command", command: "./guard.sh" }] },
+  ]);
+  assert.equal(written.hooks.Stop.length, 2);
+  assert.equal(written.hooks.Stop[0].hooks[0].command, '"$CLAUDE_PROJECT_DIR/.claude/notify.sh"');
+  assert.equal(JSON.stringify(written).includes("session-start.sh"), false);
+  // Settled: a second run changes nothing.
+  assert.equal(mergeCarrickHooks(merged.body).changed, false);
+  // `carrick remove` is not a replacement: the pack's entries stay for their owner.
+  assert.equal(removeCarrickHooks(scaffolded).changed, false);
 });
 
 test("merging twice changes nothing the second time", () => {
@@ -1385,7 +1431,7 @@ function pathsUnder(root: string): string[] {
 // the task skills the two harnesses read: carrick.json is the agent's to write,
 // after someone has read it, and before the one paid scan
 // (carrick-cloud#799). A change to this set is a deliberate diff in this list.
-test("a first init writes the proposal, its ignore file, the hook settings and the task skills, and nothing else", posixNativeFixture, () => {
+test("a first init writes the proposal, its ignore file, the hook settings, the task skills and the AGENTS.md check section, and nothing else",posixNativeFixture, () => {
   const fixture = executableInitFixture("payments", "absent", "monorepo");
   try {
     const result = spawnSync(
@@ -1414,8 +1460,14 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
         path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
         // The same two-part nudge, for the other host (carrick#1335).
         CODEX_HOOKS_FILE,
+        // The check section for agents (carrick#2828).
+        "AGENTS.md",
         ...taskSkillPaths(),
       ].sort(),
+    );
+    assert.equal(
+      fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8").includes("run `carrick check --changed`"),
+      true,
     );
 
     // The proposal is the whole derivation, including the config it would once
@@ -1425,7 +1477,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     // the Codex hooks and the skills and are meant to be committed.
     assert.equal(
       execFileSync("git", ["-C", fixture.repo, "status", "--porcelain"], { encoding: "utf8" }),
-      "?? .agents/\n?? .claude/\n?? .codex/\n",
+      "?? .agents/\n?? .claude/\n?? .codex/\n?? AGENTS.md\n",
     );
 
     const proposal = JSON.parse(fs.readFileSync(path.join(fixture.repo, PROPOSAL_FILE), "utf8"));
@@ -1443,7 +1495,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
       result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
       [
         "◇ Set up in project payments: repo",
-        "▲ Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.",
+        "▲ Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.",
         "",
         "Next: paste this into a new agent session",
         `  ${scaffoldFor("acme/api")}`,
@@ -2412,7 +2464,7 @@ test("the interactive step stops the spinner on the marker its work earned", asy
     hostedReport({ kind: "local_only", services: 3, state: "read_failed", reread: true }),
   );
   await out.step("Reading the hosted index into .carrick/", async () => "downloaded", () =>
-    hostedReport({ kind: "downloaded", services: 2, reread: true }),
+    hostedReport({ kind: "downloaded", services: 2, reread: true, readFromHosted: [] }),
   );
   // Rendered, then read as text: the colours and the cursor are the
   // terminal's business and the markers are the contract.
@@ -2483,22 +2535,22 @@ test("the numbered pick list takes one number, and refuses anything else", async
 // that says so, and the one that produced nothing is a refusal (carrick#1020,
 // carrick#1026).
 test("every hosted outcome is one line, and only an actionable one is a warning", () => {
-  assert.deepEqual(hostedReport({ kind: "downloaded", services: 2, reread: true }), {
+  assert.deepEqual(hostedReport({ kind: "downloaded", services: 2, reread: true, readFromHosted: [] }), {
     kind: "done",
     text: "Hosted index for 2 services read into .carrick/",
   });
   assert.deepEqual(
-    hostedReport({ kind: "downloaded", services: 1, reread: true }).text,
+    hostedReport({ kind: "downloaded", services: 1, reread: true, readFromHosted: [] }).text,
     "Hosted index for 1 service read into .carrick/",
   );
   // With the time the step took, which is what a wait of minutes ends on.
   assert.equal(
-    hostedReport({ kind: "downloaded", services: 15, reread: true }, 184).text,
+    hostedReport({ kind: "downloaded", services: 15, reread: true, readFromHosted: [] }, 184).text,
     "Hosted index for 15 services read into .carrick/ in 3m4s",
   );
   // And the same rows, on a run that spent none of those minutes: the reader
   // is told which of the two they got (carrick#1373).
-  const kept = hostedReport({ kind: "downloaded", services: 15, reread: false }, 0.4);
+  const kept = hostedReport({ kind: "downloaded", services: 15, reread: false, readFromHosted: [] }, 0.4);
   assert.equal(kept.kind, "done");
   assert.equal(kept.text, ".carrick/ already holds the hosted index for 15 services: nothing was re-read");
   assert.doesNotMatch(kept.text, /in 0/);
@@ -2739,7 +2791,7 @@ test("init runs no local pass when the index is already current, and still repor
   const said: string[] = [];
   const outcome = await downloadHostedIndex("/code", run, ["/code/api"], (line) => void said.push(line));
   assert.deepEqual(commands, ["status"]);
-  assert.deepEqual(outcome, { kind: "downloaded", services: 1, reread: false });
+  assert.deepEqual(outcome, { kind: "downloaded", services: 1, reread: false, readFromHosted: [] });
   // And nothing is said about re-reading a thing that was not re-read.
   assert.deepEqual(said, []);
 });
@@ -2757,7 +2809,7 @@ test("init runs the local pass when the index is stale, and says why before the 
   // Status, then the pass, then status again: the outcome is read back from
   // the index rather than assumed from an exit code (carrick#1012).
   assert.deepEqual(commands, ["status", "refresh", "status"]);
-  assert.deepEqual(outcome, { kind: "downloaded", services: 1, reread: true });
+  assert.deepEqual(outcome, { kind: "downloaded", services: 1, reread: true, readFromHosted: [] });
   assert.deepEqual(said, [`${STEP_LABEL}: 6 file(s) changed since it was built, ${REREADING}`]);
 });
 
@@ -3649,8 +3701,10 @@ function cloudWorkspace(options: {
   projects?: Record<string, string>;
   /** What `status` says of an indexed repo's hosted rows after the read. */
   hostedState?: string;
-  /** A repo whose dependencies the scanner found missing. */
-  notInstalled?: string;
+  /** Repos whose dependencies the scanner found missing. */
+  notInstalled?: string[];
+  /** Repos the scanner read in from the hosted index rather than scanning here. */
+  readFromHosted?: string[];
   /** Editors with a configuration directory here, and whether each one's command answers. */
   editors?: Record<string, boolean>;
 }): {
@@ -3705,7 +3759,7 @@ if (argv[0] === "status") {
   const state = (repo) => ({ indexed: ${JSON.stringify(options.hostedState ?? "enriched")}, connected: "no_index_yet", absent: "not_connected" })[held[path.basename(repo)]];
   process.stdout.write(JSON.stringify({
     schema: "carrick.status/0", workspace,
-    repos: repos.map((repo) => ({ repo, name: path.basename(repo), changed_since_index: 0, outside_every_service: 0 })),
+    repos: repos.map((repo) => ({ repo, name: path.basename(repo), changed_since_index: 0, outside_every_service: 0, ...(${JSON.stringify(options.readFromHosted ?? [])}.includes(path.basename(repo)) ? { read_from_hosted: true } : {}) })),
     services: repos.map((repo) => ({
       service: path.basename(repo), repo, index_commit: "abc1234", indexed_at: "2026-10-12T00:00:00Z",
       routes: 3, calls: 2, changed_since_index: 0, hosted_state: state(repo), hosted: null,
@@ -3716,7 +3770,7 @@ if (argv[0] === "status") {
 if (argv[0] !== "derive") process.exit(2);
 const entry = (repo) => ({
   path: repo, reason: "test", services: [{ serviceName: path.basename(repo) }], config: null, warnings: [],
-  not_installed: path.basename(repo) === ${JSON.stringify(options.notInstalled ?? "")} ? [{ service: path.basename(repo), directory: ".", command: "npm install" }] : [],
+  not_installed: ${JSON.stringify(options.notInstalled ?? [])}.includes(path.basename(repo)) ? [{ service: path.basename(repo), directory: ".", command: "npm install" }] : [],
 });
 const base = { schema: "carrick.derive/0", workspace, repos_added: [], repos_excluded: exclude, missing: [] };
 process.stdout.write(JSON.stringify(inside.length > 0
@@ -4027,8 +4081,31 @@ test("--local on that workspace is the run a laptop workspace gets, line for lin
   assert.doesNotMatch(cloud.text, /scaffold/);
 });
 
+// carrick#2839. A repo read in from the hosted index carries the hosted scan's
+// types, captured with dependencies installed, so the advice to install and
+// refresh is false for it and costs a full local re-read.
+test("on that workspace a repo read in from the hosted index is not told to install", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({
+    repos: { api: "indexed", web: "indexed" },
+    notInstalled: ["api", "web"],
+    readFromHosted: ["api"],
+  });
+  try {
+    const out = silentTerminal();
+    assert.equal(await initWith([fixture.folder], out, false), 0, out.lines.join("\n"));
+    const text = out.lines.join("\n");
+    assert.ok(
+      out.lines.includes("▲ Dependencies are not installed, so the index here was read without their types. Run `npm install` in web, then carrick refresh."),
+      text,
+    );
+    assert.doesNotMatch(text, /npm install` in api/);
+  } finally {
+    fixture.restore();
+  }
+});
+
 test("on that workspace a release mismatch and missing dependencies name no scan", posixNativeFixture, async () => {
-  const fixture = cloudWorkspace({ repos: { api: "indexed", web: "indexed" }, hostedState: "version_mismatch", notInstalled: "api" });
+  const fixture = cloudWorkspace({ repos: { api: "indexed", web: "indexed" }, hostedState: "version_mismatch", notInstalled: ["api"] });
   try {
     const out = silentTerminal();
     assert.equal(await initWith([fixture.folder], out, false), 0, out.lines.join("\n"));

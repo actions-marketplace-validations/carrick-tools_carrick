@@ -23,8 +23,7 @@ use crate::{
     packages::Packages,
     url_normalizer::UrlNormalizer,
 };
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::HashMap;
 use swc_common::{SourceMap, sync::Lrc};
 use tracing::debug;
 
@@ -44,8 +43,6 @@ pub struct MultiAgentAnalysisResult {
     /// Processing statistics
     #[allow(dead_code)]
     pub stats: ProcessingStats,
-    /// See [`FileCentricAnalysisResult::passes_body`].
-    pub passes_body: HashSet<(PathBuf, String)>,
 }
 
 /// Orchestrates the complete multi-agent workflow using AST-Gated File-Centric analysis.
@@ -97,10 +94,6 @@ impl MultiAgentOrchestrator {
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
-        // The one module resolver for this service
-        // (`engine::service_module_index`, carrick#1416), read by the passes
-        // that resolve a call's specifier after the model has answered.
-        service_modules: &crate::workspace_resolver::WorkspaceIndex,
         // What each call site's callee sends (carrick#1555), possibly still
         // being composed while the library semantics settle (carrick#1564).
         request_summaries: crate::agents::file_orchestrator::SummarySource,
@@ -152,7 +145,6 @@ impl MultiAgentOrchestrator {
                 graphql_producer_hints,
                 graphql_consumer_hints,
                 normalizer,
-                service_modules,
             )
             .await?;
 
@@ -177,7 +169,6 @@ impl MultiAgentOrchestrator {
             file_results: file_centric_result.file_results,
             raw_model_results: file_centric_result.raw_model_results,
             stats: file_centric_result.stats,
-            passes_body: file_centric_result.passes_body,
         })
     }
 

@@ -8,6 +8,10 @@
  * stdio `capture_v2` action is the only surface the Rust client sees.
  */
 
+import type { ResultLabel } from './result-label.js';
+
+export type { ResultLabel };
+
 /**
  * How the anchor was produced upstream (design-doc amendment 2). Recorded so
  * the fidelity metric separates anchor-recall loss from serialization loss.
@@ -61,6 +65,12 @@ export interface SymbolAnchorRequest {
    * table keyed by status code captures as its 2xx body, not as the table.
    */
   consumer_response?: boolean;
+  /**
+   * carrick#2814: the symbol is a request body or payload whose handler works
+   * when none is sent (the inferrer's mark for the alias). Copied onto the
+   * alias's record, where the check phase reads it.
+   */
+  absent_body_tolerated?: true;
 }
 
 /**
@@ -95,6 +105,12 @@ export interface LiteralAnchorRequest {
    * onto the alias's record, where the check phase reads it.
    */
   raw_text_read?: true;
+  /**
+   * carrick#2814: the text is a request body or payload whose handler works
+   * when none is sent. Copied onto the alias's record, where the check phase
+   * reads it.
+   */
+  absent_body_tolerated?: true;
 }
 
 /**
@@ -166,6 +182,12 @@ export interface InferAnchorRequest {
    * Default 'awaited': Promise / thenable layers are unwrapped.
    */
   unwrap?: 'awaited' | 'none';
+  /**
+   * carrick#2818: the library store's label for the call this anchor locates,
+   * naming the part of the call's result that holds the response body. Read
+   * after the awaited unwrap; absent means the type is taken as it stands.
+   */
+  result?: ResultLabel;
 }
 
 export type CaptureAnchorRequest =
@@ -248,6 +270,7 @@ export type TypeProvenanceReason =
   | 'projected_value_only'
   | 'serialised_body_unread'
   | 'body_built_by_callee'
+  | 'result_member_missing'
   | 'not_recorded';
 
 /**
@@ -356,6 +379,14 @@ export interface CaptureAliasRecord {
    * otherwise, and absent on every record a release before this one stored.
    */
   raw_text_read?: true;
+  /**
+   * carrick#2814: the alias is a route's request body, or a subscriber's
+   * payload, whose handler works when none is sent. The check phase lets a
+   * sender that may send nothing pass against it when its type has no
+   * required member. Absent otherwise: the absent body is then judged by the
+   * type alone.
+   */
+  absent_body_tolerated?: true;
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */

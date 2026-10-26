@@ -22,7 +22,7 @@ invented, a sibling's route, and one correct path. Rows whose id starts with
 `model:` join no candidate, so they have no span and are placed by their line.
 
 Rows that take the request their call reaches (`commands.ts` lines 9, 15, 21,
-46, 64, 101, 145, 151, 157, 164 and 176; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
+46, 64, 101, 145, 151, 157, 164, 176 and 186; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
 source `request_summary`, the role `wrapper_call` and `reaches_request`. Line
 21 is stated twice by the model and is one row afterwards. The correct row
 (`commands.ts:28`) keeps its `model` source and its type entry, and gains the
@@ -34,12 +34,36 @@ Types at the corrected rows:
 |---|---|
 | `commands.ts:145` | `Run`, which matches what the API sends; the function called hands back the parsed body: kept under the reached operation and judged compatible |
 | `commands.ts:157` | `SavedRun`, a stale copy that requires a field the API no longer sends: kept and judged incompatible |
+| `commands.ts:9`, `:46` | the client method hands the request to a helper that reads `.data` of a library client's result: a member read is never taken as the body, so the type is dropped (the library store will state the member, carrick-cloud#2639) |
+| `commands.ts:15` | no entry exists at the call (the caller declares no type), so none is kept |
+| `commands.ts:21`, `:64`, `:101`, `:164` | the same helper chain: dropped |
 | `commands.ts:151` | anchored at a call whose function wraps the body in an envelope: dropped and counted |
-| `commands.ts:9`, `:21`, `:46`, `:101` | anchored at a client method that returns `.data` of what a request spec returns, a shape nothing here states: dropped and counted |
+| `commands.ts:176`, `:186` | the function called returns the transport's result whole, with no step read off it: dropped and counted |
 | `hooks.ts:9`, `:14`, `:19` | anchored at a hook's or a runner's call, whose result is not what the request returns: dropped and counted |
 
-A type is kept only where the function called hands back the request's parsed
-body unchanged, as the request summaries read it (carrick#1601).
+A type is kept only where the chain of functions from the call's callee to the
+request reads exactly one step off the transport's value, and that step is the
+Fetch standard's `Response.json()` (carrick#2377, `ReachGraph::hands_back_body`
+in `src/call_through.rs`). A member read of a library client's result is never
+taken as the body; those wrappers abstain until the library store states the
+member (carrick-cloud#2639). The
+steps are counted over every function on the chain; a function whose value is
+built into an object, passed through another function, or read twice leaves
+the chain unproven.
+
+`packages/cli/src/typed-commands.ts` states four rows, each at a client method
+(`typed-client.ts`) that says what it returns:
+
+| Site | Outcome |
+|---|---|
+| `typed-commands.ts:8` (`saveRun`) | dropped: the helper chain of `commands.ts:46` reads a member |
+| `typed-commands.ts:15` (`read`) | `Run` kept, compatible: a class member returning a function's parsed `fetch` |
+| `typed-commands.ts:22` (`getRunView`) | dropped: the value goes through `toView` before it is returned |
+| `typed-commands.ts:29` (`getRunState`) | dropped: two reads, the helper's member and then the run's own |
+
+The calls in `typed-commands.ts` from line 36 have no model row. The requests
+they reach are in `packages/client/src/typed.ts`: two specs (lines 13 and 19)
+and a `fetch` on the declared base (line 24).
 
 Where a call reaches more than one request, the request is the one whose value
 the functions hand back. A request awaited and dropped, or whose value only
@@ -101,10 +125,8 @@ client class then states its row from the source alone (`commands.ts` lines
 None is stated at a call one hop further up (`main.ts:5` calls a command of
 another file, which calls the client; `commands.ts:15` and `:46` call a
 command of the same file, `:57` a helper of the same file that reaches two
-operations), at a call nothing resolves (`commands.ts:70`), or in
-`hooks.ts`: the hooks call the client package directly, and `withSpinner`
-(`:19`) only runs the callback it is handed, so no function of the web's own
-calls into the other service on their behalf.
+operations), or at a call nothing resolves (`commands.ts:70`). A call
+straight into the client package is a different case, below.
 
 `packages/cli/src/nested.ts`, with `helpers.ts` and `local-fetch.ts` beside
 it, and `apps/web/src/page.tsx` with `badge.tsx`:
@@ -119,5 +141,52 @@ it, and `apps/web/src/page.tsx` with `badge.tsx`:
 | `nested.ts:39` | `GET /api/v1/status`: `statusViaReader` writes a reader and calls it |
 | `page.tsx:5` | none: a JSX element is no call the source writes |
 | `page.tsx:10` | `GET /api/v1/runs`: the same component called as a function |
+
+## Calls straight into another service
+
+A call into a function another service declares, where that function
+reaches exactly one request written in that service, states the request at
+the call (carrick#2773), whether or not the model stated a row there. The
+function may hand its request back unrun: `getRunOptions` returns a `queryFn`
+that a hook runs later.
+
+- `apps/web` has a `tsconfig.json` that maps `@fixture/client` to the client
+  package, so the compiler's rows read its calls. `packages/cli`'s maps
+  nothing, and its calls are read as the scan reads an import the compiler
+  cannot resolve. Both state the same kind of row.
+- A call written inside a function of its own service that the service's other
+  calls already reach the request through states nothing: those callers are
+  the sites, one per module that calls in. So the client class's methods
+  (`api-client.ts`), the probed clients' methods, `helpers.ts` lines 16 and 21
+  and `badge.tsx:5` (called at `page.tsx:10`) state none.
+- A function that no other file of the service calls, or that reaches two
+  operations, or hands its request back unrun, is no wrapper, and its calls
+  state theirs: `helpers.ts` lines 6 (two rows) and 27, and the probe in
+  `probed-client.ts:14`.
+- A function of the service's own file that is called from its own file only
+  (`commands.ts:171`) is no wrapper either.
+- The request must be written in the service that declares the function
+  called. A function that reaches a request a third service writes states
+  nothing (unit test in `src/call_through.rs`).
+
+With the model's answers for `hooks.ts` and `commands.ts` emptied, the rows
+the pass states are `hooks.ts` lines 9, 14, 19 and 24 and `commands.ts`
+lines 145, 151, 157 and 171; `commands.ts` lines 76, 82 and 94 stay empty, for
+the reasons in the table above.
+
+A method called on a call's value (carrick#2822, #2823) is followed only
+through the compiler's `call` rows, so these rows are asserted on a scan with
+`CARRICK_POSITION_ROWS=1`:
+
+- `packages/cli/src/inline-commands.ts:9` (`getClient().getRun(id)`) and `:13`
+  (`createClient().getStatus()`): the model's path is made from names; each
+  row takes the request the client method sends.
+- `inline-commands.ts:22`: a command table's `run:` calls `showToken`, whose
+  body is `createClient().getToken()`; the row takes `GET /api/v1/token`.
+- `apps/web/src/inline-hooks.ts:6`: a hook's one callback calls
+  `createApi().status()` on the app's own client (`apps/web/src/api.ts`); the
+  row takes `GET /api/v1/status`.
+
+Without the rows these four stay as the model stated them.
 
 Driven by `tests/call_through_rows_test.rs`.

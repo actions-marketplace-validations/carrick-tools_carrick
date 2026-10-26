@@ -162,6 +162,21 @@ pub struct SymbolRequest {
     pub consumer_response: bool,
 }
 
+/// The library store's label for which part of a call's result holds the
+/// response body (carrick#2818). On the wire it is exactly one key:
+/// `{"whole":true}`, `{"member":["data"]}` or `{"parse":"json"}`. Mirrors the
+/// sidecar's `ResultLabel` (src/sidecar/src/capture/result-label.ts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultShape {
+    /// The awaited value is the body (the flag is always `true`).
+    Whole(bool),
+    /// This member of every non-nullish constituent of the awaited value.
+    Member([String; 1]),
+    /// The awaited return of this no-argument method.
+    Parse(String),
+}
+
 /// Request for type inference at a specific location
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferRequestItem {
@@ -193,6 +208,11 @@ pub struct InferRequestItem {
     /// request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<String>,
+    /// The library store's label for the call's result (carrick#2818), read
+    /// by the sidecar for `CallResult`. Absent from every request without one,
+    /// so those serialise as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultShape>,
 }
 
 // ============================================================================
@@ -234,6 +254,11 @@ pub enum CaptureAnchor {
         /// Carried from [`SymbolRequest::consumer_response`] (carrick#1841).
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         consumer_response: bool,
+        /// carrick#2814: the symbol is a request body or payload whose
+        /// handler works when none is sent, marked by the inference for the
+        /// alias. The capture copies it onto the alias's record.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        absent_body_tolerated: bool,
     },
     /// Addressable handler: `Awaited<ReturnType<typeof import('./m').fn>>`.
     HandlerReturn {
@@ -262,6 +287,10 @@ pub enum CaptureAnchor {
         /// captures that call's return type instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         param_name: Option<String>,
+        /// carrick#2818: the library store's label for the call this anchor
+        /// locates; the capture reads the labelled part of the call's result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ResultShape>,
     },
     /// Inline literal type text (the v1 inline-alias path).
     Literal {
@@ -285,6 +314,11 @@ pub enum CaptureAnchor {
         /// phase reads from every stored stub.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         raw_text_read: bool,
+        /// carrick#2814: the text is a request body or payload whose handler
+        /// works when none is sent. The capture copies it onto the alias's
+        /// record, which the check phase reads from every stored stub.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        absent_body_tolerated: bool,
     },
 }
 
@@ -450,7 +484,8 @@ pub struct TypeProvenance {
     /// Categorized cause: `declared`, `unresolved_import`, `budget_exhausted`,
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
-    /// `serialised_body_unread`, `body_built_by_callee`, `not_recorded`.
+    /// `serialised_body_unread`, `body_built_by_callee`, `result_member_missing`,
+    /// `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1512,6 +1547,13 @@ pub struct InferredType {
     /// the check phase reads the pair unverifiable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub raw_text_read: bool,
+    /// carrick#2814, a route's request body or a subscriber's payload: the
+    /// handler is in reach and works when nothing is sent (it defaults the
+    /// body or reads it only through `?.` / `?? {}`). `derive_capture_anchors`
+    /// carries the mark onto the literal anchor, and the check lets a sender
+    /// that may send nothing pass against a body type with no required member.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent_body_tolerated: bool,
     /// carrick#2054, response inferences only: which fields of the incoming
     /// message the handler's branches test to choose among the success bodies
     /// `type_string` joins, and, when one placed field decides it, the union
@@ -1897,6 +1939,19 @@ pub fn ready_budget() -> Duration {
 // ============================================================================
 // V8 heap sizing
 // ============================================================================
+
+/// The directory a sidecar keeps its `infer` answers in, one per service, and
+/// serves them again from while the program they were read in is unchanged
+/// (carrick#2843, `src/sidecar/src/infer-cache.ts`). Unset, nothing is kept:
+/// a CI scan starts on a clean machine and has nothing to serve again.
+pub const INFER_CACHE_ENV: &str = "CARRICK_INFER_CACHE_DIR";
+
+/// Where a laptop scan's sidecars keep their `infer` answers:
+/// `~/.carrick/cache/infer`, beside the run logs, or `None` with no home
+/// directory.
+pub fn local_infer_cache_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".carrick").join("cache").join("infer"))
+}
 
 /// Env override for the sidecar's V8 old-space cap, in MB. `0` (or an
 /// unparseable value) means "do not pass the flag at all" — V8's own default.
@@ -4868,6 +4923,7 @@ mod tests {
     fn test_infer_request_serialization() {
         let request = InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/routes.ts".to_string(),
             line_number: 42,
             span_start: Some(128),
@@ -4932,6 +4988,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: Some(2),
             consumer_response: false,
+            absent_body_tolerated: false,
         };
         let json = serde_json::to_string(&symbol).unwrap();
         assert!(json.contains(r#""kind":"symbol""#));
@@ -4944,6 +5001,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: true,
+            absent_body_tolerated: false,
         };
         let consumer_json = serde_json::to_string(&consumer).unwrap();
         assert!(
@@ -4962,6 +5020,7 @@ mod tests {
             line_number: None,
             expression_text: None,
             param_name: None,
+            result: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
         assert!(json.contains(r#""kind":"infer""#));
@@ -4975,6 +5034,7 @@ mod tests {
             source_file: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
@@ -4993,6 +5053,7 @@ mod tests {
                 export_path: vec!["Status".into()],
             }],
             raw_text_read: false,
+            absent_body_tolerated: false,
         };
         let json = serde_json::to_string(&located).unwrap();
         assert!(json.contains(r#""source_file":"src/routes.ts""#));
@@ -5101,6 +5162,7 @@ mod tests {
                     .into_iter()
                     .map(|infer_kind| InferRequestItem {
                         member: None,
+                        result: None,
                         file_path: "/repo/src/orders.ts".into(),
                         line_number: 4,
                         span_start: Some(10),
@@ -5178,6 +5240,7 @@ mod tests {
                         anchor_origin: AnchorOrigin::LlmSymbol,
                         array_depth: Some(1),
                         consumer_response: false,
+                        absent_body_tolerated: false,
                     },
                     CaptureAnchor::HandlerReturn {
                         alias: "B".into(),
@@ -5194,6 +5257,7 @@ mod tests {
                         line_number: Some(4),
                         expression_text: Some("req.body".into()),
                         param_name: Some("event".into()),
+                        result: None,
                     },
                     CaptureAnchor::Literal {
                         alias: "D".into(),
@@ -5206,6 +5270,7 @@ mod tests {
                             export_path: vec!["Status".into()],
                         }],
                         raw_text_read: true,
+                        absent_body_tolerated: true,
                     },
                 ],
                 out_dir: "/tmp/stub".into(),
@@ -5500,6 +5565,7 @@ mod tests {
         };
         let item = |infer_kind| InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/app.ts".into(),
             line_number: 1,
             span_start: None,
@@ -6442,6 +6508,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         }
@@ -7239,6 +7306,7 @@ mod tests {
     fn model_symbols_are_sent_for_producer_response_reads_only() {
         let item = |alias: &str, infer_kind: InferKind| InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/routes.ts".into(),
             line_number: 4,
             span_start: None,
@@ -7465,6 +7533,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let items: Vec<InferRequestItem> = (0..ITEMS as u32)
             .map(|line| InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: line + 1,
                 span_start: None,
@@ -7504,5 +7573,50 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "no service was being analysed, named or not"
         );
         crate::scan_health::forget_service_losses(Some(SERVICE));
+    }
+
+    /// carrick#2818: a result label rides the infer item and the infer anchor
+    /// as exactly one key, and an item without one serialises as it did.
+    #[test]
+    fn result_label_wire_form() {
+        let item = |result: Option<ResultShape>| InferRequestItem {
+            file_path: "src/a.ts".into(),
+            line_number: 3,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::CallResult,
+            alias: None,
+            param_name: None,
+            member: None,
+            result,
+        };
+        let json = |r| serde_json::to_string(&item(r)).unwrap();
+        assert!(!json(None).contains(r#""result":"#), "{}", json(None));
+        assert!(json(Some(ResultShape::Whole(true))).contains(r#""result":{"whole":true}"#));
+        assert!(
+            json(Some(ResultShape::Member(["data".into()])))
+                .contains(r#""result":{"member":["data"]}"#)
+        );
+        assert!(
+            json(Some(ResultShape::Parse("json".into()))).contains(r#""result":{"parse":"json"}"#)
+        );
+
+        let anchor = CaptureAnchor::Infer {
+            alias: "A".into(),
+            source_file: "src/a.ts".into(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            span_start: None,
+            span_end: None,
+            line_number: Some(3),
+            expression_text: None,
+            param_name: None,
+            result: Some(ResultShape::Member(["data".into()])),
+        };
+        let wire = serde_json::to_string(&anchor).unwrap();
+        assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");
+        let back: ResultShape = serde_json::from_str(r#"{"parse":"json"}"#).unwrap();
+        assert_eq!(back, ResultShape::Parse("json".into()));
     }
 }

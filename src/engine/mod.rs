@@ -51,6 +51,7 @@ mod route_boundaries;
 pub(crate) mod served_paths;
 pub mod service_workers;
 pub mod setup_ahead;
+mod siblings;
 pub(crate) mod type_compat_v2;
 pub(crate) mod upload_boundary;
 mod walk_lane;
@@ -954,7 +955,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         let (analyzer, type_check) =
             build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
         let results = analyzer.get_results();
-        crate::local_mode::LocalJoin::from_results(&results, type_check).write(&out_path)?;
+        crate::local_mode::LocalJoin::from_results(&results, type_check, &analyzer.call_bases())
+            .write(&out_path)?;
         logging::finish_spinner(
             &sp,
             &format!(
@@ -1110,8 +1112,19 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // The loop starts once every walk has ended: no walk process is alive
     // beside an analysis sidecar.
     let walks = lane.await;
+    // The services the run carries that an analysed one calls into are
+    // walked in a lane round of their own, so a scan of a change to the
+    // consumer alone reads the same chains as a full scan (carrick#2618).
+    let mut sibling_registry =
+        siblings::SiblingRegistry::new(repo_path, &services, scan_index.clone());
+    if walking {
+        sibling_registry
+            .walk_carried(&walks, recipe.clone(), width.count)
+            .await;
+    }
     let scan = std::sync::Arc::new(ServiceScan {
         repo_path: repo_path.to_string(),
+        siblings: sibling_registry,
         services: analysed.into(),
         sidecar: recipe,
         run_intents,
@@ -2286,6 +2299,9 @@ struct ServiceScan {
     /// (carrick#2413): read by its analysis and by the owed-work retry, and
     /// kept until the run ends.
     walks: Option<Vec<walk_lane::Walked>>,
+    /// The other services of the run, read for the walks that enter them
+    /// (carrick#2618).
+    siblings: siblings::SiblingRegistry,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -2536,6 +2552,13 @@ impl ServiceScan {
                 &self.run_intents,
                 &self.graphql_schemas,
                 positions,
+                self.siblings
+                    .declared(index)
+                    .map(|own| siblings::Neighbours {
+                        registry: &self.siblings,
+                        own,
+                        walks: self.walks.as_deref(),
+                    }),
             )))
             .await;
         let analysis = analysis?;
@@ -3663,6 +3686,7 @@ async fn analyze_current_repo_incremental(
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
     positions: Option<crate::position_rows::PositionIndex>,
+    neighbours: Option<siblings::Neighbours<'_>>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -3687,7 +3711,15 @@ async fn analyze_current_repo_incremental(
         positions,
         crate::request_summary::ROWS_JOIN_BUDGET,
         crate::request_summary::discovery::receiver_trace_enabled(),
+        Read::Own,
     )?;
+    // The services this one's calls are declared in, read for the walks that
+    // enter them (carrick#2618), only where the store is asked
+    // (`LibraryAsk::start`).
+    let siblings = neighbours
+        .filter(|_| sidecar.is_some() && !crate::local_mode::no_model())
+        .map(|neighbours| neighbours.reached(&request_inputs))
+        .unwrap_or_default();
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode. The cache version is the whole
@@ -3947,8 +3979,10 @@ async fn analyze_current_repo_incremental(
             // asked (carrick#1564).
             let declared_dependencies = packages.declared_dependency_names();
             let semantics_root = service_scan_root(repo_path, config);
+            let sibling_inputs = siblings.inputs();
             let library_ask = LibraryAsk::start(
                 &request_inputs,
+                &siblings,
                 sidecar,
                 &semantics_root,
                 Path::new(repo_path),
@@ -3971,7 +4005,6 @@ async fn analyze_current_repo_incremental(
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
-                    &service_modules,
                 ),
                 compose_summaries(
                     &request_inputs,
@@ -3985,6 +4018,7 @@ async fn analyze_current_repo_incremental(
                     library_ask.as_ref(),
                     first_answer,
                     &request_inputs,
+                    &sibling_inputs,
                     Path::new(repo_path),
                     fact_sender,
                 ),
@@ -4073,6 +4107,7 @@ async fn analyze_current_repo_incremental(
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
+                    siblings: &sibling_inputs,
                 },
             )
             .await;
@@ -4086,6 +4121,7 @@ async fn analyze_current_repo_incremental(
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     prior: first_discovery.as_ref(),
                     declarations: declarations.as_ref(),
+                    siblings: &sibling_inputs,
                 },
             );
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -4357,11 +4393,6 @@ async fn analyze_current_repo_incremental(
                 &request_inputs,
                 repo_path,
                 &cloud_data.function_definitions,
-                &|file, function| {
-                    analysis
-                        .passes_body
-                        .contains(&(file.to_path_buf(), function.to_string()))
-                },
             );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
@@ -4417,6 +4448,7 @@ async fn analyze_current_repo_incremental(
         workspace,
         run_intents,
         graphql_schemas,
+        &siblings,
     )
     .await?;
 
@@ -4825,6 +4857,7 @@ impl LibraryAsk {
     /// registry package has nothing to ask about.
     fn start(
         inputs: &crate::request_summary::RequestSummaryInputs,
+        siblings: &siblings::Siblings,
         sidecar: Option<&TypeSidecar>,
         service_root: &Path,
         repo_root: &Path,
@@ -4833,18 +4866,21 @@ impl LibraryAsk {
         if crate::local_mode::no_model() || sidecar.is_none() {
             return None;
         }
-        Self::of(
+        let site_questions = crate::site_questions::enabled();
+        Self::of_with(
             inputs,
+            siblings,
             service_root,
             repo_root,
             turns,
-            crate::site_questions::enabled(),
+            site_questions,
         )
     }
 
     /// What the service asks: the roles [`crate::library_store::roles_for`]
     /// `site_questions` (carrick#2436), for the public registry packages its
     /// library calls go through.
+    #[cfg(test)]
     fn of(
         inputs: &crate::request_summary::RequestSummaryInputs,
         service_root: &Path,
@@ -4852,7 +4888,58 @@ impl LibraryAsk {
         turns: setup_ahead::AskTurns,
         site_questions: bool,
     ) -> Option<Self> {
+        Self::of_with(
+            inputs,
+            &siblings::Siblings::default(),
+            service_root,
+            repo_root,
+            turns,
+            site_questions,
+        )
+    }
+
+    /// [`Self::of`], also asking what each of the `siblings` the service's
+    /// walk may enter asks (carrick#2618): a service that never calls
+    /// `fetch` itself matches nothing in a sibling's request helper without
+    /// the sibling's labels. The service's own entries come first, and its
+    /// library sites are the only ones that become rows.
+    fn of_with(
+        inputs: &crate::request_summary::RequestSummaryInputs,
+        siblings: &siblings::Siblings,
+        service_root: &Path,
+        repo_root: &Path,
+        turns: setup_ahead::AskTurns,
+        site_questions: bool,
+    ) -> Option<Self> {
         let sites = crate::request_summary::library_sites(inputs);
+        let own = Self::asked_by(inputs, &sites, service_root, repo_root, site_questions);
+        let (asked, dropped) = crate::library_store::Asked::merged(
+            own,
+            siblings
+                .iter()
+                .filter_map(|sibling| sibling.asked(repo_root, site_questions)),
+        );
+        if dropped > 0 {
+            debug!(
+                "Library store ask: {dropped} package(s) of the services this one walks into were left out at the cap"
+            );
+        }
+        Some(Self {
+            sites,
+            asked: asked?,
+            turns,
+        })
+    }
+
+    /// What the service whose read is `inputs` asks the library store, with
+    /// the roles `site_questions` asks for: `None` when it asks nothing.
+    fn asked_by(
+        inputs: &crate::request_summary::RequestSummaryInputs,
+        sites: &crate::request_summary::LibrarySites,
+        service_root: &Path,
+        repo_root: &Path,
+        site_questions: bool,
+    ) -> Option<crate::library_store::Asked> {
         let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
         let home = dirs::home_dir();
         let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
@@ -4886,13 +4973,8 @@ impl LibraryAsk {
                 &install,
             ));
         }
-        let asked = crate::library_store::Asked::with_default_library(asked, library)?
-            .with_roles(crate::library_store::roles_for(site_questions));
-        Some(Self {
-            sites,
-            asked,
-            turns,
-        })
+        crate::library_store::Asked::with_default_library(asked, library)
+            .map(|asked| asked.with_roles(crate::library_store::roles_for(site_questions)))
     }
 }
 
@@ -4961,6 +5043,7 @@ async fn fact_files_of(
     ask: Option<&LibraryAsk>,
     first: tokio::sync::oneshot::Receiver<crate::library_store::FirstAnswer>,
     inputs: &crate::request_summary::RequestSummaryInputs,
+    siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
     sender: tokio::sync::oneshot::Sender<Option<crate::request_summary::fact_files::FactFiles>>,
 ) -> Option<FirstDiscovery> {
@@ -4974,7 +5057,7 @@ async fn fact_files_of(
         let _ = sender.send(None);
         return None;
     };
-    let (facts, first) = first_discovery(&ask.sites, answer, inputs, root);
+    let (facts, first) = first_discovery(&ask.sites, answer, inputs, siblings, root);
     let _ = sender.send(Some(facts));
     Some(first)
 }
@@ -4985,6 +5068,7 @@ fn first_discovery(
     library: &crate::request_summary::LibrarySites,
     answer: crate::library_store::FirstAnswer,
     inputs: &crate::request_summary::RequestSummaryInputs,
+    siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
 ) -> (
     crate::request_summary::fact_files::FactFiles,
@@ -4995,9 +5079,11 @@ fn first_discovery(
     // with nothing to label.
     let labels =
         crate::request_summary::discovery::Labels::of_answered(&answer.exports, &answer.answered);
-    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
-    let decided = crate::request_summary::decided_sites::decided_sites(
+    let discovery =
+        crate::request_summary::discovery::discover_with(inputs, siblings, &labels, root);
+    let decided = crate::request_summary::decided_sites::decided_sites_with(
         inputs,
+        siblings,
         root,
         &discovered_sites(&discovery),
         &crate::request_summary::decided_sites::SiteLabel::from_exports(&answer.exports),
@@ -5009,6 +5095,13 @@ fn first_discovery(
         &answer,
         root,
     );
+    // A walk into a sibling ends in a file this service does not read: it
+    // selects none of its own and lists no span there (carrick#2618).
+    let facts = if siblings.is_empty() {
+        facts
+    } else {
+        facts.within(|file| inputs.files.contains_key(&root.join(file)))
+    };
     (
         facts,
         FirstDiscovery {
@@ -5194,6 +5287,9 @@ struct SiteContext<'a> {
     /// declarations verified op claims resolve to ([`member_declarations`]).
     /// `None` leaves discovery as it was.
     declarations: Option<&'a crate::request_summary::discovery::MemberDeclarations>,
+    /// The other services of the run the service's walk may enter
+    /// (carrick#2618); none when it calls into no other.
+    siblings: &'a [&'a crate::request_summary::RequestSummaryInputs],
 }
 
 /// Discovery run on the library store's first answer, before the file reader
@@ -5305,7 +5401,12 @@ fn site_records_of(
                 }
                 None => crate::request_summary::discovery::Labels::of(claims),
             };
-            walked = crate::request_summary::discovery::discover(inputs, &labels, root);
+            walked = crate::request_summary::discovery::discover_with(
+                inputs,
+                context.siblings,
+                &labels,
+                root,
+            );
             &walked
         }
     };
@@ -5334,8 +5435,9 @@ fn site_records_of(
     // (carrick#2474 R2a) and the full path it is served at under the scope
     // members the trace's own request verified (R2b): read by nothing.
     let mut decided = match context.declarations {
-        Some(declarations) => crate::request_summary::decided_sites::decided_sites_traced(
+        Some(declarations) => crate::request_summary::decided_sites::decided_sites_traced_with(
             inputs,
+            context.siblings,
             root,
             &discovered,
             &labels,
@@ -5349,9 +5451,13 @@ fn site_records_of(
                 &declarations.verified_scopes,
             ),
         ),
-        None => {
-            crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels)
-        }
+        None => crate::request_summary::decided_sites::decided_sites_with(
+            inputs,
+            context.siblings,
+            root,
+            &discovered,
+            &labels,
+        ),
     };
     let yielded = context
         .placements
@@ -6280,7 +6386,7 @@ fn append_deterministic_protocol_operations(
             stated = site.stated.len(),
             withdrawn = site.withdrawn.len(),
             through = extractions.site.through.len(),
-            through_folded = site.through_folded,
+            through_folded = site.through_folded.len(),
             "site questions: fold"
         );
     }
@@ -7522,6 +7628,7 @@ fn site_infer_requests(
         };
         InferRequestItem {
             member: None,
+            result: None,
             file_path: path.to_string_lossy().into_owned(),
             line_number: anchor.line,
             span_start: Some(position(anchor.span_start)),
@@ -8887,7 +8994,17 @@ fn discover_files_and_symbols(
         None,
         crate::request_summary::ROWS_JOIN_BUDGET,
         false,
+        Read::Own,
     )
+}
+
+/// Whose discovery a read is (carrick#2618): a service's own, which reports
+/// what it finds and enters the scan's stages, or a sibling's, read quietly
+/// for the facts another service's walk needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Own,
+    Sibling,
 }
 
 /// Discover the service's files and symbols, binding each file's compiler
@@ -8903,25 +9020,41 @@ fn discover_with_positions(
     mut positions: Option<crate::position_rows::PositionIndex>,
     rows_budget: std::time::Duration,
     receiver_trace: bool,
+    read: Read,
 ) -> FileDiscoveryResult {
-    crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
-    let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
+    let own = read == Read::Own;
+    if own {
+        crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
+    }
+    // A sibling's read is the same walk for the same facts, and says nothing:
+    // its own scan reports what is wrong with its files (carrick#2618).
+    let handler = if own {
+        Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()))
+    } else {
+        Handler::with_emitter_writer(Box::new(std::io::sink()), None)
+    };
     let repo_name = get_repository_name(repo_path);
 
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
     let walk_started = Instant::now();
-    let walk = walk_service(repo_path, service, &ignore_patterns);
+    let walk = if own {
+        walk_service(repo_path, service, &ignore_patterns)
+    } else {
+        crate::file_finder::walk_service_quietly(repo_path, service, &ignore_patterns)
+    };
     let files = walk.files;
     // Timed separately from the parse that follows: the walk and the parse
     // scale with different things, and a scan that spends minutes in the walk
     // is a walk reaching somewhere it should not (carrick#751).
-    info!(
-        "Discovered {} file(s) under {} in {:.1}s",
-        files.len(),
-        service.directory.as_deref().unwrap_or("the repo root"),
-        walk_started.elapsed().as_secs_f64()
-    );
+    if own {
+        info!(
+            "Discovered {} file(s) under {} in {:.1}s",
+            files.len(),
+            service.directory.as_deref().unwrap_or("the repo root"),
+            walk_started.elapsed().as_secs_f64()
+        );
+    }
     let left_out: Vec<LeftOut> = [
         folders_left_out(repo_path, &walk.checkouts_left_out, CHECKOUTS),
         folders_left_out(repo_path, &walk.dot_folders_left_out, UNTRACKED_DOT_FOLDERS),
@@ -8962,11 +9095,13 @@ fn discover_with_positions(
             "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
         ))));
     }
-    for left_out in &left_out {
-        info!("{}", left_out_line(left_out));
-    }
-    if walk.excluded.patterns > 0 {
-        info!("{}", excluded_line(walk.excluded));
+    if own {
+        for left_out in &left_out {
+            info!("{}", left_out_line(left_out));
+        }
+        if walk.excluded.patterns > 0 {
+            info!("{}", excluded_line(walk.excluded));
+        }
     }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
@@ -9116,7 +9251,9 @@ fn discover_with_positions(
         repo_root,
         &bindings_wanted,
     );
-    report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
+    if own {
+        report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
+    }
     // The files only tests import: the receiver trace ignores the router
     // mounts made in them (carrick#2775). Read for the trace alone.
     let test_only = if receiver_trace {
@@ -9247,6 +9384,7 @@ pub(crate) fn discover_service_inputs_within(
         positions,
         budget,
         true,
+        Read::Own,
     )
     .expect("discovery reads the service")
     .request_inputs
@@ -10899,6 +11037,7 @@ async fn analyze_current_repo(
     workspace: &crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
+    siblings: &siblings::Siblings,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     debug!("Running multi-agent analysis on: {}", repo_path);
 
@@ -10997,8 +11136,10 @@ async fn analyze_current_repo(
     // settled; the analysis reads them only once the model has been asked
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
+    let sibling_inputs = siblings.inputs();
     let library_ask = LibraryAsk::start(
         &request_inputs,
+        siblings,
         sidecar,
         &service_root,
         Path::new(repo_path),
@@ -11016,7 +11157,6 @@ async fn analyze_current_repo(
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
-            &service_modules,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
             crate::agents::file_orchestrator::FactFileSource::later(fact_files),
         ),
@@ -11032,6 +11172,7 @@ async fn analyze_current_repo(
             library_ask.as_ref(),
             first_answer,
             &request_inputs,
+            &sibling_inputs,
             Path::new(repo_path),
             fact_sender,
         ),
@@ -11104,6 +11245,7 @@ async fn analyze_current_repo(
             library: library_ask.as_ref().map(|ask| &ask.sites),
             prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
+            siblings: &sibling_inputs,
         },
     )
     .await;
@@ -11117,6 +11259,7 @@ async fn analyze_current_repo(
             library: library_ask.as_ref().map(|ask| &ask.sites),
             prior: first_discovery.as_ref(),
             declarations: declarations.as_ref(),
+            siblings: &sibling_inputs,
         },
     );
     let withdrawn = withdraw_model_routes_at_definitions(
@@ -11368,11 +11511,6 @@ async fn analyze_current_repo(
         &request_inputs,
         repo_path,
         &cloud_data.function_definitions,
-        &|file, function| {
-            analysis_result
-                .passes_body
-                .contains(&(file.to_path_buf(), function.to_string()))
-        },
     );
     Ok(ServiceAnalysis {
         data: cloud_data,
@@ -20347,6 +20485,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         });
@@ -20418,6 +20557,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         });
@@ -20457,6 +20597,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         }
@@ -22836,6 +22977,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     param: 0,
                     param_name: Some("message".to_string()),
                 }),
+                key: None,
             },
             lead: crate::possible_calls::PossibleCall {
                 file_path: file.to_string(),
@@ -23435,7 +23577,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         .await;
         let first = first.await.expect("the first answer is sent");
         assert_eq!(first.exports, settled.exports, "the settle added nothing");
-        let (facts, prior) = super::first_discovery(&ask.sites, first, &on.inputs, &on.repo);
+        let (facts, prior) = super::first_discovery(&ask.sites, first, &on.inputs, &[], &on.repo);
         let why = facts
             .files
             .get(LIB_FETCH_FILE)
@@ -23858,7 +24000,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             leads: Vec::new(),
             route_kept_reader: 0,
             lead_on_row_line: 0,
-            through_folded: 0,
+            through_folded: Vec::new(),
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
@@ -25139,6 +25281,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let items: Vec<InferRequestItem> = (1..=ITEMS as u32)
             .map(|line| InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: line,
                 span_start: None,

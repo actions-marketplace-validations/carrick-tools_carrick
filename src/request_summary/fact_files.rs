@@ -89,6 +89,12 @@ pub struct FactFiles {
     /// them apart. The orchestrator keeps these calls out of the request
     /// members it joins to callers.
     pub server_framework_calls: BTreeMap<String, BTreeSet<u32>>,
+    /// The spans of the calls whose labelled export is a GraphQL client and
+    /// which carry no listed end, by file (carrick#2763). A hook that hands a document to a client executes
+    /// an operation; the HTTP reader is never asked about it, so a row the
+    /// reader states there is not a request the call makes. The site selects
+    /// its file and lists nothing.
+    pub graphql_client_calls: BTreeMap<String, BTreeSet<(u32, u32)>>,
     /// Packages the first answer left without exports.
     pub unanswered_packages: usize,
     /// The ask got no answer at all.
@@ -126,6 +132,13 @@ impl FactFiles {
             };
             facts.record(&site.file, (site.span_start, site.span_end), followed);
             if let Some(end) = &site.end {
+                if end.role == LibraryRole::GraphqlClient {
+                    facts
+                        .graphql_client_calls
+                        .entry(site.file.clone())
+                        .or_default()
+                        .insert((site.span_start, site.span_end));
+                }
                 let listed = listed_role(end.role);
                 facts.select(&site.file, (site.span_start, site.span_end), listed);
                 facts.select(&end.file, (end.span_start, end.span_end), listed);
@@ -185,7 +198,28 @@ impl FactFiles {
                 facts.files.entry(file).or_default().unanswered_package = true;
             }
         }
+        // A call can carry several ends, one site each at the same span. When
+        // any of them is listed for the reader (an HTTP client or a server
+        // framework), the call makes a real request as well, and the reader's
+        // row there is not the GraphQL operation's.
+        let listed = &facts.listed;
+        facts.graphql_client_calls.retain(|file, spans| {
+            spans.retain(|span| !listed.get(file).is_some_and(|l| l.contains(span)));
+            !spans.is_empty()
+        });
         facts
+    }
+
+    /// These fact files, less every file `owns` refuses (carrick#2618): a
+    /// walk that enters a sibling service's code ends in a file this service
+    /// does not read, and selects no file of its own and lists no span there.
+    /// The sibling's own scan states its own.
+    pub fn within(mut self, owns: impl Fn(&str) -> bool) -> Self {
+        self.files.retain(|file, _| owns(file));
+        self.listed.retain(|file, _| owns(file));
+        self.calls.retain(|(file, _, _), _| owns(file));
+        self.server_framework_calls.retain(|file, _| owns(file));
+        self
     }
 
     /// Record what discovery found at one call. A site wins over anything
@@ -230,6 +264,16 @@ impl FactFiles {
         self.server_framework_calls
             .iter()
             .any(|(file, lines)| module.ends_with(Path::new(file)) && lines.contains(&line))
+    }
+
+    /// Whether the call at `span` in `module` reaches an export the store
+    /// labels a GraphQL client (carrick#2763). `module` is compared
+    /// component-wise by its tail, so a canonical path still matches the
+    /// repo-relative key.
+    pub fn graphql_client_call(&self, module: &Path, span: (u32, u32)) -> bool {
+        self.graphql_client_calls
+            .iter()
+            .any(|(file, spans)| module.ends_with(Path::new(file)) && spans.contains(&span))
     }
 
     /// What discovery recorded at the call at `span` in `file`, or `None`
@@ -284,6 +328,45 @@ mod tests {
         }
     }
 
+    /// A call with a GraphQL-client end and an HTTP-client end at the same
+    /// span makes a real request too: it is no GraphQL-client call, so the
+    /// reader's row there is kept. A call with only the GraphQL end stays.
+    #[test]
+    fn a_call_with_a_listed_end_is_no_graphql_client_call() {
+        let discovery = Discovery {
+            sites: vec![
+                site(
+                    "a.ts",
+                    (1, 4),
+                    Some(end("b.ts", LibraryRole::GraphqlClient)),
+                    None,
+                ),
+                site(
+                    "a.ts",
+                    (1, 4),
+                    Some(end("c.ts", LibraryRole::HttpClient)),
+                    None,
+                ),
+                site(
+                    "a.ts",
+                    (6, 9),
+                    Some(end("b.ts", LibraryRole::GraphqlClient)),
+                    None,
+                ),
+            ],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        );
+        assert!(!facts.graphql_client_call(Path::new("/repo/a.ts"), (1, 4)));
+        assert!(facts.graphql_client_call(Path::new("/repo/a.ts"), (6, 9)));
+    }
+
     /// A site puts its own file and its labelled call's file in the set; a
     /// stopped walk records the call as stopped and selects nothing; a call
     /// one walk reached and another stopped is a site.
@@ -325,6 +408,35 @@ mod tests {
         assert_eq!(facts.listed_in("b.ts"), BTreeSet::from([(5, 9)]));
         assert!(facts.listed_in("d.ts").is_empty());
         assert!(facts.listed_in("e.ts").is_empty());
+    }
+
+    /// carrick#2618: a walk that enters a sibling service's code ends in a
+    /// file this service does not read. That file selects nothing and lists
+    /// no span, while the service's own call that enters it stays a site.
+    #[test]
+    fn a_file_outside_the_service_selects_nothing() {
+        let discovery = Discovery {
+            sites: vec![site(
+                "a.ts",
+                (1, 4),
+                Some(end("packages/b.ts", LibraryRole::HttpClient)),
+                None,
+            )],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        )
+        .within(|file| !file.starts_with("packages/"));
+        let files: Vec<&str> = facts.files.keys().map(String::as_str).collect();
+        assert_eq!(files, ["a.ts"]);
+        assert_eq!(facts.listed_in("a.ts"), BTreeSet::from([(1, 4)]));
+        assert!(facts.listed_in("packages/b.ts").is_empty());
+        assert_eq!(facts.followed("a.ts", (1, 4)), Some(&Followed::Site));
     }
 
     /// carrick#2725: a route registered on a framework instance handed in as

@@ -631,19 +631,31 @@ fn a_re_check_names_the_functions_the_index_does_not_hold() {
         "and says what they are new since:\n{text}"
     );
 
-    // Nothing is claimed when no re-check ran: a degraded answer extracted
-    // nothing, so it cannot say whether a function is new.
+    // A re-scan that misses its budget still names what the edit added
+    // (carrick#2849): the names come from a parse of the file, which does not
+    // wait on the re-scan. On a large monorepo the re-scan never fits the
+    // budget, and the reuse nudge would otherwise never hear of a function.
     let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
         root,
         &["check", route, "--workspace", ".", "--recheck", "--json"],
         &[("CARRICK_RECHECK_BUDGET_MS", "1")],
     ))
     .expect("check --recheck --json was not JSON");
-    assert_eq!(degraded["recheck"]["ran"], serde_json::json!("none"));
     assert_eq!(
-        degraded["recheck"]["new_functions"],
-        serde_json::Value::Null,
-        "a re-check that did not run names nothing:\n{degraded:#}"
+        degraded["recheck"]["ran"],
+        serde_json::json!("none"),
+        "the verdicts are the indexed ones:\n{degraded:#}"
+    );
+    let named_degraded: Vec<&str> = degraded["recheck"]["new_functions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a missed budget dropped the new functions:\n{degraded:#}"))
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        named_degraded,
+        ["widgetLabel", "countActive"],
+        "the same names as a re-check that finished:\n{degraded:#}"
     );
 }
 
@@ -691,6 +703,13 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
         "the indexed verdict stands:\n{degraded:#}"
     );
     assert_eq!(degraded["stale"], serde_json::json!(true));
+    // The edit changed a type and added no function, so a degraded answer
+    // names none either (carrick#2849).
+    assert_eq!(
+        degraded["recheck"]["new_functions"],
+        serde_json::Value::Null,
+        "an edit that added no function names none:\n{degraded:#}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "a missed budget answers at once, not eventually: {:?}",
@@ -701,6 +720,163 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
         before,
         "a re-check leaves no temporary generation behind, including one it killed"
     );
+}
+
+/// A re-check that missed its budget is not started again against the same
+/// index: the next one answers at once with the parse and the indexed
+/// verdicts, and says why. A new index tries again. On a large monorepo the
+/// re-scan never fits, so without this every edit waits out the whole budget
+/// for no verdict.
+#[test]
+#[serial]
+fn a_re_check_that_missed_its_budget_is_not_started_again_until_the_index_moves() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+    let ample = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+    let ask = |env: &[(&str, &str)]| -> serde_json::Value {
+        serde_json::from_str(&run_with_env(
+            root,
+            &["check", route, "--workspace", ".", "--recheck", "--json"],
+            env,
+        ))
+        .expect("check --recheck --json was not JSON")
+    };
+    let named = |answer: &serde_json::Value| -> Vec<String> {
+        answer["recheck"]["new_functions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no new_functions in:\n{answer:#}"))
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("a name").to_string())
+            .collect()
+    };
+
+    index(root);
+    let existing = std::fs::read_to_string(&route_file).expect("read the route file");
+    std::fs::write(
+        &route_file,
+        format!(
+            "{existing}\nexport function widgetLabel(name: string): string {{\n  return name;\n}}\n"
+        ),
+    )
+    .expect("write the route file");
+
+    // The miss itself: an answer of indexed age, and nothing skipped yet.
+    let missed = ask(&[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    assert_eq!(
+        missed["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{missed:#}"
+    );
+    assert_eq!(
+        missed["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{missed:#}"
+    );
+
+    // Same index, ample budget: the re-scan would fit now, and is still not
+    // started, because this repo already missed against this index.
+    let skipped = ask(&ample);
+    assert_eq!(
+        skipped["recheck"]["ran"],
+        serde_json::json!("none"),
+        "a known miss starts no re-scan:\n{skipped:#}"
+    );
+    assert_eq!(
+        skipped["recheck"]["known_miss"],
+        serde_json::json!(true),
+        "{skipped:#}"
+    );
+    assert!(
+        skipped["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("check --changed")),
+        "the reason names the fresh read:\n{skipped:#}"
+    );
+    assert_eq!(
+        named(&skipped),
+        ["widgetLabel"],
+        "the parse still answers:\n{skipped:#}"
+    );
+    assert_eq!(
+        skipped["items"][0]["verdict"]["state"],
+        serde_json::json!("resolved"),
+        "with the indexed verdicts:\n{skipped:#}"
+    );
+
+    // A new index is a new generation: the re-check is tried again, and fits.
+    std::thread::sleep(Duration::from_millis(1100));
+    index(root);
+    let existing = std::fs::read_to_string(&route_file).expect("read the route file");
+    std::fs::write(
+        &route_file,
+        format!("{existing}\nexport function widgetCount(names: string[]): number {{\n  return names.length;\n}}\n"),
+    )
+    .expect("write the route file");
+    let fresh = ask(&ample);
+    assert_ne!(
+        fresh["recheck"]["ran"],
+        serde_json::json!("none"),
+        "a new index re-checks again:\n{fresh:#}"
+    );
+    assert_eq!(
+        fresh["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{fresh:#}"
+    );
+    assert_eq!(named(&fresh), ["widgetCount"], "{fresh:#}");
+}
+
+/// `check --each` answers several files in one process, each exactly as the
+/// single-file `check` would, as one JSON array in the order named. The
+/// post-edit hook asks it for a patch that touches several files.
+#[test]
+#[serial]
+fn check_each_answers_every_file_in_one_call() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let client = "inventory-svc/src/client.ts";
+
+    index(root);
+    let text = run(
+        root,
+        &[
+            "check",
+            "--each",
+            route,
+            client,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    let answers: Vec<serde_json::Value> =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not a JSON array: {e}\n{text}"));
+    assert_eq!(answers.len(), 2, "{text}");
+    for (answer, file) in answers.iter().zip([route, client]) {
+        let single: serde_json::Value = serde_json::from_str(&run(
+            root,
+            &["check", file, "--workspace", ".", "--recheck", "--json"],
+        ))
+        .expect("check --json was not JSON");
+        assert_eq!(
+            answer["schema"],
+            serde_json::json!("carrick.check/0"),
+            "{answer:#}"
+        );
+        assert_eq!(answer["file"], single["file"], "{answer:#}");
+        assert_eq!(
+            answer["items"], single["items"],
+            "the same rows as `check <file>`:\n{answer:#}"
+        );
+        assert_eq!(
+            answer["recheck"]["ran"], single["recheck"]["ran"],
+            "{answer:#}"
+        );
+    }
 }
 
 /// Temporary generations a re-check has left in the system temp directory.
@@ -2413,5 +2589,599 @@ fn a_verdict_the_upload_missed_is_named_by_the_build_and_by_status() {
     assert_eq!(
         json["type_check"]["not_stored"][0]["consumer"], "basket-svc",
         "{json:#}"
+    );
+}
+
+/// `carrick check --changed`, with its exit code and its stdout. The budget is
+/// generous for the same reason the re-check tests' is: this binary is built
+/// without optimisation on a shared runner.
+fn check_changed(workspace: &Path, json: bool) -> (Option<i32>, String) {
+    let mut args = vec!["check", "--changed", "--workspace", "."];
+    if json {
+        args.push("--json");
+    }
+    let output = Command::new(carrick())
+        .args(&args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+/// The same with `--all`: the problems that do not fail the run are listed
+/// too, each with why.
+fn check_changed_all(workspace: &Path) -> (Option<i32>, String) {
+    let output = Command::new(carrick())
+        .args(["check", "--changed", "--all", "--workspace", "."])
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick check --changed --all: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+/// `carrick check <file>...`, with its exit code and its stdout.
+fn check_files(workspace: &Path, files: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(carrick())
+        .arg("check")
+        .args(files)
+        .args(["--workspace", "."])
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick check {files:?}: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+fn commit_all(repo: &Path, message: &str) {
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=fixture@carrick.test",
+            "-c",
+            "user.name=fixture",
+            "commit",
+            "-qm",
+            message,
+        ],
+    );
+}
+
+/// Where a test's new call sends its request: a bare path, which goes to the
+/// origin the client already holds, or a base set at run time.
+const RELATIVE: &str = "";
+const INJECTED: &str = "${this.baseUrl}";
+
+/// The consumer gains a member that calls a route no service serves, and a
+/// caller that makes it a member the repo uses.
+fn add_a_call_to_no_route(root: &Path, base: &str) {
+    let client = root.join("inventory-svc/src/client.ts");
+    edit(
+        &client,
+        "  readWidget(widgetId: string)",
+        &format!(
+            "  readGadget(gadgetId: string): Promise<Widget> {{\n    return send<Widget>(`{base}/api/v1/gadgets/${{gadgetId}}`, {{\n      method: \"GET\",\n    }});\n  }}\n\n  readWidget(widgetId: string)"
+        ),
+    );
+    let caller = root.join("inventory-svc/src/inventory.ts");
+    let mut text = std::fs::read_to_string(&caller).expect("read the caller");
+    text.push_str(
+        "\nexport async function gadgetName(\n  gadgetId: string,\n  client: CatalogClient\n): Promise<string> {\n  const gadget = await client.readGadget(gadgetId);\n  return gadget.name;\n}\n",
+    );
+    std::fs::write(&caller, text).expect("write the caller");
+}
+
+/// A handler committed on a branch stops sending a field the consumer reads.
+/// The consumer is untouched, so only a pass that re-extracts the producer and
+/// re-judges it against the index can see it, and it is a fact on both sides.
+#[test]
+#[serial]
+fn check_changed_fails_when_a_changed_handler_drops_a_field_a_consumer_reads() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let producer = root.join("catalog-web");
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    git(&producer, &["checkout", "-qb", "feature"]);
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    commit_all(&producer, "drop activeCount");
+
+    let (code, text) = check_changed(root, false);
+    let summary = text.lines().next().unwrap_or_default();
+    assert!(
+        summary.starts_with("carrick check: checked 1 route and 0 calls in 1 changed file"),
+        "one summary line, about the one file the branch changed:\n{text}"
+    );
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("catalog-web/app/routes/api.v1.widgets.$widgetId.ts:")
+                && line.contains("  incompatible  ")
+        })
+        .unwrap_or_else(|| panic!("the route is named at its line:\n{text}"));
+    assert!(
+        problem.contains("with inventory-svc src/client.ts:") && problem.contains("activeCount"),
+        "with the other side and the reason:\n{text}"
+    );
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(json["schema"], "carrick.check-changed/0");
+    assert_eq!(json["files"], 1, "{json:#}");
+    assert_eq!(json["problems"][0]["kind"], "incompatible", "{json:#}");
+    assert_eq!(json["problems"][0]["fails"], true, "{json:#}");
+}
+
+/// A new call, uncommitted, to a route no service in the workspace serves.
+/// Its path is bare, so it goes to the origin the client already talks to.
+#[test]
+#[serial]
+fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the new call is named at its line:\n{text}"));
+    assert!(
+        problem.contains("GET /api/v1/gadgets/:gadgetId"),
+        "with the operation it calls:\n{text}"
+    );
+    assert!(
+        !text.contains("api.v1.widgets"),
+        "the untouched producer is not reported:\n{text}"
+    );
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+}
+
+/// The same new call through a base set at run time: it could be a service
+/// of this workspace or an outside API, so it is printed as unconfirmed and
+/// does not fail the run.
+#[test]
+#[serial]
+fn check_changed_prints_a_new_call_through_a_runtime_base_as_unconfirmed() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, INJECTED);
+
+    // The member and its caller: two call sites through the runtime base.
+    let (code, quiet) = check_changed(root, false);
+    assert!(
+        quiet.contains(": 0 incompatible, 0 reach no route, plus 2 unconfirmed, run with --all"),
+        "counted, not listed:\n{quiet}"
+    );
+    assert_eq!(code, Some(0), "{quiet}");
+    let (code, text) = check_changed_all(root);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the new call is still printed:\n{text}"));
+    assert!(
+        problem.contains("[unconfirmed: the base is set at run time, does not fail]"),
+        "as unconfirmed:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// A call the index already held with no route, in a file the work touched,
+/// is printed and was there before the work: it does not fail the run.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    add_a_call_to_no_route(root, RELATIVE);
+    let consumer = root.join("inventory-svc");
+    commit_all(&consumer, "a call to no route, on main");
+    index(root);
+    git(&consumer, &["checkout", "-qb", "feature"]);
+    edit(
+        &consumer.join("src/client.ts"),
+        "import { send }",
+        "// The catalog's client.\nimport { send }",
+    );
+
+    let (code, quiet) = check_changed(root, false);
+    assert!(
+        quiet.contains("plus 1 unconfirmed, run with --all to list them"),
+        "counted, not listed:\n{quiet}"
+    );
+    assert_eq!(code, Some(0), "{quiet}");
+    let (code, text) = check_changed_all(root);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the old call is printed:\n{text}"));
+    assert!(
+        problem.contains("[already in the index, does not fail]"),
+        "as one the index held:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// A problem that was already on main, in a file the work did not touch, is
+/// not this work's: only the changed file is reported and counted.
+#[test]
+#[serial]
+fn check_changed_does_not_re_check_a_file_the_work_did_not_touch() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    // The unmatched call is committed on main before the index is built.
+    add_a_call_to_no_route(root, RELATIVE);
+    commit_all(&root.join("inventory-svc"), "a call to no route, on main");
+    index(root);
+
+    let producer = root.join("catalog-web");
+    git(&producer, &["checkout", "-qb", "feature"]);
+    edit(
+        &producer.join("app/routes/api.v1.health.ts"),
+        "// A second route",
+        "// Health.\n// A second route",
+    );
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.starts_with("carrick check: checked 1 route and 0 calls in 1 changed file"),
+        "only the changed file is counted:\n{text}"
+    );
+    assert!(
+        text.contains(": 0 incompatible, 0 reach no route"),
+        "and nothing outside it is reported:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// The one exception: a call in an untouched file that the index matched, and
+/// that the work left with no route by deleting the route it called.
+#[test]
+#[serial]
+fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    std::fs::remove_file(root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts"))
+        .expect("delete the route");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")
+                && line.contains("the index matched this call")),
+        "the consumer the deletion broke is named:\n{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// The two fixture repos as two services of one monorepo, committed and
+/// listed as the workspace's one repo.
+fn monorepo_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = repo_root().join("tests/fixtures/local-mode-workspace");
+    let mono = dir.path().join("mono");
+    for service in ["catalog-web", "inventory-svc"] {
+        copy_tree(&source.join(service), &mono.join(service));
+    }
+    std::fs::write(
+        mono.join("carrick.json"),
+        r#"{ "services": [
+  { "name": "catalog-web", "directory": "catalog-web" },
+  { "name": "inventory-svc", "directory": "inventory-svc" }
+] }
+"#,
+    )
+    .expect("write carrick.json");
+    git(&mono, &["init", "-q", "."]);
+    commit_all(&mono, "fixture");
+    std::fs::write(
+        dir.path().join("carrick-workspace.json"),
+        "{ \"repos\": [\"./mono\"] }\n",
+    )
+    .expect("write the workspace file");
+    dir
+}
+
+/// carrick#2826: only the services that own a changed file are re-extracted;
+/// every other service of the same repo stands in from the index, and is
+/// still judged against. Which service is carried is the change scope's
+/// decision, unit-tested in `change_scope` (a run that asks no model carries
+/// a service whose stored blob owes only model work); this proves the carried
+/// consumer still reaches the join and fails the run as a fact.
+#[test]
+#[serial]
+fn check_changed_re_extracts_only_the_services_that_own_a_changed_file() {
+    let workspace = monorepo_workspace();
+    let root = workspace.path();
+    index(root);
+    let route = root.join("mono/catalog-web/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert!(
+        json["problems"]
+            .as_array()
+            .is_some_and(|problems| problems.iter().any(|p| {
+                p["kind"] == "incompatible"
+                    && p["other"].as_array().is_some_and(|other| {
+                        other
+                            .iter()
+                            .any(|o| o == "inventory-svc inventory-svc/src/client.ts:14")
+                    })
+                    && p["fails"] == true
+            })),
+        "the carried consumer is still judged against, as a fact:\n{json:#}"
+    );
+    assert_eq!(code, Some(1), "{json:#}");
+}
+
+/// carrick#2827: several named files are one pass across repos, with the
+/// summary line and the exit code `--changed` gives. The handler edit is
+/// uncommitted and on no branch: the files are named, not found by git.
+#[test]
+#[serial]
+fn check_several_files_judges_them_in_one_pass_and_fails_on_a_fact() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let route = root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    commit_all(&root.join("catalog-web"), "drop activeCount");
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let (code, text) = check_files(
+        root,
+        &[
+            "catalog-web/app/routes/api.v1.widgets.$widgetId.ts",
+            "inventory-svc/src/client.ts",
+            "/not/in/the/workspace/x.ts",
+        ],
+    );
+    let summary = text.lines().next().unwrap_or_default();
+    assert!(
+        summary.starts_with("carrick check: checked 1 route and ")
+            && summary.contains("in 2 changed files"),
+        "one summary line for the two files found:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("  incompatible  route GET")),
+        "the handler's break is named:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")),
+        "and the consumer's new call:\n{text}"
+    );
+    assert!(
+        text.contains("not checked: /not/in/the/workspace/x.ts: not in a repo of this workspace"),
+        "a file outside the workspace is named, not fatal:\n{text}"
+    );
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+}
+
+/// Naming only files the index cannot check is not a pass: it exits 2, a code
+/// no verdict uses, and says which files and what fixes it (carrick#2850).
+#[test]
+#[serial]
+fn check_named_files_exits_two_when_none_was_covered() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let (code, text) = check_files(
+        root,
+        &["/not/in/the/workspace/x.ts", "/not/in/the/workspace/y.ts"],
+    );
+    assert!(
+        text.contains("not checked: covered none of the 2 files asked about"),
+        "{text}"
+    );
+    assert!(
+        text.contains("not checked: /not/in/the/workspace/x.ts: not in a repo of this workspace")
+            && text.contains("carrick refresh"),
+        "the file, the reason and the fix are named:\n{text}"
+    );
+    assert_eq!(code, Some(2), "nothing covered is not a pass:\n{text}");
+}
+
+/// Some files covered and some not: the covered ones decide the exit code and
+/// the skipped one is listed.
+#[test]
+#[serial]
+fn check_a_mix_of_covered_and_uncovered_files_exits_by_the_covered_ones() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let (code, text) = check_files(
+        root,
+        &[
+            "inventory-svc/src/inventory.ts",
+            "/not/in/the/workspace/x.ts",
+        ],
+    );
+    assert!(
+        text.contains("not checked: /not/in/the/workspace/x.ts"),
+        "the skipped file is listed:\n{text}"
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "one file was covered and holds no problem:\n{text}"
+    );
+}
+
+/// An index whose paths belong to another folder covers nothing of the files
+/// changed here. That is the pilot copy that read as a pass.
+#[test]
+#[serial]
+fn check_changed_exits_two_when_the_index_is_not_bound_to_this_folder() {
+    let original = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    index(original.path());
+    let copy = tempfile::tempdir().expect("temp dir");
+    copy_tree(original.path(), copy.path());
+    drop(original);
+    let root = copy.path();
+    // The folders carry other names than the ones the index was built under.
+    std::fs::rename(root.join("catalog-web"), root.join("web-copy")).expect("rename");
+    std::fs::rename(root.join("inventory-svc"), root.join("svc-copy")).expect("rename");
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        r#"{"repos": ["./web-copy", "./svc-copy"]}"#,
+    )
+    .expect("workspace file");
+    edit(
+        &root.join("svc-copy/src/inventory.ts"),
+        "export",
+        "// edited\nexport",
+    );
+    let (code, text) = check_changed(root, false);
+    assert!(text.contains("not checked"), "{text}");
+    assert_eq!(code, Some(2), "nothing was covered:\n{text}");
+}
+
+/// Naming only files that hold no problem exits 0.
+#[test]
+#[serial]
+fn check_several_files_exits_zero_when_none_is_a_problem() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let (code, text) = check_files(
+        root,
+        &[
+            "catalog-web/app/routes/api.v1.health.ts",
+            "inventory-svc/src/inventory.ts",
+        ],
+    );
+    assert!(
+        text.contains(": 0 incompatible, 0 reach no route"),
+        "{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+const COMMIT: [&str; 6] = [
+    "-c",
+    "user.email=fixture@carrick.test",
+    "-c",
+    "user.name=fixture",
+    "commit",
+    "-qm",
+];
+
+/// No base to diff against used to print an empty "not checked:" and exit 0.
+/// Unrelated history: the branch shares no commit with the main branch.
+#[test]
+#[serial]
+fn check_changed_with_no_merge_base_exits_two_and_names_the_fix() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    index(root);
+    let repo = root.join("catalog-web");
+    git(&repo, &["branch", "-M", "main"]);
+    git(&repo, &["checkout", "-q", "--orphan", "work"]);
+    git(&repo, &["add", "-A"]);
+    let mut args = COMMIT.to_vec();
+    args.push("unrelated");
+    git(&repo, &args);
+
+    let (code, text) = check_changed(root, false);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.contains("no merge base with main") && text.contains("run `git fetch origin main`"),
+        "{text}"
+    );
+    assert!(!text.contains("not checked: \n"), "no bare reason:\n{text}");
+}
+
+/// A shallow clone whose history stops short of the main branch is told to
+/// unshallow it.
+#[test]
+#[serial]
+fn check_changed_in_a_shallow_clone_says_to_unshallow() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    let source = root.join("origin-repo");
+    std::fs::rename(root.join("catalog-web"), &source).expect("move the repo");
+    git(&source, &["branch", "-M", "main"]);
+    git(&source, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(source.join("a.txt"), "a\n").expect("write");
+    git(&source, &["add", "-A"]);
+    let mut args = COMMIT.to_vec();
+    args.push("feature work");
+    git(&source, &args);
+    git(&source, &["checkout", "-q", "main"]);
+    std::fs::write(source.join("b.txt"), "b\n").expect("write");
+    git(&source, &["add", "-A"]);
+    let mut args = COMMIT.to_vec();
+    args.push("main moved");
+    git(&source, &args);
+
+    let url = format!("file://{}", source.display());
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--depth=1",
+            "--branch",
+            "feature",
+            &url,
+            "catalog-web",
+        ],
+    );
+    let clone = root.join("catalog-web");
+    git(
+        &clone,
+        &[
+            "fetch",
+            "-q",
+            "--depth=1",
+            "origin",
+            "main:refs/remotes/origin/main",
+        ],
+    );
+    git(&clone, &["remote", "set-head", "origin", "-d"]);
+    index(root);
+
+    let (code, text) = check_changed(root, false);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.contains("this clone is shallow") && text.contains("run `git fetch --unshallow`"),
+        "{text}"
     );
 }

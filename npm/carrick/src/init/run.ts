@@ -56,6 +56,7 @@ import { writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
+import { AGENTS_FILE, writeAgentsSection } from "./agents-section.ts";
 import { ignoredSkillRoots, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
 import { findCarrick, offerGlobalInstall } from "../global-install.ts";
@@ -267,8 +268,8 @@ function help(): string {
     "or a folder of repos: which repos this install covers, the project, the repo",
     "connection, the agent hooks, the MCP connection, and the service proposal",
     "your agent turns into carrick.json. It writes nothing into the repository but",
-    "the ignored .carrick directory, the hook settings, and the four task skills",
-    "your agent loads. No model runs and nothing is uploaded. Where Carrick already",
+    "the ignored .carrick directory, the hook settings, the four task skills",
+    "your agent loads, and a short \"Carrick check\" section in AGENTS.md. No model runs and nothing is uploaded. Where Carrick already",
     "holds an index for these repos, it reads that index into .carrick so this",
     "machine can answer from it. That read re-reads your source here first, which",
     "takes minutes on a large workspace. It skips the re-read when .carrick already",
@@ -391,9 +392,13 @@ export function summaryLine(project: string | null, repos: string[]): string {
  * preflight rule the scan refuses on), so this only says where each runs, as
  * a path from the workspace the agent is in (carrick#1489).
  */
-export function installCommands(plan: WorkspaceProposal): string[] {
+export function installCommands(plan: WorkspaceProposal, readFromHosted: string[] = []): string[] {
   const commands: string[] = [];
+  const hosted = new Set(readFromHosted.map(realPath));
   for (const repo of plan.repos) {
+    // Its types are the hosted scan's, captured with dependencies installed
+    // (carrick#2839).
+    if (hosted.has(realPath(repo.path))) continue;
     for (const row of repo.not_installed) {
       const where = path.join(path.relative(plan.workspace, repo.path), row.directory);
       const command = where === "." ? `\`${row.command}\`` : `\`${row.command}\` in ${where}`;
@@ -1547,7 +1552,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // know, and a hook file for a host nobody runs costs nothing.
   try {
     if (writeCodexHooks(workspace, command.command) === "written") {
-      todo.push("Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.");
+      todo.push("Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.");
     }
   } catch (error) {
     out.refuse(
@@ -1574,6 +1579,14 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     }
   } catch (error) {
     out.refuse(`Could not write the task skills: ${(error as Error).message}`);
+  }
+
+  // The check block in AGENTS.md (carrick#2828): only our marked section is
+  // written, and every other line of the file is left as it is.
+  try {
+    writeAgentsSection(workspace);
+  } catch (error) {
+    out.refuse(`Could not write the Carrick check section in ${AGENTS_FILE}: ${(error as Error).message}`);
   }
 
   // The same hooks and skills inside each repo of a folder, because an agent
@@ -1707,6 +1720,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // what leaves `.carrick/index.json` here, and the session-start hook reads a
   // later hosted index in only onto a machine that has one (carrick#2219).
   let downloaded = false;
+  let readFromHosted: string[] = [];
   if (hostedIndex.length > 0 || cloud !== null) {
     // The step reports its own outcome, so the read is one line in a terminal
     // as well as in a pipe: a spinner that stopped with its label spent a
@@ -1729,6 +1743,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       (outcome) => hostedReport(outcome, (Date.now() - startedAt) / 1000, cloud !== null ? "cloud" : "laptop"),
     );
     downloaded = read.kind === "downloaded";
+    if (read.kind === "downloaded") readFromHosted = read.readFromHosted;
   }
   for (const line of todo) out.warn(line);
   const installs = installCommands(plan);
@@ -1743,7 +1758,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
         `Carrick has no index for ${listed(cloud.waiting, 10)} yet. It builds ${one ? "it" : "them"} in the cloud, and ${workspaceUrls(cloud.identity.workspace.slug).repos} shows where ${one ? "it is" : "they are"}. Run carrick refresh here once ${one ? "it is" : "they are"} ready.`,
       );
     }
-    const install = installSentence(installs, "cloud");
+    const install = installSentence(installCommands(plan, readFromHosted), "cloud");
     if (install !== null) out.warn(install);
     if (downloaded) out.done(READY_SENTENCE);
     return 0;

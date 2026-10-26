@@ -69,6 +69,7 @@ import { endLineOf, startLineOf } from './line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import type { LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
+import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import {
   classifyStatusCodes,
   constituents,
@@ -1247,7 +1248,11 @@ export class TypeInferrer {
       case 'expression':
         return this.inferExpression(sourceFile, request, extractionConfig);
       case 'request_body':
-        return this.inferRequestBody(sourceFile, request, extractionConfig);
+        return this.withAbsentBodyMark(
+          sourceFile,
+          request,
+          this.inferRequestBody(sourceFile, request, extractionConfig)
+        );
       case 'signature_return':
         return this.inferSignatureReturn(sourceFile, request);
       case 'function_param':
@@ -1612,7 +1617,7 @@ export class TypeInferrer {
     // scanner re-aims the explicit bundle at the root symbol instead of
     // pasting this string, so the alias's definition stays self-contained.
     const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(paramType));
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       typeString,
       isExplicit,
@@ -1622,6 +1627,52 @@ export class TypeInferrer {
       anchor.depth,
       this.primaryTypeSymbolSource(anchor.element)
     );
+    // carrick#2814: a subscriber that defaults its payload, or reads it only
+    // in ways `undefined` survives, still works when none is sent.
+    const binding = Node.isBindingElement(target.node) ? target.node : target.param;
+    if (bindingToleratesAbsence(binding)) {
+      inferred.absent_body_tolerated = true;
+    }
+    return inferred;
+  }
+
+  /**
+   * carrick#2814: mark a route's request body as one its handler tolerates
+   * going unsent, when the handler is in reach and every read of the body
+   * survives `undefined` (`absent-body.ts`). The check then lets a caller that
+   * may send nothing call a route whose body type has no required member.
+   *
+   * No mark where the handler cannot be found, where a validator the
+   * registration declares reads the body first (a schema, or another function
+   * handed in beside the handler), or where the handler reads no body it can
+   * see: the check keeps the reading it had.
+   */
+  private withAbsentBodyMark(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    inferred: InferredType | null
+  ): InferredType | null {
+    if (!inferred) return inferred;
+    const atLine = this.registrationAtLine(sourceFile, request.line_number);
+    let registration: Node | undefined = atLine?.registration;
+    let handler: FunctionLike | undefined = atLine?.handler;
+    if (!handler) {
+      const located = this.resolveTargetNode(sourceFile, request);
+      handler = located ? this.registrationHandlerAt(located) : undefined;
+      registration = handler && located ? this.unwrapExpressionNode(located) : undefined;
+    }
+    handler ??= this.exportedFunctionOpeningOn(sourceFile, request.line_number);
+    if (!handler) return inferred;
+    if (registration) {
+      if (this.routeSchemaContract(registration, 'body') ?? this.validatedBodyContract(registration)) {
+        return inferred;
+      }
+      if (this.statedParams.handsInAnotherFunction(registration, handler)) return inferred;
+    }
+    if (handlerToleratesAbsentBody(handler)) {
+      inferred.absent_body_tolerated = true;
+    }
+    return inferred;
   }
 
   /**
@@ -2586,6 +2637,91 @@ export class TypeInferrer {
     return accept(parent) ? parent : undefined;
   }
 
+  /**
+   * A call's result read through the library store's label (carrick#2818):
+   * `whole` is the awaited type, `member` is that member of every non-nullish
+   * constituent of it, and `parse` is the awaited return of that method as the
+   * call returns it (a thenable's own `json()` is not on what it resolves to).
+   * A part the type lacks is a decided abstain, so the capture's own re-read
+   * of the raw call does not publish the envelope in its place.
+   */
+  private labelledCallResult(
+    request: InferRequestItem,
+    callExpr: CallExpression,
+    label: NonNullable<InferRequestItem['result']>
+  ): InferredType {
+    const location = this.getNodeLocation(callExpr);
+    const raw = callExpr.getType();
+    const awaited = this.awaitedBeyondPromise(raw) ?? this.unwrapPromiseType(raw);
+    const missing = (what: string): InferredType =>
+      this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'result_member_missing',
+        detail: `the library's label names ${what}, which this call's type does not have`,
+      });
+
+    let read: Type[];
+    if ('whole' in label) {
+      read = [awaited];
+    } else if ('member' in label) {
+      const name = label.member[0];
+      read = [];
+      const constituents = awaited.isUnion() ? awaited.getUnionTypes() : [awaited];
+      for (const constituent of constituents) {
+        if (isNullishType(constituent)) continue;
+        const held = this.readMemberType(constituent, name, callExpr);
+        if (!held) return missing(`the member '${name}'`);
+        for (const part of held.isUnion() ? held.getUnionTypes() : [held]) {
+          if (!isNullishType(part)) read.push(part);
+        }
+      }
+      if (read.length === 0) return missing(`the member '${name}'`);
+    } else {
+      const method = (this.readMemberType(raw, label.parse, callExpr) ??
+        this.readMemberType(awaited, label.parse, callExpr)) as Type | undefined;
+      const signature = method
+        ?.getCallSignatures()
+        .find((candidate) =>
+          candidate.getParameters().every((parameter) => {
+            const declaration = parameter.getDeclarations()[0];
+            return (
+              !!declaration &&
+              Node.isParameterDeclaration(declaration) &&
+              (declaration.hasQuestionToken() ||
+                declaration.hasInitializer() ||
+                declaration.isRestParameter())
+            );
+          })
+        );
+      if (!signature) return missing(`the method '${label.parse}'`);
+      const returned = signature.getReturnType();
+      const parsed = this.awaitedBeyondPromise(returned) ?? this.unwrapPromiseType(returned);
+      // A type parameter of the method that nothing at the call instantiates
+      // (`json<J>()`) states no type: the caller supplies it.
+      if (parsed.isTypeParameter()) return missing(`a concrete type from '${label.parse}'`);
+      read = [parsed];
+    }
+
+    const texts: string[] = [];
+    for (const part of read) {
+      const text = this.structuralTextFromType(part, callExpr) ?? typeText(part, callExpr);
+      if (!texts.includes(text)) texts.push(text);
+    }
+    const anchor =
+      read.length === 1 ? this.unwrapArrayLevels(this.unwrapPromiseType(read[0])) : undefined;
+    return this.createInferredType(
+      request,
+      texts.join(' | '),
+      false,
+      location,
+      undefined,
+      anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
+      anchor?.depth,
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
+    );
+  }
+
   private inferCallResult(
     sourceFile: SourceFile,
     request: InferRequestItem,
@@ -2601,6 +2737,13 @@ export class TypeInferrer {
         `Call-result locator at ${request.file_path}:${request.line_number} finds no call; leaving unresolved`
       );
       return null;
+    }
+
+    // carrick#2818: the library store labels which part of this call's result
+    // holds the response body. The label is the library's own statement, so it
+    // is read before any wrapper rule of the service's extraction config.
+    if (request.result) {
+      return this.labelledCallResult(request, callExpr, request.result);
     }
 
     // Walk up from the already-found call expression instead of re-searching
@@ -5731,6 +5874,15 @@ export class TypeInferrer {
   }
 
   /**
+   * The type of `type`'s member `name` at `node`, or `undefined` when the type
+   * has no such member. The one property read the payload-property rules and
+   * the library store's result label (carrick#2818) share.
+   */
+  private readMemberType(type: Type, name: string, node: Node): Type | undefined {
+    return type.getProperty(name)?.getTypeAtLocation(node);
+  }
+
+  /**
    * Extract the payload type from a matched wrapper. Returns null when the
    * rule matched the wrapper but no payload is recoverable from generics or
    * property paths — the caller decides what a payload-less match means
@@ -5815,11 +5967,10 @@ export class TypeInferrer {
       let currentType = type;
 
       for (const propName of rule.payloadPropertyPath) {
-        const prop = currentType.getProperty(propName);
-        if (!prop) {
+        const propType = this.readMemberType(currentType, propName, node);
+        if (!propType) {
           break;
         }
-        const propType = prop.getTypeAtLocation(node);
         currentType = propType;
       }
 
@@ -10961,6 +11112,28 @@ export class TypeInferrer {
       return undefined;
     }
 
+    // A locator that elides members (`body: { a: x, ... }`) stands for the
+    // whole node it opens: the text before the elision is where the source
+    // opens. Never a node the text merely contains, which is one member of the
+    // payload it names.
+    // An opening shorter than this (`{`) names no node in particular.
+    const MIN_ELIDED_OPENING_LEN = 8;
+    const elidedOpening = this.elidedLocatorOpening(normalizedTarget);
+    if (elidedOpening !== undefined) {
+      if (elidedOpening.length < MIN_ELIDED_OPENING_LEN) return undefined;
+      const opened = candidates.filter((c) => c.text.startsWith(elidedOpening));
+      if (opened.length === 0) return undefined;
+      if (lineNumber !== undefined) {
+        const distance = (c: { node: T }) => Math.abs(startLineOf(c.node) - lineNumber);
+        const nearest = Math.min(...opened.map(distance));
+        return this.pickBestMatch(
+          opened.filter((c) => distance(c) === nearest).map((c) => c.node),
+          lineNumber
+        ) as T;
+      }
+      return this.pickBestMatch(opened.map((c) => c.node), lineNumber) as T;
+    }
+
     // Fall back to substring match
     // For the reverse direction (target contains node text), require a minimum node text
     // length to avoid matching tiny identifiers like "res" or "body" too broadly.
@@ -11034,6 +11207,18 @@ export class TypeInferrer {
       if (enclosing) bound.add(enclosing);
     }
     return bound.size > 0 ? (this.pickBestMatch([...bound], lineNumber) as T) : undefined;
+  }
+
+  /**
+   * The text a locator opens with before an elision, or `undefined` when the
+   * locator has none. An elision is `...` followed only by closing brackets
+   * (`{ a: x, ... }`); `...rest` is a spread and source text. An opening too
+   * short to tell nodes apart is judged by the caller.
+   */
+  private elidedLocatorOpening(normalizedTarget: string): string | undefined {
+    const match = /^(.*?)[\s,]*\.\.\.[\s,)}\]]*$/s.exec(normalizedTarget);
+    if (!match) return undefined;
+    return match[1];
   }
 
   /**
@@ -11499,4 +11684,9 @@ function nodeAtSpan(span: SavedSpan): Node | undefined {
     node = node.getParent();
   }
   return node;
+}
+
+/** `undefined`, `null` and `void`: what a labelled read removes (carrick#2818). */
+function isNullishType(type: Type): boolean {
+  return type.isUndefined() || type.isNull() || type.getText() === 'void';
 }

@@ -104,6 +104,16 @@ export const SymbolRequestSchema = z.object({
 // Infer Request Item Schema
 // ============================================================================
 
+/**
+ * The library store's label for which part of a call's result holds the
+ * response body (carrick#2818). Exactly one key.
+ */
+export const ResultLabelSchema = z.union([
+  z.object({ whole: z.literal(true) }).strict(),
+  z.object({ member: z.tuple([z.string().min(1)]) }).strict(),
+  z.object({ parse: z.string().min(1) }).strict(),
+]);
+
 export const InferRequestItemSchema = z.object({
   file_path: z.string().min(1, 'File path cannot be empty'),
   line_number: z.number().int().positive('Line number must be positive'),
@@ -116,6 +126,8 @@ export const InferRequestItemSchema = z.object({
   param_name: z.string().optional(),
   // The body-carrying member a `request_config` item asks about.
   member: z.string().optional(),
+  // The library store's label for the call's result (carrick#2818).
+  result: ResultLabelSchema.optional(),
 });
 
 /**
@@ -197,6 +209,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     anchor_origin: AnchorOriginSchema,
     array_depth: z.number().int().nonnegative().optional(),
     consumer_response: z.boolean().optional(),
+    absent_body_tolerated: z.literal(true).optional(),
   }),
   z.object({
     kind: z.literal('handler_return'),
@@ -219,6 +232,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     // the request.
     param_name: z.string().optional(),
     unwrap: z.enum(['awaited', 'none']).optional(),
+    result: ResultLabelSchema.optional(),
   }),
   z.object({
     kind: z.literal('literal'),
@@ -236,6 +250,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
       )
       .optional(),
     raw_text_read: z.literal(true).optional(),
+    absent_body_tolerated: z.literal(true).optional(),
   }),
 ]);
 
@@ -468,6 +483,13 @@ const RequestAtSchema = z
   })
   .strict();
 
+/** Exactly one of the whole return, one member name, or a parse method (carrick#2817). */
+const ResultShapeSchema = z.union([
+  z.object({ whole: z.literal(true) }).strict(),
+  z.object({ member: z.tuple([z.string().min(1)]) }).strict(),
+  z.object({ parse: z.string().min(1) }).strict(),
+]);
+
 const ClaimOnSchema = z.enum(['export', 'instance', 'both']);
 const MemberPathSchema = z.array(z.string().min(1));
 const KeyLabelsSchema = z.record(z.string().min(1), z.enum(['name', 'not_name']));
@@ -496,6 +518,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       key_labels: KeyLabelsSchema.optional(),
       name_scope: NameScopeSchema.optional(),
       picker: z.string().optional(),
+      result: ResultShapeSchema.optional(),
     })
     .strict(),
   z
@@ -539,6 +562,19 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       runs: RunsSlotSchema.optional(),
       yields: YieldsSchema.optional(),
       request: RequestAtSchema.optional(),
+      result: ResultShapeSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('result'),
+      form: z.enum(['make', 'op']),
+      member: z.string().min(1).nullable(),
+      path: MemberPathSchema.optional(),
+      on: ClaimOnSchema.optional(),
+      of: z.string().min(1).optional(),
+      picker: z.string().optional(),
+      result: ResultShapeSchema,
     })
     .strict(),
   z

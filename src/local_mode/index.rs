@@ -299,6 +299,8 @@ fn run_generation(
     // counting its own services, as they did.
     let service_counts = workspace_service_counts(targets, hosted, pass);
     let mut services_done = 0usize;
+    // The repos whose hosted index stood in for their scan (carrick#985).
+    let mut fetched: Vec<String> = Vec::new();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let workspace_position = service_counts
@@ -307,16 +309,37 @@ fn run_generation(
         if let Some(counts) = &service_counts {
             services_done += counts.get(position).copied().unwrap_or(0);
         }
+        let hosted_blobs = hosted.local_blobs(repo);
+        // A facts-only pass over a tree the hosted index already describes
+        // would re-read every file to write what it downloaded: fetched, not
+        // re-read (carrick#985).
+        if matches!(pass, Pass::Facts)
+            && let Some(current) = current_hosted_blobs(repo, &hosted_blobs)
+        {
+            for (service, blob) in current.iter().enumerate() {
+                let file = format!("local-{position}-{service}.json");
+                write_blob(&blobs.join(&file), blob)?;
+                write_blob(&peers.join(&file), blob)?;
+                positions.insert(service_id(blob), position);
+            }
+            fetched.push(name.clone());
+            scanned.push(name);
+            continue;
+        }
         let previous = generation.join("previous.json");
         std::fs::write(
             &previous,
-            serde_json::to_vec(&hosted.local_blobs(repo)).map_err(|e| e.to_string())?,
+            serde_json::to_vec(&hosted_blobs).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
         // Scanner cache filenames derive from repo/service labels. Keep each
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
+        // A facts-only pass over a tree that moved since the hosted commit
+        // re-reads only the services whose inputs moved, and every other one
+        // stands in from its hosted blob (carrick#2840).
+        let carry = matches!(pass, Pass::Facts) && !hosted_blobs.is_empty();
         let report = scan_repo(
             &exe,
             repo,
@@ -327,6 +350,7 @@ fn run_generation(
             pass,
             workspace_position,
             targets.len(),
+            carry,
         )?;
         pending.extend(report.pending.iter().cloned());
         if let Some(split) = &report.timing {
@@ -360,7 +384,24 @@ fn run_generation(
             // artefact a killed scan leaves behind says what it had spent.
             super::scan_state::spent(&spend);
         }
-        for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
+        let mut written = read_blobs(&scan_dir)?;
+        if carry {
+            let carried = carried_services(repo, &hosted_blobs, &hosted_blobs, &written)?;
+            let resolved: Vec<Option<String>> =
+                crate::service_derivation::resolve_with_hosted(repo, Some(&hosted_blobs))?
+                    .into_iter()
+                    .map(|service| service.service_name)
+                    .collect();
+            written.extend(carried);
+            // In declared order, as a scan of every service writes them.
+            written.sort_by_key(|blob| {
+                resolved
+                    .iter()
+                    .position(|name| *name == blob.service_name)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        for (service, blob) in written.into_iter().enumerate() {
             let file = format!("local-{position}-{service}.json");
             write_blob(&blobs.join(&file), &blob)?;
             write_blob(&peers.join(&file), &blob)?;
@@ -443,6 +484,9 @@ fn run_generation(
     timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
+    for repo in &mut index.repos {
+        repo.read_from_hosted = fetched.contains(&repo.name);
+    }
     index.type_check = Some(type_check_summary(&join, &uploaded_blobs, &positions));
     index.hosted_checked_at = hosted.checked_at();
     index.hosted_source_key = hosted.source_key();
@@ -513,11 +557,109 @@ fn run_generation(
         index,
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        hosted_download: hosted.download_line(),
+        hosted_download: download_line(hosted.download_line(), &fetched),
         not_dispatched,
         pending,
         timing: pass.measured_wait(timing),
     })))
+}
+
+/// The hosted blobs of `repo` when they are what a facts-only scan of this
+/// checkout would write, so the build reads them in instead of re-reading
+/// every file (carrick#985). `None` sends the repo to the scan, which still
+/// replays the hosted answers for every file that did not change.
+///
+/// All or nothing per repo, as the hosted configs are taken
+/// (`service_derivation::hosted_services`): every blob is one generation (one
+/// commit, this build's cache format, read from a clean tree), the tree holds
+/// that commit and has not moved under any file a scan reads since, and the
+/// services this checkout resolves to are exactly the blobs' services.
+///
+/// "A file a scan reads" is a source file the walk keeps, a repository input
+/// (manifests, lockfiles, `carrick.json`, GraphQL schemas) or a tsconfig. A
+/// change anywhere else — the hooks, skills and settings `carrick init` writes
+/// just before this runs — leaves the hosted index current (carrick#1007 item
+/// 5). A JSON module a service imports by name is not checked: a tree whose
+/// only change is one is read in as the hosted index has it.
+pub(super) fn current_hosted_blobs(
+    repo: &Path,
+    blobs: &[CloudRepoData],
+) -> Option<Vec<CloudRepoData>> {
+    let commit = &blobs.first()?.commit_hash;
+    if blobs.iter().any(|blob| {
+        &blob.commit_hash != commit
+            || blob.cache_version != Some(crate::engine::CACHE_VERSION)
+            || blob.dirty == Some(true)
+    }) {
+        return None;
+    }
+    let changed = super::query::changed_since(repo, commit)?;
+    if changed.iter().any(|file| is_scan_input(repo, file)) {
+        return None;
+    }
+    let services = crate::service_derivation::resolve_with_hosted(repo, Some(blobs)).ok()?;
+    let mut resolved: Vec<Option<&str>> = services
+        .iter()
+        .map(|service| service.service_name.as_deref())
+        .collect();
+    let mut held: Vec<Option<&str>> = blobs
+        .iter()
+        .map(|blob| blob.service_name.as_deref())
+        .collect();
+    resolved.sort();
+    held.sort();
+    (resolved == held).then(|| blobs.to_vec())
+}
+
+/// The services of `previous` a `--changed-only` scan carried: it writes a
+/// carried service only when its join moved something the service holds, so
+/// every service of `previous` it did not write stands in as it was. Only the
+/// services this checkout resolves to: a stored service the tree no longer
+/// declares is not carried back into it. `hosted` is the hosted copy of the
+/// repo's blobs, which the resolver reads when the tree declares no services.
+pub(super) fn carried_services(
+    repo: &Path,
+    hosted: &[CloudRepoData],
+    previous: &[CloudRepoData],
+    written: &[CloudRepoData],
+) -> Result<Vec<CloudRepoData>, String> {
+    let written: std::collections::BTreeSet<String> = written.iter().map(service_id).collect();
+    let resolved: Vec<Option<String>> =
+        crate::service_derivation::resolve_with_hosted(repo, Some(hosted))?
+            .into_iter()
+            .map(|service| service.service_name)
+            .collect();
+    Ok(previous
+        .iter()
+        .filter(|blob| !written.contains(&service_id(blob)))
+        .filter(|blob| resolved.contains(&blob.service_name))
+        .cloned()
+        .collect())
+}
+
+/// Whether a change to `file` (repo-relative) can change what a scan writes.
+fn is_scan_input(repo: &Path, file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    crate::file_finder::is_scanned_source(&repo.join(file), repo)
+        || crate::change_scope::is_repo_input(file)
+        || ((name.starts_with("tsconfig") || name.starts_with("jsconfig"))
+            && name.ends_with(".json"))
+}
+
+/// The hosted read's line, and which repos it stood in for a scan of.
+fn download_line(hosted: Option<String>, fetched: &[String]) -> Option<String> {
+    if fetched.is_empty() {
+        return hosted;
+    }
+    let fetched = format!(
+        "read in from the hosted index without re-reading the source (current for this \
+         checkout): {}",
+        fetched.join(", ")
+    );
+    Some(match hosted {
+        Some(line) => format!("{line}; {fetched}"),
+        None => fetched,
+    })
 }
 
 /// The repo holding a named service, for `refresh --service`. The blobs know
@@ -586,8 +728,12 @@ fn scan_repo(
     pass: &Pass,
     workspace_position: Option<(usize, usize)>,
     run_repos: usize,
+    changed_only: bool,
 ) -> Result<ScanReport, String> {
     let mut command = scan_command(exe, repo, blobs, previous, Some(peers), pass);
+    if changed_only {
+        command.arg("--changed-only");
+    }
     declare_run_repos(&mut command, pass, run_repos);
     if let Some((offset, total)) = workspace_position {
         command
@@ -718,6 +864,14 @@ pub(super) fn scan_command(
         command.env(crate::preflight::ALLOW_ENV, "1");
     } else {
         command.env_remove(crate::preflight::ALLOW_ENV);
+    }
+    // A laptop scans the same services again and again, so its sidecars keep
+    // their type answers and serve them again while the program they were
+    // read in is unchanged (carrick#2843). A directory the caller named wins.
+    if std::env::var_os(crate::services::type_sidecar::INFER_CACHE_ENV).is_none()
+        && let Some(dir) = crate::services::type_sidecar::local_infer_cache_dir()
+    {
+        command.env(crate::services::type_sidecar::INFER_CACHE_ENV, dir);
     }
     // Always: the ambient CI context would name every repo in the workspace
     // after the one whose shell this ran in, and on a laptop scan its OIDC
@@ -1480,6 +1634,7 @@ pub(super) fn build(
             services,
             files: BTreeMap::new(),
             uses: None,
+            read_from_hosted: false,
         });
     }
 
@@ -1784,7 +1939,7 @@ fn verdict_for(
 ///
 /// One selector, used by both: a row that took its verdict from one finding
 /// and its types from another would state a pair that was never compared.
-fn finding_for<'a>(
+pub(super) fn finding_for<'a>(
     operation: &JoinedOperation,
     findings: &'a [JoinedFinding],
 ) -> Option<&'a JoinedFinding> {
@@ -2113,6 +2268,34 @@ mod tests {
         assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&None));
     }
 
+    /// Every laptop scan's sidecars keep their `infer` answers in the home
+    /// cache, and a directory the caller named is left to it (carrick#2843).
+    #[test]
+    #[serial_test::serial(infer_cache_dir)]
+    fn every_scan_keeps_its_infer_answers_in_the_home_cache() {
+        let env_name = crate::services::type_sidecar::INFER_CACHE_ENV;
+        // SAFETY: serialised with every other test that reads this variable.
+        let caller = std::env::var_os(env_name);
+        unsafe { std::env::remove_var(env_name) };
+        let expected = crate::services::type_sidecar::local_infer_cache_dir()
+            .map(|dir| dir.to_string_lossy().into_owned());
+        assert!(expected.is_some(), "the test machine has a home directory");
+        for pass in [Pass::Facts, Pass::Infer, Pass::Dispatch] {
+            assert_eq!(scan_env(&pass).get(env_name), Some(&expected));
+        }
+        unsafe { std::env::set_var(env_name, "/elsewhere") };
+        let named = scan_env(&Pass::Facts);
+        match caller {
+            Some(value) => unsafe { std::env::set_var(env_name, value) },
+            None => unsafe { std::env::remove_var(env_name) },
+        }
+        assert_eq!(
+            named.get(env_name),
+            None,
+            "the caller's directory is inherited"
+        );
+    }
+
     /// A build the flag allowed hands that decision to every scan it starts,
     /// and a build that was not allowed clears the variable rather than
     /// letting an inherited one through (carrick#1254).
@@ -2247,6 +2430,135 @@ mod tests {
         }
     }
 
+    /// A two-service monorepo with no carrick.json, committed, and the hosted
+    /// blobs a CI scan of that commit wrote for it.
+    fn hosted_monorepo() -> (tempfile::TempDir, String, Vec<CloudRepoData>) {
+        let (dir, head) = crate::git_state::tests::committed_repo(&[
+            ("package.json", r#"{"name":"root","private":true}"#),
+            ("services/orders/package.json", r#"{"name":"@acme/orders"}"#),
+            (
+                "services/orders/src/app.ts",
+                "export const route = '/orders';",
+            ),
+            ("services/web/package.json", r#"{"name":"@acme/web"}"#),
+            ("services/web/src/client.ts", "export const page = 1;"),
+        ]);
+        let blob = |name: &str, directory: &str| -> CloudRepoData {
+            let config = serde_json::json!({"serviceName": name, "directory": directory});
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "shop", "service_name": name,
+                "config_json": config.to_string(),
+                "endpoints": [], "calls": [], "mounts": [], "apps": {},
+                "imported_handlers": [], "function_definitions": {},
+                "last_updated": "2026-10-01T00:00:00Z", "commit_hash": head,
+                "cache_version": crate::engine::CACHE_VERSION
+            }))
+            .unwrap()
+        };
+        let blobs = vec![
+            blob("@acme/orders", "services/orders"),
+            blob("@acme/web", "services/web"),
+        ];
+        (dir, head, blobs)
+    }
+
+    /// carrick#2846: a stored service the checkout no longer declares is not
+    /// carried back into a re-check, whichever caller carries it.
+    #[test]
+    fn a_stored_service_the_tree_no_longer_declares_is_not_carried() {
+        let (dir, _, hosted) = hosted_monorepo();
+        let mut previous = hosted.clone();
+        let mut gone = hosted[0].clone();
+        gone.service_name = Some("@acme/gone".to_string());
+        previous.push(gone);
+        let carried = carried_services(dir.path(), &hosted, &previous, &[]).unwrap();
+        let names: Vec<_> = carried
+            .iter()
+            .map(|blob| blob.service_name.as_deref())
+            .collect();
+        assert_eq!(names, [Some("@acme/orders"), Some("@acme/web")]);
+    }
+
+    /// carrick#985: a checkout at the hosted commit is read in from the
+    /// hosted index, whatever `carrick init` wrote beside it first.
+    #[test]
+    fn a_checkout_at_the_hosted_commit_takes_the_hosted_blobs() {
+        let (dir, _, blobs) = hosted_monorepo();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "# notes").unwrap();
+        let current = current_hosted_blobs(repo, &blobs).expect("current");
+        assert_eq!(current.len(), 2);
+    }
+
+    /// Any file a scan reads that moved since the hosted commit sends the
+    /// repo to the scan, which replays the hosted answers for the rest.
+    #[test]
+    fn a_moved_input_sends_the_repo_to_the_scan() {
+        for (file, contents) in [
+            ("services/web/src/client.ts", "export const page = 2;"),
+            ("services/web/src/new.ts", "export const added = 1;"),
+            ("pnpm-lock.yaml", "lockfileVersion: 9"),
+            ("services/orders/tsconfig.json", "{}"),
+            ("carrick.json", r#"{"serviceName":"shop"}"#),
+        ] {
+            let (dir, _, blobs) = hosted_monorepo();
+            std::fs::write(dir.path().join(file), contents).unwrap();
+            assert!(
+                current_hosted_blobs(dir.path(), &blobs).is_none(),
+                "{file} moved"
+            );
+        }
+    }
+
+    /// A checkout a commit ahead of the hosted index is not current.
+    #[test]
+    fn a_checkout_a_commit_ahead_is_not_current() {
+        let (dir, _, blobs) = hosted_monorepo();
+        let repo = dir.path();
+        std::fs::write(
+            repo.join("services/orders/src/app.ts"),
+            "export const x = 2;",
+        )
+        .unwrap();
+        crate::git_state::tests::git_in(repo, &["commit", "-qam", "two"]);
+        assert!(current_hosted_blobs(repo, &blobs).is_none());
+    }
+
+    /// The blobs themselves have to be one clean generation in this build's
+    /// cache format, at a commit this clone holds.
+    #[test]
+    fn a_generation_this_build_cannot_stand_behind_is_not_current() {
+        type Spoil = fn(&mut CloudRepoData);
+        let spoilers: [(&str, Spoil); 4] = [
+            ("older cache", |b| b.cache_version = Some(0)),
+            ("dirty", |b| b.dirty = Some(true)),
+            ("missing commit", |b| {
+                b.commit_hash = "0123456789abcdef".into()
+            }),
+            ("renamed", |b| b.service_name = Some("@acme/shop".into())),
+        ];
+        for (what, spoil) in spoilers {
+            let (dir, _, mut blobs) = hosted_monorepo();
+            blobs.iter_mut().for_each(spoil);
+            assert!(current_hosted_blobs(dir.path(), &blobs).is_none(), "{what}");
+        }
+        let (dir, _, _) = hosted_monorepo();
+        assert!(current_hosted_blobs(dir.path(), &[]).is_none(), "no blobs");
+    }
+
+    #[test]
+    fn the_download_line_names_the_repos_read_in_without_a_scan() {
+        assert_eq!(download_line(Some("x".into()), &[]), Some("x".into()));
+        let line = download_line(Some("x".into()), &["shop".into()]).unwrap();
+        assert!(
+            line.starts_with("x; read in from the hosted index"),
+            "{line}"
+        );
+        assert!(line.ends_with(": shop"), "{line}");
+    }
+
     fn consumer_blob(repo: &str) -> CloudRepoData {
         serde_json::from_value(serde_json::json!({
             "repo_name": repo,
@@ -2269,6 +2581,7 @@ mod tests {
             operations: Vec::new(),
             matches: vec![joined_pair("web", None)],
             findings: Vec::new(),
+            unmatched: Vec::new(),
             type_check: super::super::JoinTypeCheck::Skipped {
                 reason: "sidecar not found".to_string(),
             },

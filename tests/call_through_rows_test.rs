@@ -20,12 +20,18 @@ use std::sync::OnceLock;
 const SERVICES: [&str; 4] = ["api", "cli", "client", "web"];
 
 const COMMANDS: &str = "packages/cli/src/commands.ts";
+const TYPED_COMMANDS: &str = "packages/cli/src/typed-commands.ts";
+const TYPED: &str = "packages/client/src/typed.ts";
 const HOOKS: &str = "apps/web/src/hooks.ts";
 const REQUESTS: &str = "packages/client/src/requests.ts";
 const TOOLS: &str = "packages/cli/src/tools.ts";
 const MAIN: &str = "packages/cli/src/main.ts";
 const NESTED: &str = "packages/cli/src/nested.ts";
 const PAGE: &str = "apps/web/src/page.tsx";
+const BADGE: &str = "apps/web/src/badge.tsx";
+const HELPERS: &str = "packages/cli/src/helpers.ts";
+const PROBED: &str = "packages/cli/src/probed-client.ts";
+const API_CLIENT: &str = "packages/cli/src/api-client.ts";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/call-through-client")
@@ -282,6 +288,98 @@ fn as_stated(method: &str, target: &str, path: &str) -> Row {
     }
 }
 
+const INLINE_COMMANDS: &str = "packages/cli/src/inline-commands.ts";
+const INLINE_HOOKS: &str = "apps/web/src/inline-hooks.ts";
+
+/// Whether the live sidecar can run, for the scans that walk the compiler's
+/// rows. CI builds it before the Rust tests, so a skip there would make a
+/// green tick mean nothing.
+fn sidecar_available() -> bool {
+    let node = Command::new("node").arg("--version").output().is_ok();
+    let built = std::env::var_os("CARRICK_SIDECAR_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"))
+        .join("dist/src/index.js")
+        .exists();
+    assert!(
+        (node && built) || std::env::var("CI").is_err(),
+        "node or the built sidecar is missing in CI, so this test would silently not run"
+    );
+    node && built
+}
+
+/// The fixture scanned as a fact-layer scan runs, with the compiler's
+/// per-position rows (`CARRICK_POSITION_ROWS=1`), once for the whole binary.
+fn blobs_with_rows() -> &'static Blobs {
+    static SCAN: OnceLock<Blobs> = OnceLock::new();
+    SCAN.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = committed_copy(tmp.path());
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = scan_command(&repo, &storage);
+        cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("CARRICK_POSITION_ROWS", "1")
+            .env("HOME", &home);
+        run(cmd);
+        read_blobs(&storage)
+            .into_iter()
+            .map(|(service, (_, blob))| (service, blob))
+            .collect()
+    })
+}
+
+/// carrick#2822: a method called on a call's value (`getClient().getRun(id)`,
+/// `createClient().getStatus()`) reaches the client method the compiler's
+/// `call` row names, so the model's row, a path made from the names in
+/// sight, takes the request that method sends.
+#[test]
+fn a_method_called_on_a_factorys_value_takes_the_request_the_method_reaches() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let blobs = blobs_with_rows();
+    assert_eq!(
+        rows_in(blobs, "cli", INLINE_COMMANDS, 9),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+    assert_eq!(
+        rows_in(blobs, "cli", INLINE_COMMANDS, 13),
+        [corrected("GET", "/api/v1/status", 23)]
+    );
+    // A hook's one callback calls a method on the app client a factory
+    // returns.
+    assert_eq!(
+        rows_in(blobs, "web", INLINE_HOOKS, 6),
+        [corrected("GET", "/api/v1/status", 23)]
+    );
+    // The binding form, `const client = createClient(); client.getRun(id)`,
+    // is unchanged.
+    assert_eq!(
+        rows_in(blobs, "cli", COMMANDS, 9),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+}
+
+/// carrick#2823: a command table's `run:` calls a wrapper whose body calls a
+/// method on a factory's value. The walk passes through that call, so the
+/// model's row, made from the command's `path`, takes the request.
+#[test]
+fn a_wrapper_over_a_factorys_value_passes_the_walk_to_the_request() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        rows_in(blobs_with_rows(), "cli", INLINE_COMMANDS, 22),
+        [corrected("GET", "/api/v1/token", 14)]
+    );
+}
+
 /// The consumer type entries the manifest holds at `file:line`.
 fn consumer_entries_at(service: &str, file: &str, line: u32) -> Vec<serde_json::Value> {
     blobs()[service]["type_manifest"]
@@ -409,24 +507,104 @@ fn a_stale_type_at_a_corrected_row_is_found() {
 }
 
 /// carrick#1601: a call of a function that does not hand back its request's
-/// parsed body unchanged is worth that function's own result. The function
-/// called wraps the body in an envelope (`readRunStamped`), or the client
-/// method called returns a member of what a transport returns (`Client.send`
-/// reads `.data` of a request spec's value, whose shape nothing here
-/// states). The row still takes the operation, and the type anchored there
-/// goes: judged against the producer, it would read as a break that is not
-/// there.
+/// body is worth that function's own result. The function called wraps the
+/// body in an envelope (`readRunStamped`), or the chain from it holds the
+/// transport's result itself, with no step read off it (`runOf`). The row
+/// still takes the operation, and the type anchored there goes: judged
+/// against the producer, it would read as a break that is not there.
 #[test]
 fn a_corrected_row_whose_call_returns_another_shape_carries_no_type() {
     assert_eq!(
         row_at("cli", COMMANDS, 151).reaches,
         Some(format!("{REQUESTS}:51"))
     );
-    for line in [9, 46, 151] {
+    for line in [151, 186] {
         let entries = consumer_entries_at("cli", COMMANDS, line);
         assert!(
             entries.is_empty(),
             "no type is carried from a call that returns another shape ({COMMANDS}:{line}): {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(COMMANDS, line), []);
+    }
+}
+
+/// carrick#2377: the chain from the call's callee to the request reads
+/// exactly one step off the transport's value, and that step is the Fetch
+/// standard's `Response.json()`: a class member returns a function's parsed
+/// `fetch`. The type the caller declared is the request's body, so it is kept
+/// under the reached operation and judged against its producer.
+#[test]
+fn a_call_through_a_function_that_parses_a_fetch_keeps_its_type() {
+    let entries = consumer_entries_at("cli", TYPED_COMMANDS, 15);
+    assert!(
+        entries.iter().any(|entry| {
+            entry["type_kind"] == "response"
+                && entry["path"] == "/api/v1/runs/:id"
+                && entry["primary_type_symbol"] == "Run"
+        }),
+        "{TYPED_COMMANDS}:15 keeps its Run: {entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(TYPED_COMMANDS, 15),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// carrick#2377: a client wrapper that reads a member of a library client's
+/// result (`.data` here, `.status` in another) is not taken as handing back
+/// the body: which member holds it is the library store's to state
+/// (carrick-cloud#2639). The row still takes the operation, keeps no type,
+/// and so gets no verdict, where a guess would give a false one.
+#[test]
+fn a_wrapper_that_reads_a_member_of_a_library_clients_result_abstains() {
+    for (file, line) in [(COMMANDS, 9), (COMMANDS, 46), (TYPED_COMMANDS, 8)] {
+        assert!(
+            row_at("cli", file, line).reaches.is_some(),
+            "{file}:{line} still takes the request it reaches"
+        );
+        let entries = consumer_entries_at("cli", file, line);
+        assert!(
+            entries.is_empty(),
+            "{file}:{line} carries no type: {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(file, line), []);
+    }
+}
+
+/// carrick#2377: a chain that holds the transport's result with no step read
+/// (`runOf`), maps the value through another function (`toView`), or reads
+/// the helper's member and then the run's own, is not the request's body. The
+/// row takes the operation and the type goes.
+#[test]
+fn a_chain_that_builds_reads_twice_or_passes_through_another_function_drops_its_type() {
+    for (file, line) in [(COMMANDS, 176), (TYPED_COMMANDS, 22), (TYPED_COMMANDS, 29)] {
+        assert!(
+            row_at("cli", file, line).reaches.is_some(),
+            "{file}:{line} still takes the request it reaches"
+        );
+        let entries = consumer_entries_at("cli", file, line);
+        assert!(
+            entries.is_empty(),
+            "{file}:{line} carries no type: {entries:#?}"
+        );
+        assert_eq!(response_verdicts_at(file, line), []);
+    }
+}
+
+/// The client methods whose helper never gets its `T` read a member of a
+/// library client's result, so they abstain like the others; no unknown type
+/// reaches a verdict. (A proven chain with a bare top type is dropped and
+/// counted apart: unit test `a_bare_top_type_is_no_type_to_carry`.)
+#[test]
+fn a_client_method_with_a_helper_that_is_never_given_its_type_carries_nothing() {
+    for line in [21, 64, 101, 164] {
+        let entries = consumer_entries_at("cli", COMMANDS, line);
+        assert!(
+            entries.is_empty(),
+            "no type is carried ({COMMANDS}:{line}): {entries:#?}"
         );
         assert_eq!(response_verdicts_at(COMMANDS, line), []);
     }
@@ -488,7 +666,7 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(11 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(15 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -521,9 +699,10 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 145 and 157 of `commands.ts` keep their response entry.
+    // Lines 145 and 157 of `commands.ts` and line 15 of `typed-commands.ts`
+    // keep their response entry.
     assert!(
-        settled_line().contains("2 kept the response type and lost the request type)"),
+        settled_line().contains("3 kept the response type and lost the request type)"),
         "{}",
         settled_line()
     );
@@ -664,8 +843,8 @@ fn every_request_row_is_unchanged() {
         )
     };
     requests.sort_by_key(|(site, _, _)| {
-        site.rsplit_once(':')
-            .and_then(|(_, line)| line.parse::<u32>().ok())
+        let (file, line) = site.rsplit_once(':').unwrap();
+        (file.to_string(), line.parse::<u32>().unwrap())
     });
     assert_eq!(
         requests,
@@ -690,6 +869,22 @@ fn every_request_row_is_unchanged() {
             ),
             (
                 format!("{REQUESTS}:51"),
+                "GET /api/v1/runs/:id".to_string(),
+                "env_base_path".to_string()
+            ),
+            // `typed.ts`: two specs and a `fetch` on the declared base.
+            (
+                format!("{TYPED}:13"),
+                "GET /api/v1/runs/:id".to_string(),
+                "request_spec".to_string()
+            ),
+            (
+                format!("{TYPED}:19"),
+                "GET /api/v1/runs/:id".to_string(),
+                "request_spec".to_string()
+            ),
+            (
+                format!("{TYPED}:24"),
                 "GET /api/v1/runs/:id".to_string(),
                 "env_base_path".to_string()
             ),
@@ -738,9 +933,10 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Eleven rows in `commands.ts` the model alone states, and the one at
-    // `nested.ts:7`.
-    assert_eq!(boundary["model_only_rows"], 12, "{boundary}");
+    // Eleven rows in `commands.ts` the model alone states, the one at
+    // `nested.ts:7`, and the three in `inline-commands.ts`, which only a scan
+    // with the compiler's rows follows (carrick#2822).
+    assert_eq!(boundary["model_only_rows"], 15, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
@@ -870,11 +1066,6 @@ fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_
         ("cli", COMMANDS, 57),
         // Nothing resolves the receiver.
         ("cli", COMMANDS, 70),
-        // Calls straight into the client package, and a runner of the web's
-        // own that only runs the callback it is handed.
-        ("web", HOOKS, 9),
-        ("web", HOOKS, 14),
-        ("web", HOOKS, 19),
     ] {
         stated.extend(
             rows_in(blobs, service, file, line)
@@ -884,6 +1075,106 @@ fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_
         );
     }
     assert!(stated.is_empty(), "no call-through row here: {stated:#?}");
+}
+
+/// A call straight into a function another service declares states the
+/// request that function reaches in the service that writes it
+/// (carrick#2773), at the call, where no row sits.
+#[test]
+fn a_call_straight_into_another_services_function_states_the_request_it_reaches() {
+    let blobs = unanswered();
+    for (service, file, line, method, path, request_line) in [
+        // A factory's options spread into a hook: the factory hands its
+        // request back inside the object, unrun.
+        ("web", HOOKS, 9, "GET", "/api/v1/runs/:id", 5),
+        // A callback handed to the hook, and to one of the web's own
+        // functions.
+        ("web", HOOKS, 14, "GET", "/api/v1/runs", 8),
+        ("web", HOOKS, 19, "POST", "/api/v1/audit", 17),
+        ("web", HOOKS, 24, "POST", "/api/v1/audit", 17),
+        ("cli", COMMANDS, 145, "GET", "/api/v1/runs/:id", 45),
+        ("cli", COMMANDS, 151, "GET", "/api/v1/runs/:id", 51),
+        ("cli", COMMANDS, 157, "GET", "/api/v1/runs/:id", 45),
+        // `authorizedRun` is called from its own file, so it is no wrapper.
+        ("cli", COMMANDS, 171, "GET", "/api/v1/runs/:id", 5),
+    ] {
+        let mut row = corrected(method, path, request_line);
+        // The two requests written on a declared environment base keep it in
+        // their target.
+        if request_line == 45 || request_line == 51 {
+            row.target = "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string();
+        }
+        assert_eq!(rows_in(blobs, service, file, line), [row], "{file}:{line}");
+    }
+    // The request is written from the parameters, or only the model states it.
+    for line in [76, 82, 94] {
+        assert_eq!(
+            rows_in(blobs, "cli", COMMANDS, line),
+            [],
+            "{COMMANDS}:{line}"
+        );
+    }
+}
+
+/// A boundary call stated whether or not the model stated a row: the first
+/// scan and the unanswered one alike.
+#[test]
+fn a_boundary_call_in_a_function_no_other_call_reaches_one_request_through_states_its_row() {
+    for blobs in [blobs(), unanswered()] {
+        // `loadPair` reaches two operations, so it is no wrapper.
+        assert_eq!(
+            rows_in(blobs, "cli", HELPERS, 6),
+            [
+                corrected("GET", "/api/v1/runs", 8),
+                corrected("GET", "/api/v1/runs/:id", 5),
+            ]
+        );
+        // `statusReader` hands its reader back unrun: it is no wrapper.
+        assert_eq!(
+            rows_in(blobs, "cli", HELPERS, 27),
+            [corrected("GET", "/api/v1/status", 23)]
+        );
+        // The probe in the private `invoke`, which no other file calls.
+        assert_eq!(
+            rows_in(blobs, "cli", PROBED, 14),
+            [corrected("GET", "/health", 20)]
+        );
+    }
+}
+
+/// A helper only its own file calls gets no row beside the one its caller
+/// holds: the model's wrong route at the caller is corrected to the request,
+/// and the call inside the helper states nothing more.
+#[test]
+fn a_boundary_call_in_a_same_file_helper_whose_caller_holds_the_row_states_nothing() {
+    assert_eq!(
+        rows_in(blobs(), "cli", COMMANDS, 186),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+    assert_eq!(rows_in(blobs(), "cli", COMMANDS, 182), []);
+    // With no row at the caller, the helper's call is the site.
+    assert_eq!(
+        rows_in(unanswered(), "cli", COMMANDS, 182),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+}
+
+/// A boundary call inside a function whose callers state the row states
+/// nothing: the callers are the sites, one per module that calls in.
+#[test]
+fn a_boundary_call_inside_a_wrapper_states_nothing() {
+    for blobs in [blobs(), unanswered()] {
+        for (service, file, lines) in [
+            ("cli", API_CLIENT, vec![18, 22, 27, 32, 36, 40, 44]),
+            ("cli", PROBED, vec![10, 35]),
+            ("cli", HELPERS, vec![16, 21]),
+            ("web", BADGE, vec![5]),
+        ] {
+            for line in lines {
+                assert_eq!(rows_in(blobs, service, file, line), [], "{file}:{line}");
+            }
+        }
+    }
 }
 
 /// A call written inside another call whose row states the same request is
@@ -1050,6 +1341,10 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
             (COMMANDS, 121),
             (NESTED, 16),
             (NESTED, 39),
+            (COMMANDS, 171),
+            (HELPERS, 6),
+            (HELPERS, 27),
+            (PROBED, 14),
         ],
     );
     std::fs::write(&path, serde_json::to_string(&cli).unwrap()).unwrap();

@@ -217,11 +217,16 @@ export function decisiveAssignmentLine(plan: ProbePlan): number {
  * probe of an `http` pair then ends with a second assignment of that reading,
  * in the wire form. Without an answer the probe is what it always was, byte
  * for byte.
+ *
+ * `expectedToleratesAbsence` answers, for the receiving side, whether its
+ * capture record marks a handler that works when no body is sent
+ * (carrick#2814).
  */
 export function buildProbe(
   spec: CheckPairSpec,
   packageOf: (serviceName: string) => string,
-  unwidenedAliasFor?: (sent: CheckPairEndpoint) => string | undefined
+  unwidenedAliasFor?: (sent: CheckPairEndpoint) => string | undefined,
+  expectedToleratesAbsence?: (expected: CheckPairEndpoint) => boolean
 ): ProbePlan {
   const id = pairId(spec);
   const direction = directionFor(spec.protocol, spec.type_kind);
@@ -334,7 +339,32 @@ export function buildProbe(
       'expected:envelope'
     );
   }
-  push(`declare const sent: Sent;`);
+  // carrick#2814: a body the sender may omit (`T | undefined`, `T | void`) is
+  // compatible with a receiver that requires none. A receiver requires none
+  // when its type has no required member (`{} extends Expected`) AND either
+  // its type admits absence (`Expected` holds `undefined` or `void`), or its
+  // handler works with nothing sent: the capture record says so
+  // (`absent_body_tolerated`), from a handler that defaults the body or reads
+  // it only through `?.` / `?? {}`. A handler that destructures or
+  // dereferences the body throws on `undefined`, whatever its type says, so
+  // without the mark the absent body keeps today's incompatible reading. When
+  // it holds, the absent members are dropped from the sent side and what
+  // remains is compared as before. The request direction of HTTP, and socket
+  // and pub/sub payloads (the subscriber is `expected`); a GraphQL request is
+  // not read this way.
+  const absentBodyAllowed =
+    (spec.protocol === 'http' && spec.type_kind === 'request') ||
+    spec.protocol === 'socket' ||
+    spec.protocol === 'pubsub';
+  const toleratesAbsence = expectedToleratesAbsence?.(expectedEndpoint) === true;
+  const sentBodyType = (sent: string): string => {
+    const dropped = `Exclude<${sent}, undefined | void>`;
+    const byHandler = toleratesAbsence ? dropped : sent;
+    return `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [Expected] ? ([Extract<Expected, undefined | void>] extends [never] ? ${byHandler} : ${dropped}) : ${sent}`;
+  };
+  if (absentBodyAllowed) push(`type SentBody = ${sentBodyType('Sent')};`);
+  const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
+  push(`declare const sent: ${sentBody};`);
 
   let assignmentLine: number;
   if (spec.protocol === 'graphql') {
@@ -458,7 +488,7 @@ export function buildProbe(
     // that name — and there the declared name no longer describes what travels.
     for (const line of jsonWireDeclarations('')) push(line);
     push(
-      `type WireSent = [Sent] extends [Expected] ? Sent : (JsonWireSame<JsonWire<Sent>, Sent> extends true ? Sent : JsonWire<Sent>);`
+      `type WireSent = [${sentBody}] extends [Expected] ? ${sentBody} : (JsonWireSame<JsonWire<${sentBody}>, ${sentBody}> extends true ? ${sentBody} : JsonWire<${sentBody}>);`
     );
     push(`declare const sentWire: WireSent;`);
     wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
@@ -492,8 +522,13 @@ export function buildProbe(
     push(`type _G_unwidened_any = Assert<Not<IsAny<${local}>>>;`);
     push(`type _G_unwidened_unknown = Assert<Not<IsUnknown<${local}>>>;`);
     push(`type _G_unwidened_never = Assert<Not<IsNever<${local}>>>;`);
+    let unwidenedBody = local;
+    if (absentBodyAllowed) {
+      push(`type SentUnwidenedBody = ${sentBodyType(local)};`);
+      unwidenedBody = 'SentUnwidenedBody';
+    }
     push(
-      `type WireSentUnwidened = [${local}] extends [Expected] ? ${local} : (JsonWireSame<JsonWire<${local}>, ${local}> extends true ? ${local} : JsonWire<${local}>);`
+      `type WireSentUnwidened = [${unwidenedBody}] extends [Expected] ? ${unwidenedBody} : (JsonWireSame<JsonWire<${unwidenedBody}>, ${unwidenedBody}> extends true ? ${unwidenedBody} : JsonWire<${unwidenedBody}>);`
     );
     push(`declare const sentWireUnwidened: WireSentUnwidened;`);
     push(`const expectedWireUnwidened: Expected = sentWireUnwidened;`);
