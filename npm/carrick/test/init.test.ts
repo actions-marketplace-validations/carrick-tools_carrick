@@ -1495,7 +1495,7 @@ test("a first init writes the proposal, its ignore file, the hook settings, the 
       result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
       [
         "◇ Set up in project payments: repo",
-        "▲ Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.",
+        "▲ Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.",
         "",
         "Next: paste this into a new agent session",
         `  ${scaffoldFor("acme/api")}`,

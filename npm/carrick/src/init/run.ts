@@ -1548,7 +1548,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // know, and a hook file for a host nobody runs costs nothing.
   try {
     if (writeCodexHooks(workspace, command.command) === "written") {
-      todo.push("Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.");
+      todo.push("Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.");
     }
   } catch (error) {
     out.refuse(
