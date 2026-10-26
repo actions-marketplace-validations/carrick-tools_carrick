@@ -4830,6 +4830,7 @@ impl FileOrchestrator {
                     };
                     infer_requests.push(InferRequestItem {
                         member: None,
+                        result: None,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -4854,6 +4855,7 @@ impl FileOrchestrator {
                     }
                     infer_requests.push(InferRequestItem {
                         member: None,
+                        result: None,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -4870,6 +4872,7 @@ impl FileOrchestrator {
                 InferLocator::Line => {
                     infer_requests.push(InferRequestItem {
                         member: None,
+                        result: None,
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
@@ -5890,6 +5893,7 @@ impl FileOrchestrator {
                 let request = match role {
                     ManifestRole::Consumer => InferRequestItem {
                         member: None,
+                        result: None,
                         file_path: file_abs,
                         line_number: line,
                         span_start: None,
@@ -5910,6 +5914,7 @@ impl FileOrchestrator {
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
+                        result: None,
                         // Anchor the containing-function search on the payload
                         // binding's own line when present (the handler may start
                         // lines away from the subscribe call the op is keyed on).
@@ -6170,6 +6175,7 @@ impl FileOrchestrator {
             };
             requests.push(InferRequestItem {
                 member: None,
+                result: None,
                 file_path: file.clone(),
                 line_number: declared.line,
                 span_start: Some(crate::utils::sidecar_position(content, declared.lo)),
@@ -6339,6 +6345,7 @@ impl FileOrchestrator {
             if seen.insert(dedup_key) {
                 requests.push(InferRequestItem {
                     member: None,
+                    result: None,
                     file_path: anchor_file,
                     line_number: anchor_line,
                     span_start,
