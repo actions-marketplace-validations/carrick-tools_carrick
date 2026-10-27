@@ -622,7 +622,12 @@ export interface CheckResult {
    * missing (soundness over availability — pinned design, Check step 2). */
   isolation: 'pnpm' | 'unavailable';
   install_ok: boolean;
+  /** The judge compiler's version. */
   ts_version: string;
+  /** Which compiler judged, in words: `TypeScript 7.0.2 (native)`, or
+   * `TypeScript 6.0.2 (native compiler not installed)` where the host's
+   * native executable is missing. */
+  judge: string;
   /** Verdicts, sorted by pair_id for byte-stable output. */
   verdicts: CheckVerdict[];
   degraded_services: DegradedService[];
@@ -656,9 +661,9 @@ export interface CheckOptions {
    * `node_modules/.bin/pnpm` at or above this bundle — the sidecar's own in a
    * checkout, the install root's in an npm install. */
   pnpmPath?: string;
-  /** Absolute path to the tsc CLI. Defaults to the nearest
-   * `node_modules/.bin/tsc` at or above this bundle. Tests inject a stand-in
-   * to pin the abnormal-termination path. */
+  /** Absolute path to the tsc CLI. Defaults to the judge compiler, TypeScript
+   * 7's native tsc (`judgeTscPath`). Tests inject a stand-in to pin the
+   * abnormal-termination path. */
   tscPath?: string;
   /** Delete the scratch workspace before returning (default true). Tests that
    * inspect the assembled tree pass false. */

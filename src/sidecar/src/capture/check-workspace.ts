@@ -349,7 +349,7 @@ export const CHECKER_TSCONFIG =
         types: [],
         noEmit: true,
         forceConsistentCasingInFileNames: true,
-        esModuleInterop: false,
+        esModuleInterop: true,
         allowSyntheticDefaultImports: true,
         resolveJsonModule: true,
         alwaysStrict: true,
