@@ -2760,6 +2760,249 @@ fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
     assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
 }
 
+/// A `check --changed` stopped by SIGTERM takes its re-scan and the re-scan's
+/// type sidecar with it, even a sidecar too busy to hear a signal. Before,
+/// only the check ended: the re-scan was a process of its own that nothing
+/// told, and it ran on with its sidecar.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_signalled_check_ends_its_re_scan_and_the_re_scans_sidecar() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    // Busy as the real one is while it builds a program: its handlers never
+    // run, because its event loop never turns.
+    let sidecar_dir = root.join(".busy-sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar_dir).expect("a directory for the sidecar");
+    let pid_file = root.join(".busy-sidecar.pid");
+    std::fs::write(
+        sidecar_dir.join("index.js"),
+        format!(
+            "require('fs').writeFileSync({:?}, String(process.pid));\n\
+             process.on('SIGTERM', () => process.exit(0));\n\
+             process.stdin.on('end', () => process.exit(0));\n\
+             for (;;) {{}}\n",
+            pid_file.display().to_string()
+        ),
+    )
+    .expect("write the busy sidecar");
+
+    let mut check = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_SIDECAR_DIR", root.join(".busy-sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the check");
+
+    let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) == 0 };
+    let started = Instant::now();
+    let sidecar = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            let _ = check.kill();
+            panic!("the check's re-scan started no sidecar in 120s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let listed = Command::new("pgrep")
+        .args(["-P", &check.id().to_string(), "-x", "carrick"])
+        .output()
+        .expect("pgrep lists a process's children");
+    let rescan: libc::pid_t = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse().ok())
+        .expect("the check is waiting on its re-scan");
+
+    // SAFETY: a signal to a child this test spawned and has not reaped.
+    assert_eq!(
+        unsafe { libc::kill(check.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let ended = Instant::now();
+    let status = loop {
+        if let Some(status) = check.try_wait().expect("poll the check") {
+            break status;
+        }
+        assert!(
+            ended.elapsed() < Duration::from_secs(60),
+            "the signalled check was still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    for (pid, what) in [(rescan, "the re-scan"), (sidecar, "the busy sidecar")] {
+        let start = Instant::now();
+        while alive(pid) {
+            if start.elapsed() > Duration::from_secs(15) {
+                // SAFETY: descendants this test started, left running by the
+                // failure it is about to report.
+                unsafe {
+                    libc::kill(rescan, libc::SIGKILL);
+                    libc::kill(sidecar, libc::SIGKILL);
+                }
+                panic!("{what} was still running 15s after the check ended ({status:?})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // It ended by passing the signal on, and says which signal it was.
+    assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
+/// How long the silence-watching caller below lets a command say nothing
+/// before killing it, as an agent harness does with a command it reads as
+/// hung. Longer than the check's heartbeat, shorter than the stall the stub
+/// sidecar makes.
+const SILENCE_LIMIT: Duration = Duration::from_secs(20);
+
+/// A check that works for longer than a caller will wait in silence keeps
+/// saying so on stderr, and its answer on stdout stays the answer alone.
+///
+/// The type sidecar here never becomes ready, so the re-scan and the join
+/// each wait out the readiness budget: a stretch with no output that is
+/// longer than [`SILENCE_LIMIT`], as a large repo's re-scan is. The caller is
+/// what an agent harness does: it kills the command after that long without a
+/// byte on either stream. Before the narration, the check printed nothing
+/// until its answer, and this caller killed it.
+#[test]
+#[serial]
+fn check_changed_keeps_talking_to_a_caller_that_kills_silent_commands() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let sidecar = root.join(".stalled-sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    std::fs::write(
+        sidecar.join("index.js"),
+        "process.stdin.on('end', () => process.exit(0));\nprocess.stdin.resume();\n",
+    )
+    .expect("write the sidecar that never answers");
+
+    let mut child = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", ".", "--json"])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_SIDECAR_DIR", root.join(".stalled-sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "30")
+        // The stalled sidecar types nothing; the run is about the wait.
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the check");
+
+    // Each stream read on its own thread; every chunk is a sign of life.
+    let (heard, hearing) = mpsc::channel::<(bool, Vec<u8>)>();
+    let readers: Vec<_> = [
+        (
+            true,
+            Box::new(child.stdout.take().expect("stdout")) as Box<dyn Read + Send>,
+        ),
+        (false, Box::new(child.stderr.take().expect("stderr"))),
+    ]
+    .into_iter()
+    .map(|(is_stdout, mut stream)| {
+        let heard = heard.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 || heard.send((is_stdout, buffer[..read].to_vec())).is_err() {
+                    break;
+                }
+            }
+        })
+    })
+    .collect();
+    drop(heard);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let started = Instant::now();
+    let mut longest_silence = Duration::ZERO;
+    let mut last = Instant::now();
+    loop {
+        match hearing.recv_timeout(Duration::from_millis(100)) {
+            Ok((is_stdout, bytes)) => {
+                longest_silence = longest_silence.max(last.elapsed());
+                last = Instant::now();
+                if is_stdout {
+                    stdout.extend(bytes);
+                } else {
+                    stderr.extend(bytes);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last.elapsed() >= SILENCE_LIMIT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "killed as hung: {:.0}s without output, {:.0}s in; it had said:\n{}",
+                        last.elapsed().as_secs_f64(),
+                        started.elapsed().as_secs_f64(),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            }
+        }
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let status = child.wait().expect("wait for the check");
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let stdout = String::from_utf8(stdout).expect("stdout is UTF-8");
+
+    eprintln!("what the check said while it worked:\n{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is the JSON answer alone ({e}):\n{stdout}"));
+    assert_eq!(json["schema"], "carrick.check-changed/0", "{json:#}");
+    assert!(
+        status.code().is_some(),
+        "the check ended on its own: {status:?}"
+    );
+    assert!(
+        stderr.contains("carrick check: re-reading inventory-svc..."),
+        "it named the repo it re-read:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("carrick check: still "),
+        "and said it was still working through the stall:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("carrick check: comparing routes and calls across 2 services..."),
+        "and named the join:\n{stderr}\n{stdout}"
+    );
+    assert!(
+        longest_silence < SILENCE_LIMIT,
+        "never silent for the limit: {longest_silence:?}"
+    );
+}
+
 /// The same new call through a base set at run time: it could be a service
 /// of this workspace or an outside API, so it is printed as unconfirmed and
 /// does not fail the run.
@@ -2812,7 +3055,7 @@ fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
 
     let (code, quiet) = check_changed(root, false);
     assert!(
-        quiet.contains("plus 1 unconfirmed, run with --all to list them"),
+        quiet.contains("plus 1 already in the index, run with --all to list them"),
         "counted, not listed:\n{quiet}"
     );
     assert_eq!(code, Some(0), "{quiet}");
@@ -2880,6 +3123,85 @@ fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route(
                 && line.contains("  no route  ")
                 && line.contains("the index matched this call")),
         "the consumer the deletion broke is named:\n{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// Marks the workspace's index as written by an older scanner, as an upgrade
+/// leaves it: same rows, another version.
+fn as_written_by_an_older_scanner(root: &Path) {
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+            .expect("the index is JSON");
+    index["scanner_version"] = serde_json::json!("0.0.1");
+    std::fs::write(&path, index.to_string()).expect("write the index");
+}
+
+/// carrick#2911: an index an older scanner wrote holds the rows that scanner
+/// read. A row this build reads and that one did not looks new, so a check
+/// against it cannot tell a new problem from an upgrade: it does not fail,
+/// says why in one line, and exits 2.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_on_a_row_an_older_scanners_index_cannot_date() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the call is listed, not hidden:\n{text}"));
+    assert!(
+        problem.contains("[not checked: the index is from another scanner build]"),
+        "marked as not checked:\n{text}"
+    );
+    assert!(
+        text.contains("written by carrick 0.0.1")
+            && text.contains("Run `carrick refresh` on the main branch"),
+        "one line says which build wrote the index and what to run:\n{text}"
+    );
+    assert_eq!(code, Some(2), "not a pass and not a failure:\n{text}");
+
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(json["failing"], 0, "{json:#}");
+    assert_eq!(json["index_scanner"], "0.0.1", "{json:#}");
+    assert!(
+        json["problems"].as_array().is_some_and(|problems| problems
+            .iter()
+            .any(|p| p["other_build"] == true && p["fails"] == false)),
+        "{json:#}"
+    );
+}
+
+/// carrick#2911: what the older index did read still decides. It matched this
+/// call to a route, and the work deleted the route: that fails whichever
+/// build wrote the index.
+#[test]
+#[serial]
+fn check_changed_still_fails_a_call_an_older_scanners_index_matched() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+    std::fs::remove_file(root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts"))
+        .expect("delete the route");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")
+                && line.contains("the index matched this call")
+                && !line.contains("not checked")),
+        "the consumer the deletion broke still fails:\n{text}"
     );
     assert_eq!(code, Some(1), "{text}");
 }
