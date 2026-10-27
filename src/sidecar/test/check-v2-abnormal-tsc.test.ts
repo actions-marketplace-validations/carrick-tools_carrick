@@ -25,7 +25,12 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runCheck } from '../src/capture/index.js';
-import { carriesHeapLimitLine, childHeap } from '../src/capture/check.js';
+import {
+  carriesHeapLimitLine,
+  childHeap,
+  judgeTscPath,
+  resolveVendored,
+} from '../src/capture/check.js';
 import { buildProbe, decisiveAssignmentLine } from '../src/capture/check-probe.js';
 import type { CheckPairSpec, CheckStubInput } from '../src/capture/api.js';
 
@@ -238,6 +243,95 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     const verdictB = result.verdicts.find((v) => v.pair_key === 'pair-b')!;
     assert.strictEqual(verdictB.bucket, 'compatible', JSON.stringify(verdictB));
   });
+
+  // TypeScript 7 refuses a tsconfig option it removed, prints the refusal at a
+  // position in the tsconfig, and checks nothing. That diagnostic belongs to no
+  // pair, so before this guard every pair read compatible.
+  it('a compiler that refuses its configuration clears no pair', async () => {
+    const tscPath = fakeTsc(
+      'tsc-config',
+      "echo \"packages/carrick-probes/tsconfig.json(19,24): error TS5108: Option 'esModuleInterop=false' has been removed. Please remove it from your configuration.\"; exit 1"
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, false);
+    assert.ok(result.verdicts.length > 0);
+    for (const v of result.verdicts) {
+      assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+      assert.strictEqual(v.gate, 'tsc:abnormal-termination');
+      assert.match(v.diagnostic ?? '', /TS5108/);
+    }
+  });
+
+  // The same with the real compilers: a tsconfig carrying an option neither
+  // knows. TypeScript 6 reports it and checks the probes anyway; neither run
+  // is a check of the configuration the judge wrote.
+  for (const [label, real] of [
+    ['TypeScript 6', () => resolveVendored(path.join('typescript', 'bin', 'tsc'))],
+    ['the native judge', () => judgeTscPath()],
+  ] as const) {
+    it(`${label}, handed a tsconfig it rejects, clears no pair`, async () => {
+      const tscPath = fakeTsc(
+        `tsc-bad-config-${label.replace(/\W+/g, '-')}`,
+        [
+          'cfg=packages/carrick-probes/tsconfig.json',
+          'sed \'s/"compilerOptions": {/"compilerOptions": { "notARealOption": true,/\' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"',
+          `exec "${real()}" "$@"`,
+        ].join('\n')
+      );
+      const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+      assert.strictEqual(result.success, false, JSON.stringify(result.verdicts));
+      for (const v of result.verdicts) {
+        assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+        assert.strictEqual(v.gate, 'tsc:abnormal-termination');
+        assert.match(v.diagnostic ?? '', /TS5023/);
+      }
+    });
+  }
+
+  it('an option code in a stub source file poisons that stub, not the run', async () => {
+    const plan = buildProbe(PAIRS[0], (s) => `@carrick/${s}`);
+    const probeFile = `packages/carrick-probes/probes/${plan.fileName}`;
+    const tscPath = fakeTsc(
+      'tsc-stub-ts5097',
+      [
+        "echo \"packages/orders/types/surface.d.ts(1,1): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.\"",
+        `echo "${probeFile}(${decisiveAssignmentLine(plan)},7): error TS2322: Type 'A' is not assignable to type 'B'."`,
+        'exit 1',
+      ].join('\n')
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    for (const v of result.verdicts) {
+      assert.notStrictEqual(v.gate, 'tsc:abnormal-termination', JSON.stringify(v));
+    }
+    // Line 1 of the surface is pair-a's alias: the poison stays on it.
+    const a = result.verdicts.find((v) => v.pair_key === 'pair-a')!;
+    assert.strictEqual(a.gate, 'poison:producer', JSON.stringify(a));
+  });
+
+  it('the native compiler out of memory is a heap death, and says why', async () => {
+    const tscPath = fakeTsc(
+      'tsc-go-oom',
+      "echo 'fatal error: runtime: out of memory' >&2; exit 2"
+    );
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.compiler_end?.heap_limit, true);
+    assert.strictEqual(result.compiler_end?.exit_code, 2);
+    for (const v of result.verdicts) {
+      assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+      assert.match(v.diagnostic ?? '', /ran out of memory/);
+    }
+  });
+
+  it('a host with no native compiler is judged by TypeScript 6, and says so', async () => {
+    const tscPath = judgeTscPath(undefined, 'aix', 'ppc64');
+    const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    assert.strictEqual(result.ts_version, '6.0.2');
+    assert.strictEqual(result.judge, 'TypeScript 6.0.2 (native compiler not installed)');
+    for (const v of result.verdicts) assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+  });
 });
 
 describe('check_v2: heap-death evidence and the compiler heap cap', () => {
@@ -289,5 +383,25 @@ describe('check_v2: heap-death evidence and the compiler heap cap', () => {
       nodeOptions: '--enable-source-maps',
       heapCapMb: null,
     });
+  });
+
+  it("the judge runs the host's native executable where the walk finds it, else TypeScript 6", () => {
+    const layout = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-judge-tsc-'));
+    try {
+      const sidecar = path.join(layout, 'node_modules', 'carrick', 'sidecar');
+      fs.mkdirSync(sidecar, { recursive: true });
+      const six = path.join(layout, 'node_modules', 'typescript', 'bin', 'tsc');
+      fs.mkdirSync(path.dirname(six), { recursive: true });
+      fs.writeFileSync(six, '');
+      assert.strictEqual(judgeTscPath(sidecar, 'linux', 'x64'), six);
+      const native = path.join(layout, 'node_modules', '@typescript', 'typescript-linux-x64', 'lib', 'tsc');
+      fs.mkdirSync(path.dirname(native), { recursive: true });
+      fs.writeFileSync(native, '');
+      assert.strictEqual(judgeTscPath(sidecar, 'linux', 'x64'), native);
+      assert.strictEqual(judgeTscPath(sidecar, 'darwin', 'arm64'), six);
+      assert.strictEqual(judgeTscPath(sidecar, 'win32', 'x64'), six);
+    } finally {
+      fs.rmSync(layout, { recursive: true, force: true });
+    }
   });
 });

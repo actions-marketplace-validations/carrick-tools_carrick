@@ -545,6 +545,7 @@ fn judge(
             .find(|item| item.key == operation.key && item.line == operation.line)
     };
 
+    let strict = states_dispatch(before);
     let mut judged = Judged {
         routes: 0,
         calls: 0,
@@ -585,7 +586,7 @@ fn judge(
         // Not this work's when the index already held the same row of this
         // file with a mismatch: it was there before the change began.
         let already = indexed_rows(before, repo, &operation.file).any(|old| {
-            old.key == operation.key
+            same_operation(old, operation, strict)
                 && old
                     .verdict
                     .as_ref()
@@ -643,7 +644,7 @@ fn judge(
                 };
                 // A call in a file the work did not touch is reported only
                 // when the index matched it: the work took its route away.
-                if !is_changed(repo, &file) && !was_matched(before, repo, operation) {
+                if !is_changed(repo, &file) && !was_matched(before, strict, repo, operation) {
                     continue;
                 }
                 let source = Source::of(operation.resolution_source);
@@ -652,7 +653,7 @@ fn judge(
                 // have moved, so the key and the file decide.
                 let already = indexed_rows(before, repo, &file).any(|old| {
                     old.kind == super::read_model::ItemKind::Call
-                        && old.key == operation.key
+                        && same_operation(old, operation, strict)
                         && old.counterparts.is_empty()
                 });
                 // A base set at run time could be one of this workspace's
@@ -660,7 +661,7 @@ fn judge(
                 // expression: printed, never failing, new or not. Unless the
                 // index matched this call: a workspace route served it, so
                 // the base is the workspace's and losing it is a fact.
-                let matched = was_matched(before, repo, operation);
+                let matched = was_matched(before, strict, repo, operation);
                 let unconfirmed = unmatched.injected.iter().any(|at| at == site) && !matched;
                 let new_fact = source == Source::Fact && !already && !unconfirmed;
                 let other_build = new_fact && !same_build && !matched;
@@ -692,6 +693,30 @@ fn judge(
     judged
 }
 
+/// Whether any row of the index states a dispatch case. An index written
+/// before rows carried the case states none anywhere; one that does, states
+/// the case on every row it has one for.
+fn states_dispatch(index: &LocalIndex) -> bool {
+    index
+        .repos
+        .iter()
+        .flat_map(|repo| repo.files.values().flatten())
+        .any(|item| item.dispatch.is_some())
+}
+
+/// Whether an indexed row is the same operation as a joined one: the key
+/// (method and path, GraphQL field, socket event or topic) and the dispatch
+/// case (carrick#831), which is part of a row's identity beside it. The cases
+/// of one dispatching route are different operations, so a sibling's state
+/// says nothing about this one.
+///
+/// `strict` says the index states dispatch cases (see [`states_dispatch`]):
+/// then a row with none is a plain row. When it does not, the index predates
+/// the field, its silence is no evidence, and the key alone decides.
+fn same_operation(old: &IndexedItem, operation: &JoinedOperation, strict: bool) -> bool {
+    old.key == operation.key && (!strict || old.dispatch == operation.dispatch)
+}
+
 /// The rows the index, before this pass, held for one file of one repo.
 fn indexed_rows<'a>(
     before: &'a LocalIndex,
@@ -708,7 +733,7 @@ fn indexed_rows<'a>(
 }
 
 /// Whether the index, before this pass, matched this call to a producer.
-fn was_matched(before: &LocalIndex, repo: &str, operation: &JoinedOperation) -> bool {
+fn was_matched(before: &LocalIndex, strict: bool, repo: &str, operation: &JoinedOperation) -> bool {
     before
         .repos
         .iter()
@@ -716,7 +741,7 @@ fn was_matched(before: &LocalIndex, repo: &str, operation: &JoinedOperation) -> 
         .and_then(|indexed| indexed.files.get(&operation.file))
         .is_some_and(|items| {
             items.iter().any(|item| {
-                item.key == operation.key
+                same_operation(item, operation, strict)
                     && item.line == operation.line
                     && !item.counterparts.is_empty()
             })
@@ -1050,6 +1075,141 @@ mod tests {
             ..output
         };
         assert_eq!(failing.exit_code(), 1);
+    }
+
+    /// One service `web` in repo `web`, and a call row at `client.ts:<line>`.
+    fn call_row(line: u32, dispatch: Option<&str>, served: bool) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "call", "service": "web", "key": "http|POST|/types/check",
+            "dispatch": dispatch, "method": "POST", "path": "/types/check",
+            "line": line, "col": null, "source": "fact",
+            "resolution_source": null, "evidence": null,
+            "counterparts": if served {
+                serde_json::json!([{"role": "producer", "service": "api", "file": "h.ts", "line": 1}])
+            } else {
+                serde_json::json!([])
+            },
+            "verdict": null
+        })
+    }
+
+    fn index_of(rows: Vec<serde_json::Value>) -> LocalIndex {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "scanner_version": "0", "indexed_at": "", "repos": [{
+                "path": "/w/web", "name": "web",
+                "services": [{
+                    "name": "web", "commit": "", "indexed_at": "", "boundary": null,
+                    "routes": 0, "calls": 0
+                }],
+                "files": {"client.ts": rows}
+            }]
+        }))
+        .expect("an index")
+    }
+
+    fn dispatch_key(value: &str) -> String {
+        crate::dispatch::Dispatch {
+            location: crate::dispatch::DispatchLocation::Body,
+            field: "action".to_string(),
+            value: value.to_string(),
+        }
+        .key()
+    }
+
+    /// The judge's verdict on the one call at `client.ts:322` that reaches no
+    /// route, sending `sent`, against the rows the index held before.
+    fn judged_call(before: Vec<serde_json::Value>, sent: Option<&str>) -> Problem {
+        let before = index_of(before);
+        let sent = sent.map(dispatch_key);
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": [{
+                "role": "consumer", "service": "web", "key": "http|POST|/types/check",
+                "method": "POST", "path": "/types/check", "file": "client.ts",
+                "line": 322, "resolution_source": null, "handler": null,
+                "dispatch": sent
+            }],
+            "matches": [], "findings": [],
+            "unmatched": [{
+                "method": "POST", "path": "/types/check",
+                "call_sites": ["client.ts:322"], "injected": []
+            }],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let rebuilt = index_of(Vec::new());
+        let files: BTreeSet<String> = ["client.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &files)].into();
+        // The row's source decides whether it fails: a resolved call is a fact.
+        let mut join = join;
+        join.operations[0].resolution_source =
+            Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestSpec);
+        let judged = judge(Path::new("/w"), &before, true, &rebuilt, &join, &changed);
+        assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
+        judged.problems.into_iter().next().unwrap()
+    }
+
+    /// A dispatch case renamed in the handler and the config leaves the call
+    /// sending the old value with no route. A sibling call to the same path
+    /// was already unmatched in the index; it is not this call.
+    #[test]
+    fn a_renamed_dispatch_case_is_not_already_indexed_because_a_sibling_was() {
+        // A dispatch row elsewhere in the index: it states cases, so the
+        // dispatch-less sibling is a plain call.
+        let mut elsewhere = call_row(10, Some(&dispatch_key("other")), true);
+        elsewhere["path"] = "/other".into();
+        elsewhere["key"] = "http|POST|/other".into();
+        let before = vec![elsewhere, call_row(280, None, false)];
+        let problem = judged_call(before, Some("old-name"));
+        assert!(!problem.already_indexed, "{problem:?}");
+        assert!(problem.fails, "{problem:?}");
+    }
+
+    /// A call sending a value no case answers is a different operation from
+    /// one sending a value that is also unmatched.
+    #[test]
+    fn a_wrong_dispatch_value_is_not_already_indexed_because_another_value_was() {
+        let before = vec![call_row(280, Some(&dispatch_key("other")), false)];
+        let problem = judged_call(before, Some("wrong"));
+        assert!(!problem.already_indexed, "{problem:?}");
+        assert!(problem.fails, "{problem:?}");
+    }
+
+    /// The same case unmatched before and now is old, and a plain call is
+    /// judged as it always was.
+    #[test]
+    fn the_same_dispatch_case_or_a_plain_call_unmatched_before_is_already_indexed() {
+        let same = judged_call(
+            vec![call_row(280, Some(&dispatch_key("old-name")), false)],
+            Some("old-name"),
+        );
+        assert!(same.already_indexed && !same.fails, "{same:?}");
+        let plain = judged_call(vec![call_row(280, None, false)], None);
+        assert!(plain.already_indexed && !plain.fails, "{plain:?}");
+        // An index with no case anywhere predates the field: it still dates
+        // the same key, so an upgrade invents no new problem.
+        let old_index = judged_call(vec![call_row(280, None, false)], Some("old-name"));
+        assert!(
+            old_index.already_indexed && !old_index.fails,
+            "{old_index:?}"
+        );
+    }
+
+    /// A call the index matched under one case is not matched under another.
+    #[test]
+    fn a_call_matched_under_one_dispatch_case_was_not_matched_under_another() {
+        let before = index_of(vec![call_row(322, Some(&dispatch_key("a")), true)]);
+        let operation = |case: &str| -> JoinedOperation {
+            serde_json::from_value(serde_json::json!({
+                "role": "consumer", "service": "web", "key": "http|POST|/types/check",
+                "method": "POST", "path": "/types/check", "file": "client.ts",
+                "line": 322, "resolution_source": null, "handler": null,
+                "dispatch": dispatch_key(case)
+            }))
+            .unwrap()
+        };
+        assert!(was_matched(&before, true, "web", &operation("a")));
+        assert!(!was_matched(&before, true, "web", &operation("b")));
     }
 
     #[test]
