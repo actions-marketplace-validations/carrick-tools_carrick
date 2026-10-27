@@ -17,6 +17,7 @@
 // It exits 0 whatever happens. An edit never fails because Carrick had nothing
 // to say, could not find its binary, or timed out.
 
+import fs from "node:fs";
 import path from "node:path";
 import { check, checkEach } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
@@ -26,7 +27,8 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markTold, record, toldKey, wasTold } from "./reuse.ts";
+import { isCheckedSource } from "./check-nudge.ts";
+import { markTold, NOTED_KEY, record, toldKey, wasTold } from "./reuse.ts";
 import type { CheckResult } from "../contract.ts";
 import type { NewFunction } from "./reuse.ts";
 
@@ -56,11 +58,33 @@ type Payload = {
  * this does is put the names somewhere the Stop hook can find them.
  */
 export function newFunctions(result: CheckResult, file: string): NewFunction[] {
+  // Test, spec and story files never warrant a reuse check (carrick#2936).
+  if (!isCheckedSource(file)) return [];
   return (result.recheck?.new_functions ?? []).map((entry) => ({
     name: entry.name,
-    file: result.file ?? file,
+    // The path this hook computed, not the one the binary echoes: it is the
+    // checkout-relative path the index holds, whatever root the edit ran from.
+    file,
     indexCommit: result.index_commit ?? "",
   }));
+}
+
+/**
+ * `file` relative to the nearest checkout top at or below `root`: the nearest
+ * directory holding `.git` (a folder, or the file a linked worktree has). An
+ * edit inside a nested worktree is then keyed as the index keys it, not with
+ * the worktree's own prefix (carrick#2936). With no nested checkout it is
+ * relative to `root`, as before.
+ */
+export function checkoutRelative(root: string, file: string): string {
+  let dir = path.dirname(file);
+  while (dir !== root && path.relative(root, dir) && !path.relative(root, dir).startsWith("..")) {
+    if (fs.existsSync(path.join(dir, ".git"))) return path.relative(dir, file);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.relative(root, file);
 }
 
 /**
@@ -179,7 +203,7 @@ async function main(): Promise<void> {
       log("no answer for", relative, answers.failure ?? "");
       continue;
     }
-    found.push(...newFunctions(result, relative));
+    found.push(...newFunctions(result, checkoutRelative(choice.root, edited[index]!)));
     const key = toldKey(result, relative);
     const show = !payload.session_id || !wasTold(payload.session_id, key);
     if (show && result.uses_lines?.length) told.push(key);
@@ -188,7 +212,13 @@ async function main(): Promise<void> {
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) contexts.push(context);
   }
-  if (unchecked.length > 0) contexts.unshift(notedLine(unchecked));
+  // Said once per session: the sentence is the same on every edit, and the
+  // Stop hook asks again if the check never ran.
+  const notedAlready = payload.session_id ? wasTold(payload.session_id, NOTED_KEY) : false;
+  if (unchecked.length > 0 && !notedAlready) {
+    contexts.unshift(notedLine(unchecked));
+    told.push(NOTED_KEY);
+  }
 
   // Silent and local: the names go to a file under the user's home directory
   // and nothing about them is printed here.

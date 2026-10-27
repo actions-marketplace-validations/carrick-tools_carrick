@@ -479,10 +479,15 @@ fn rejoin_held(
     // and the local blob of every service the snapshot does not hold. It is
     // what an unchanged file replays its hosted answers from, and what the
     // change scope carries an untouched service from.
+    //
+    // Every repo's `previous` is staged on disk before the first scan starts,
+    // so the hosted snapshot and the retained blobs are not held for the
+    // minutes the children run (carrick#2948): each repo reads back only its
+    // own pair once its scan has finished.
     for (position, repo) in repos.iter().enumerate() {
         let name = repo_label(repo);
         let mut previous_data = hosted.local_blobs(repo);
-        let hosted_data = previous_data.clone();
+        write_json(&staged(generation, "hosted", position), &previous_data)?;
         let hosted_ids: std::collections::BTreeSet<String> =
             previous_data.iter().map(service_id).collect();
         let local: Vec<&crate::cloud_storage::CloudRepoData> = indexed
@@ -495,12 +500,14 @@ fn rejoin_held(
                 .filter(|blob| !hosted_ids.contains(&service_id(blob)))
                 .map(|blob| (*blob).clone()),
         );
-        let previous = generation.join(format!("previous-{position}.json"));
-        std::fs::write(
-            &previous,
-            serde_json::to_vec(&previous_data).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        write_json(&staged(generation, "previous", position), &previous_data)?;
+    }
+    drop(hosted);
+    drop(indexed);
+
+    for (position, repo) in repos.iter().enumerate() {
+        let name = repo_label(repo);
+        let previous = staged(generation, "previous", position);
         let scan_dir = generation.join(format!("scan-{position}"));
         let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
         scan.env(JUDGE_ANSWERS_ENV, &judged);
@@ -512,6 +519,8 @@ fn rejoin_held(
         }
         bounded(scan, "re-scan", deadline, narrator)?;
         let fresh = read_blobs(&scan_dir)?;
+        let hosted_data = read_staged(&staged(generation, "hosted", position))?;
+        let previous_data = read_staged(&previous)?;
         let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
             services.insert(service_id(blob));
@@ -654,6 +663,21 @@ fn states_a_type_verdict(item: &IndexedItem) -> bool {
     item.verdict
         .as_ref()
         .is_some_and(|verdict| verdict.state != "not_checked")
+}
+
+/// Where repo `position`'s staged `kind` list ("previous" or "hosted") waits.
+fn staged(generation: &Path, kind: &str, position: usize) -> std::path::PathBuf {
+    generation.join(format!("{kind}-{position}.json"))
+}
+
+fn write_json(path: &Path, blobs: &[crate::cloud_storage::CloudRepoData]) -> Result<(), String> {
+    std::fs::write(path, serde_json::to_vec(blobs).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn read_staged(path: &Path) -> Result<Vec<crate::cloud_storage::CloudRepoData>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn write_blob(path: &Path, blob: &crate::cloud_storage::CloudRepoData) -> Result<(), String> {
@@ -805,7 +829,40 @@ struct Narration {
     repo: String,
     /// The service the last count was about, and its place.
     service: Option<(String, usize)>,
+    /// The services of this phase that have reported and not finished, by
+    /// their place, with the total they are among.
+    active: std::collections::BTreeMap<usize, String>,
+    active_total: usize,
     said_at: Option<Instant>,
+}
+
+impl Narration {
+    /// What the pass is at, for the still-working line: every service that
+    /// has reported and not finished when several run side by side, so the
+    /// line never names a service that is long done.
+    fn still_doing(&self) -> String {
+        if let (true, Some((index, name))) = (self.active_total > 1, self.active.first_key_value())
+            && self.active.len() == 1
+        {
+            return format!("re-reading {name} ({index}/{})", self.active_total);
+        }
+        if self.active.len() < 2 {
+            return self.doing.clone();
+        }
+        let names: Vec<&str> = self.active.values().map(String::as_str).collect();
+        let shown = names[..names.len().min(4)].join(", ");
+        let more = names.len().saturating_sub(4);
+        let tail = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        format!(
+            "re-reading {} of {} services: {shown}{tail}",
+            names.len(),
+            self.active_total
+        )
+    }
 }
 
 impl Narrator {
@@ -837,6 +894,7 @@ impl Narrator {
             let mut state = self.state.borrow_mut();
             state.doing = doing.clone();
             state.service = None;
+            state.active.clear();
         }
         self.say(now, &format!("{doing}..."));
     }
@@ -873,6 +931,14 @@ impl Narrator {
             let fresh = state.service != place;
             state.service = place;
             state.doing = doing.clone();
+            state.active_total = update.service_total;
+            if update.total > 0 && update.done >= update.total {
+                state.active.remove(&update.service_index);
+            } else {
+                state
+                    .active
+                    .insert(update.service_index, update.service.clone());
+            }
             let due = state
                 .said_at
                 .is_none_or(|said| now.duration_since(said) >= NARRATION_GAP);
@@ -894,7 +960,7 @@ impl Narrator {
             let due = state
                 .said_at
                 .is_none_or(|said| now.duration_since(said) >= NARRATION_HEARTBEAT);
-            (state.doing.clone(), due)
+            (state.still_doing(), due)
         };
         if due && !doing.is_empty() {
             let seconds = now.duration_since(self.started).as_secs();
@@ -1079,6 +1145,35 @@ mod tests {
                 "carrick check: re-reading orders (1/2): 300 of 400 files...",
                 "carrick check: re-reading billing (2/2): 1 of 400 files...",
                 "carrick check: comparing routes and calls across 5 services...",
+            ]
+        );
+    }
+
+    /// Services re-read side by side report in turn; the still-working line
+    /// names the ones that have not finished, not the first one to report.
+    #[test]
+    fn the_still_line_names_the_services_in_progress() {
+        let said = Said::default();
+        let start = Instant::now();
+        let narrator = Narrator::new(start, Box::new(said.clone()));
+        narrator.repo(start, "api", 1, 1);
+        narrator.update(start, &files("a", 1, 4, 5));
+        narrator.update(start, &files("b", 2, 4, 5));
+        narrator.update(start, &files("c", 3, 4, 5));
+        narrator.update(start, &files("a", 1, 4, 400));
+        narrator.quiet(start + Duration::from_secs(10));
+        narrator.update(start + Duration::from_secs(11), &files("b", 2, 4, 400));
+        narrator.quiet(start + Duration::from_secs(21));
+        let still: Vec<String> = said
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains("still"))
+            .collect();
+        assert_eq!(
+            still,
+            vec![
+                "carrick check: still re-reading 2 of 4 services: b, c (10s so far)...",
+                "carrick check: still re-reading c (3/4) (21s so far)...",
             ]
         );
     }

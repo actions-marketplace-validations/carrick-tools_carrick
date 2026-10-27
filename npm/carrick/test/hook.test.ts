@@ -372,7 +372,8 @@ test("the stop hook names a task's new functions to the model, once", async (t) 
   assert.equal(parsed.continue, undefined);
   assert.equal(parsed.systemMessage, undefined);
   assert.match(parsed.hookSpecificOutput.additionalContext, /slugify/);
-  assert.match(parsed.hookSpecificOutput.additionalContext, /carrick-reuse/);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /^Carrick: this task added 2 new functions/);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /find_similar/);
 
   // A task is several stops. The second one says nothing about the same set.
   const again = await runHook("stop.ts", {
@@ -407,6 +408,67 @@ test("the stop hook is silent with nothing recorded, no session, or the channel 
     env: fakeEnv({ HOME: home, CARRICK_CHANNEL: "off" }),
   });
   assert.equal(off.stdout, "");
+});
+
+function recordedFiles(home: string, session: string): string[] {
+  return sessionRecord(home, session).found.map((entry) => (entry as { file: string }).file);
+}
+
+async function editAndRecord(
+  t: { after: (fn: () => void) => void },
+  place: (workspace: ReturnType<typeof makeWorkspace>) => string,
+  session: string,
+): Promise<string[]> {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const file = place(workspace);
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), tool_input: { file_path: file }, session_id: session },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json") }),
+  });
+  try {
+    return recordedFiles(home, session);
+  } catch {
+    return [];
+  }
+}
+
+function touch(file: string): string {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "export const x = 1;\n");
+  return file;
+}
+
+test("an edit to a test file records nothing (carrick#2936)", async (t) => {
+  const recorded = await editAndRecord(
+    t,
+    (w) => touch(path.join(w.service, "src", "a.test.ts")),
+    "sess-test-file",
+  );
+  assert.deepEqual(recorded, []);
+});
+
+test("an edit inside a nested worktree records the checkout-relative path (carrick#2936)", async (t) => {
+  const recorded = await editAndRecord(
+    t,
+    (w) => {
+      const tree = path.join(w.root, ".claude", "worktrees", "b-x");
+      fs.mkdirSync(tree, { recursive: true });
+      fs.writeFileSync(path.join(tree, ".git"), "gitdir: /elsewhere/.git/worktrees/b-x\n");
+      return touch(path.join(tree, "npm", "x", "src", "y.ts"));
+    },
+    "sess-nested",
+  );
+  assert.deepEqual(recorded, ["npm/x/src/y.ts", "npm/x/src/y.ts"]);
+});
+
+test("an ordinary edit still records its path under the root", async (t) => {
+  const recorded = await editAndRecord(t, (w) => w.file, "sess-plain");
+  assert.deepEqual(recorded, [
+    "user-service/src/routes/users.ts",
+    "user-service/src/routes/users.ts",
+  ]);
 });
 
 test("an install where the language server delivers still records for the stop hook", async (t) => {
@@ -496,7 +558,9 @@ test("a Codex patch is re-checked in one call, and the deleted file is not asked
   assert.equal(asked.includes("notes/README.md"), false);
 
   // Recorded exactly as an Edit's new functions are, and still silent about it.
-  assert.equal(sessionRecord(home, "codex-1").found.length, 2);
+  // Two files, each answered with the fixture's two functions under its own
+  // path (the fixture's echoed `file` no longer collapses them).
+  assert.equal(sessionRecord(home, "codex-1").found.length, 4);
 });
 
 test("a three-file patch is one binary call, and every file gets its answer", async (t) => {
@@ -535,11 +599,11 @@ test("a three-file patch is one binary call, and every file gets its answer", as
   // the patch names them, rather than the same sentence three times.
   assert.equal(
     contextOf(run.stdout),
-    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish.",
+    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).",
   );
 });
 
-test("a repo whose re-check is known not to fit gets one pointer line per edit and still records", async (t) => {
+test("a repo whose re-check is known not to fit gets one pointer line per session and still records", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
@@ -568,9 +632,10 @@ test("a repo whose re-check is known not to fit gets one pointer line per edit a
   // The index's verdicts describe the file before the edit, so none is
   // printed: one line that sends the reader to the command that answers.
   const pointer =
-    "Carrick noted the edit to user-service/src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish.";
+    "Carrick noted the edit to user-service/src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).";
   assert.equal(first, pointer);
-  assert.equal(second, pointer);
+  // Said once per session: the second edit's line would be the same sentence.
+  assert.equal(second, "");
   // The new function is recorded on every edit, the skipped re-scan or not.
   assert.deepEqual(
     sessionRecord(home, "sess-km").found.map((entry) => (entry as { name: string }).name),
@@ -613,7 +678,7 @@ test("the Codex hook names the set on the next prompt, once", async (t) => {
   assert.equal(parsed.continue, undefined);
   assert.equal(parsed.systemMessage, undefined);
   assert.match(parsed.hookSpecificOutput.additionalContext, /slugify/);
-  assert.match(parsed.hookSpecificOutput.additionalContext, /carrick-reuse/);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /find_similar/);
 
   // The prompt after it says nothing: the set was marked when it was spoken.
   const again = await runHook("user-prompt.ts", {
@@ -638,6 +703,7 @@ test("one session is nudged once across both hosts, whichever speaks first", asy
     env: fakeEnv({ HOME: home }),
   });
   assert.match(stop.stdout, /slugify/);
+  assert.match(stop.stdout, /find_similar/);
 
   // Both hosts drain the same store through the same function, so a set one has
   // spoken is not waiting for the other.
