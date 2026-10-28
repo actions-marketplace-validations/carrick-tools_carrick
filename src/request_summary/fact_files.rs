@@ -358,6 +358,7 @@ mod tests {
             span_start: 5,
             span_end: 9,
             new: false,
+            scope: None,
         }
     }
 
