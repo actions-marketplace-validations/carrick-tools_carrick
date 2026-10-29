@@ -3499,13 +3499,28 @@ fn enforce_payload_size_limit(data: &mut CloudRepoData, staging_available: bool)
 ///
 /// Compared against the working tree, not HEAD: a file edited and not yet
 /// committed is changed here whatever `git diff <base> HEAD` says, and a file
-/// git does not track is never unchanged (carrick#1079). `None` is "git could
-/// not answer", and the caller falls back to a full analysis.
-fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>> {
-    let reason = match crate::git_state::unchanged_since(repo_path, base_commit) {
-        Ok(paths) => return Some(paths),
+/// git does not track is never unchanged (carrick#1079). `Err` is "git could
+/// not answer", with its reason, and the caller falls back to a full analysis.
+///
+/// A local no-model run whose clone lacks `base_commit` (a PR squash-merged on
+/// GitHub before the user pulled) fetches that one commit by its hash first,
+/// once per repo, and keeps it under a ref Carrick owns (carrick#3000). A
+/// failed fetch is part of the reason returned.
+fn reusable_paths(repo_path: &str, base_commit: &str) -> Result<HashSet<String>, String> {
+    let mut reason = match crate::git_state::unchanged_since(repo_path, base_commit) {
+        Ok(paths) => return Ok(paths),
         Err(reason) => reason,
     };
+    let local = crate::local_mode::no_model();
+    if local && !crate::git_state::has_commit(repo_path, base_commit) {
+        match fetch_indexed_commit_once(repo_path, base_commit) {
+            Ok(()) => match crate::git_state::unchanged_since(repo_path, base_commit) {
+                Ok(paths) => return Ok(paths),
+                Err(again) => reason = again,
+            },
+            Err(why) => reason = format!("{reason}; fetching it from origin failed: {why}"),
+        }
+    }
     // Surface this at warn level with the cause: a shallow clone
     // (actions/checkout defaults to fetch-depth: 1) silently forces a full
     // re-analysis — including its full LLM cost — on every run.
@@ -3518,7 +3533,7 @@ fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>>
         .output()
         .ok()
         .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
-    if is_shallow {
+    if is_shallow && !local {
         warn!(
             "Incremental mode unavailable: this is a shallow clone, so the previous \
              scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
@@ -3531,7 +3546,51 @@ fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>>
             base_commit, reason
         );
     }
-    None
+    Err(reason)
+}
+
+/// [`crate::git_state::fetch_indexed_commit`], asked once per repo and commit
+/// in this process: a repo with several services must not wait out the same
+/// failed fetch for each of them.
+fn fetch_indexed_commit_once(repo_path: &str, commit: &str) -> Result<(), String> {
+    type Tried = Vec<(String, String, Result<(), String>)>;
+    static TRIED: std::sync::Mutex<Tried> = std::sync::Mutex::new(Vec::new());
+    let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, outcome)) = tried
+        .iter()
+        .find(|(repo, sha, _)| repo == repo_path && sha == commit)
+    {
+        return outcome.clone();
+    }
+    let outcome = crate::git_state::fetch_indexed_commit(repo_path, commit);
+    tried.push((repo_path.to_string(), commit.to_string(), outcome.clone()));
+    outcome
+}
+
+/// What the lost replay costs the user: the rows the previous generation's
+/// model answers held. `None` outside a no-model run, and when the previous
+/// generation held no answers to lose (carrick#3000).
+fn answers_unavailable(
+    prev: &CloudRepoData,
+    reason: &str,
+) -> Option<crate::boundary::ModelAnswersUnavailable> {
+    if !crate::local_mode::no_model() {
+        return None;
+    }
+    let rows: usize = prev
+        .file_results
+        .as_ref()?
+        .values()
+        .map(|file| file.endpoints.len() + file.mounts.len() + file.data_calls.len())
+        .sum();
+    (rows > 0).then(|| crate::boundary::ModelAnswersUnavailable {
+        commit: prev.commit_hash.clone(),
+        reason: crate::findings::truncate_chars(
+            &reason.split_whitespace().collect::<Vec<_>>().join(" "),
+            300,
+        ),
+        rows,
+    })
 }
 
 /// Hash file content for cache invalidation (package.json).
@@ -3743,6 +3802,10 @@ async fn analyze_current_repo_incremental(
         version_matches
     });
 
+    // Set when a no-model run could not replay the previous generation's
+    // model answers; stated on the boundary of the blob the full analysis
+    // below writes (carrick#3000).
+    let mut lost_answers = None;
     if let Some(prev) = can_use_incremental {
         let prev_commit = &prev.commit_hash;
         debug!(
@@ -3751,7 +3814,11 @@ async fn analyze_current_repo_incremental(
         );
 
         // Which files still hold the content the previous scan's commit did.
-        if let Some(unchanged) = reusable_paths(repo_path, prev_commit) {
+        let reusable = reusable_paths(repo_path, prev_commit);
+        if let Err(reason) = &reusable {
+            lost_answers = answers_unavailable(prev, reason);
+        }
+        if let Ok(unchanged) = reusable {
             // Function intents need only discovery's definitions and the
             // previous scan's hashes, so they start now and run beside
             // detection, file analysis and the graph (carrick#1065). Started
@@ -4124,6 +4191,21 @@ async fn analyze_current_repo_incremental(
                 sidecar,
                 &semantics_root,
             );
+            let results = result_index_of(
+                crate::site_questions::enabled(),
+                &request_inputs,
+                Path::new(repo_path),
+                &claims,
+                SiteContext {
+                    prior: first_discovery.as_ref(),
+                    declarations: declarations.as_ref(),
+                    siblings: &sibling_inputs,
+                    ..SiteContext::default()
+                },
+                sidecar,
+                &semantics_root,
+            );
+            let file_orchestrator = file_orchestrator.with_result_index(results);
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
                 &request_inputs,
@@ -4461,7 +4543,7 @@ async fn analyze_current_repo_incremental(
     // Discovery above already parsed every file, resolved the call edges and
     // walked the manifests; the full analysis reads the same result rather
     // than running all of it a second time (carrick#1108).
-    let analysis = analyze_current_repo(
+    let mut analysis = analyze_current_repo(
         repo_path,
         config,
         packages,
@@ -4483,6 +4565,9 @@ async fn analyze_current_repo_incremental(
         &siblings,
     )
     .await?;
+    if let Some(boundary) = analysis.data.boundary.as_mut() {
+        boundary.model_answers_unavailable = lost_answers;
+    }
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -5417,6 +5502,89 @@ fn discovered_sites(
         .collect()
 }
 
+/// The calls of `inputs` that reach a labelled export: the walk made on the
+/// store's first answer when `context` holds it and the settled answer is the
+/// same, else a walk made now and left in `walked`.
+fn discovery_of<'a>(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'a>,
+    walked: &'a mut Option<crate::request_summary::discovery::Discovery>,
+) -> &'a crate::request_summary::discovery::Discovery {
+    // A walk made without the trace is not the walk the trace asks for.
+    let prior = context
+        .prior
+        .filter(|prior| prior.exports == claims && context.declarations.is_none());
+    match prior {
+        Some(prior) => &prior.discovery,
+        None => {
+            let labels = match context.declarations {
+                Some(declarations) => {
+                    crate::request_summary::discovery::Labels::traced(claims, declarations)
+                }
+                None => crate::request_summary::discovery::Labels::of(claims),
+            };
+            walked.insert(crate::request_summary::discovery::discover_with(
+                inputs,
+                context.siblings,
+                &labels,
+                root,
+            ))
+        }
+    }
+}
+
+/// The results the store labels and the sidecar verifies (carrick#2819): one
+/// `result` check for each labelled claim whose end discovery finds, beside
+/// the member declarations' request and under the library checks' time limit.
+/// Empty unless `enabled`, the service has rows and some claim carries a
+/// result, so a scan whose store labels none walks and asks nothing more. No
+/// sidecar, or a failed request, indexes nothing.
+fn result_index_of(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'_>,
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> crate::result_shapes::ResultIndex {
+    use crate::result_shapes::{ResultIndex, result_checks};
+    let labelled = claims.iter().any(|export| {
+        export
+            .claims
+            .iter()
+            .any(|claim| claim.result_check().is_some())
+    });
+    if !enabled || !labelled || inputs.positions.is_none() {
+        return ResultIndex::default();
+    }
+    let mut walked = None;
+    let discovery = discovery_of(inputs, root, claims, context, &mut walked);
+    let ask = result_checks(claims, discovery);
+    let verdicts = match sidecar {
+        Some(sidecar) if !ask.checks.is_empty() => {
+            match sidecar.verify_library_claims(from_dir, &ask.checks) {
+                Ok(answer) => answer.verdicts,
+                Err(error) => {
+                    warn!(%error, "result shapes: the result ask failed; none indexed");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let index = ResultIndex::of(&ask, &verdicts, discovery);
+    debug!(
+        checks = index.checks,
+        not_reached = index.not_reached,
+        results = index.len(),
+        "result shapes: verified results"
+    );
+    index
+}
+
 /// The site labels the settled `claims` give, of every role the store was
 /// asked for (carrick#2436), every call discovery finds that reaches one,
 /// where each one's name is decided, and each decided site's record. Files
@@ -5427,29 +5595,8 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
-    let walked;
-    // A walk made without the trace is not the walk the trace asks for.
-    let prior = context
-        .prior
-        .filter(|prior| prior.exports == claims && context.declarations.is_none());
-    let discovery = match prior {
-        Some(prior) => &prior.discovery,
-        None => {
-            let labels = match context.declarations {
-                Some(declarations) => {
-                    crate::request_summary::discovery::Labels::traced(claims, declarations)
-                }
-                None => crate::request_summary::discovery::Labels::of(claims),
-            };
-            walked = crate::request_summary::discovery::discover_with(
-                inputs,
-                context.siblings,
-                &labels,
-                root,
-            );
-            &walked
-        }
-    };
+    let mut walked = None;
+    let discovery = discovery_of(inputs, root, claims, context, &mut walked);
     let reached_label = discovery
         .sites
         .iter()
@@ -7629,8 +7776,9 @@ fn apply_site_fold_to_manifest(
 }
 
 /// The type requests for the site rows the fold stated (carrick#2472 C3),
-/// each at its record's anchor by span: a send's payload expression, an
-/// HTTP request's result at its call, and a handler's first parameter. A
+/// each at its record's anchor by span: a send's payload expression (an
+/// HTTP request's as its request body), an HTTP request's result at its
+/// call, and a handler's first parameter. A
 /// row whose record has no such anchor asks nothing for that type; an HTTP
 /// route's handler is not asked (its request and response are read off the
 /// route, not the parameter).
@@ -7690,10 +7838,14 @@ fn site_infer_requests(
         let anchors = &row.anchors;
         match (&row.key, row.side) {
             (OperationKey::Http { path, .. }, RowSide::Call) if path.starts_with('/') => {
+                // Asked as a request body, as the payload slot asks it
+                // (`site_payloads`): the sidecar reads `JSON.stringify(x)` as
+                // `x`, where an expression reads the serialised `string`
+                // (carrick#3009).
                 if let Some(payload) = &anchors.payload_at {
                     requests.push(at(
                         payload,
-                        InferKind::Expression,
+                        InferKind::RequestBody,
                         alias(ManifestTypeKind::Request),
                         None,
                     ));
@@ -11274,6 +11426,20 @@ async fn analyze_current_repo(
         sidecar,
         &service_root,
     );
+    let results = result_index_of(
+        crate::site_questions::enabled(),
+        &request_inputs,
+        Path::new(repo_path),
+        &claims,
+        SiteContext {
+            prior: first_discovery.as_ref(),
+            declarations: declarations.as_ref(),
+            siblings: &sibling_inputs,
+            ..SiteContext::default()
+        },
+        sidecar,
+        &service_root,
+    );
     protocol_extractions.site = site_rows_of(
         crate::site_questions::enabled(),
         &request_inputs,
@@ -11403,7 +11569,7 @@ async fn analyze_current_repo(
 
     // 6. Resolve types using sidecar if available
     let agent_service = AgentService::new();
-    let file_orchestrator = FileOrchestrator::new(agent_service.clone());
+    let file_orchestrator = FileOrchestrator::new(agent_service.clone()).with_result_index(results);
 
     let extraction_config = setup.extraction_config.clone();
 
@@ -15518,9 +15684,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let (repo, _) = committed_repo(&[("app.ts", "x")]);
         let root = repo.path().to_str().unwrap();
         // A commit this clone does not hold (what a shallow clone looks like).
-        assert!(reusable_paths(root, "0000000000000000000000000000000000000000").is_none());
+        assert!(reusable_paths(root, "0000000000000000000000000000000000000000").is_err());
         // Not a commit id at all never reaches git.
-        assert!(reusable_paths(root, "--output=/tmp/x").is_none());
+        assert!(reusable_paths(root, "--output=/tmp/x").is_err());
     }
 
     #[test]
@@ -23034,6 +23200,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 trace_depth: 0,
             },
             needs_reader: false,
+            through: false,
             within: Vec::new(),
         }
     }
@@ -24041,6 +24208,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_kept_reader: 0,
             lead_on_row_line: 0,
             through_folded: Vec::new(),
+            replaced_by_fact: Vec::new(),
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
@@ -24111,7 +24279,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             })
             .collect();
         // The files are not on disk, so each span is read as ASCII: the SWC
-        // span less its base (carrick#2604).
+        // span less its base (carrick#2604). An HTTP send's payload is asked
+        // as a request body, which the sidecar reads through
+        // `JSON.stringify(x)` to `x`, as the payload slot asks it; asked as
+        // an expression it reads the serialised `string` (carrick#3009).
         assert_eq!(
             asked,
             vec![
@@ -24129,7 +24300,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ),
                 (
                     "/repo/src/client.ts",
-                    InferKind::Expression,
+                    InferKind::RequestBody,
                     Some(111),
                     None
                 ),

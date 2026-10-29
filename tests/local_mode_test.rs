@@ -3531,8 +3531,41 @@ const CARRY_ROUTES: &str = "items-api/src/routes.ts";
 /// The fixture's two repos, indexed with the model mocked to the fixture's
 /// cassettes, so the index holds the model's answers a check later replays.
 fn carry_workspace() -> tempfile::TempDir {
+    carry_workspace_with(|_| {})
+}
+
+/// [`carry_workspace`] with `prepare` run on the workspace before it is
+/// committed and indexed, so the index holds the prepared state.
+fn carry_workspace_with(prepare: impl FnOnce(&Path)) -> tempfile::TempDir {
     let workspace = workspace("edited-handler-carry", &["items-api", "items-web"]);
     let root = workspace.path();
+    prepare(root);
+    // Commit only what `prepare` changed: an empty commit on top would leave a
+    // later `commit --amend` with nothing to amend.
+    for repo in ["items-api", "items-web"] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root.join(repo))
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        if status.stdout.is_empty() {
+            continue;
+        }
+        git(&root.join(repo), &["add", "-A"]);
+        git(
+            &root.join(repo),
+            &[
+                "-c",
+                "user.email=fixture@carrick.test",
+                "-c",
+                "user.name=fixture",
+                "commit",
+                "-qm",
+                "prepared",
+            ],
+        );
+    }
     for repo in ["items-api", "items-web"] {
         std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
     }
@@ -3760,6 +3793,121 @@ fn an_edited_handler_keeps_its_route_and_is_re_judged() {
     );
 }
 
+/// The fixture's routes with a field typed through an uninstalled import added
+/// to the first handler, and to the other two when `all` is set, indexed in
+/// that state. Those rows have no usable type on the producer side before the
+/// edit and after it. The line numbers do not move: the import goes last.
+fn carry_workspace_without_types(all: bool) -> tempfile::TempDir {
+    carry_workspace_with(|root| {
+        let file = root.join(CARRY_ROUTES);
+        edit(
+            &file,
+            "return { id, connected: true };",
+            "return { id, connected: true, owner: ownerOf(id) };",
+        );
+        if all {
+            edit(
+                &file,
+                "reply.send({ id, state: 'ready' });",
+                "reply.send({ id, state: 'ready', owner: ownerOf(id) });",
+            );
+            edit(
+                &file,
+                "[{ id: '1', connected: true }]",
+                "[{ id: '1', connected: true, owner: ownerOf('1') }]",
+            );
+        }
+        let mut text = std::fs::read_to_string(&file).expect("read the routes");
+        text.push_str("import { ownerOf } from 'owners-db';\n");
+        std::fs::write(&file, text).expect("append the import");
+    })
+}
+
+fn named_lines(changed: &serde_json::Value) -> Vec<String> {
+    changed["not_type_checked"]
+        .as_array()
+        .expect("not_type_checked is a list")
+        .iter()
+        .map(|row| format!("{}:{}", row["file"], row["line"]))
+        .collect()
+}
+
+/// Every matched route in the changed file has no usable type, so a type edit
+/// on one can be neither seen nor failed. The check names the rows and exits 2
+/// instead of reading as a pass (carrick#3012).
+#[test]
+#[serial]
+fn an_edit_to_a_pair_with_no_usable_type_is_named_not_passed() {
+    let workspace = carry_workspace_without_types(true);
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "connected: true, owner",
+        "connected: 1, owner",
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(
+        code,
+        Some(2),
+        "nothing was type-checked and nothing fails:\n{changed:#}"
+    );
+    let named = named_lines(&changed);
+    assert!(
+        named.contains(&format!("\"{CARRY_ROUTES}\":4")),
+        "the edited route is named: {named:?}\n{changed:#}"
+    );
+    assert!(
+        named.contains(&format!("\"{CARRY_ROUTES}\":9")),
+        "the other typed-through-import route is named too: {named:?}\n{changed:#}"
+    );
+    assert_eq!(changed["type_checked"], 0, "{changed:#}");
+    assert_eq!(changed["failing"], 0, "{changed:#}");
+}
+
+/// A partial run exits by the rows it did judge: two routes keep a verdict, so
+/// the run passes, and the one it could not judge is still named.
+#[test]
+#[serial]
+fn a_partly_judged_file_names_the_unjudged_row_and_exits_by_the_rest() {
+    let workspace = carry_workspace_without_types(false);
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "connected: true, owner",
+        "connected: 1, owner",
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(0), "{changed:#}");
+    assert_eq!(
+        named_lines(&changed),
+        vec![format!("\"{CARRY_ROUTES}\":4")],
+        "{changed:#}"
+    );
+    assert_eq!(changed["type_checked"], 2, "{changed:#}");
+}
+
+/// The plain edit judges its pair: no row is left unjudged, and it fails.
+#[test]
+#[serial]
+fn an_edit_to_a_judged_pair_names_no_unjudged_row() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "return { id, connected: true };",
+        "return { id, connected: 1 };",
+    );
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(1), "{changed:#}");
+    assert_eq!(
+        changed["not_type_checked"],
+        serde_json::json!([]),
+        "{changed:#}"
+    );
+}
+
 /// A registration whose own line the edit replaced is not carried: nothing
 /// proves it still states the route the answer named. It is counted, with the
 /// line, and its neighbours are still carried.
@@ -3834,6 +3982,125 @@ fn a_named_handler_whose_body_changed_is_not_carried() {
             .all(|p| p["fails"] != true),
         "{changed:#}"
     );
+}
+
+/// Point every stored blob at `commit`, as an index written elsewhere would be.
+fn stored_blobs_say_commit(root: &Path, commit: &str) {
+    let dir = root.join(".carrick/repos");
+    for entry in std::fs::read_dir(&dir).expect("read the stored blobs") {
+        let path = entry.expect("dir entry").path();
+        let mut blob: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read a blob"))
+                .expect("a stored blob is JSON");
+        blob["commit_hash"] = serde_json::json!(commit);
+        std::fs::write(&path, serde_json::to_vec(&blob).expect("serialise")).expect("write");
+    }
+}
+
+/// The index was written at a commit this clone does not hold and cannot
+/// fetch: the re-scan cannot replay the model's answers, so every route only
+/// the model stated is gone. That used to exit 0 with a clean report. It is
+/// not a pass (carrick#3000).
+#[test]
+#[serial]
+fn an_index_commit_missing_from_the_clone_is_not_a_pass() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    let missing = "f".repeat(40);
+    stored_blobs_say_commit(root, &missing);
+    rename_connected(root);
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(2), "{changed:#}");
+    let said = changed["not_checked"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("fffffff") && said.contains("routes and calls are missing"),
+        "{changed:#}"
+    );
+    assert!(said.contains("git fetch origin"), "{said}");
+}
+
+/// The same index commit, held by `origin` and gone from the clone (a PR
+/// squash-merged on the host before the user pulled): the scan fetches that one
+/// commit by its hash, keeps it under a ref Carrick owns, replays the model's
+/// answers and judges the edit as it does when the commit is present.
+#[test]
+#[serial]
+fn an_index_commit_origin_holds_is_fetched_and_the_edit_judged() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    // Judged once at the indexed commit, as the test above does.
+    check_json(root, CARRY_ROUTES);
+    let api = root.join("items-api");
+    let indexed = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&api)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    // origin holds the indexed commit; the clone then loses it.
+    let origin = root.join("items-api-origin.git");
+    git(
+        root,
+        &["clone", "-q", "--bare", "items-api", "items-api-origin.git"],
+    );
+    git(
+        &api,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    let mut amend = COMMIT.to_vec();
+    amend.insert(5, "--amend");
+    amend.push("amended");
+    git(&api, &amend);
+    git(&api, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&api, &["gc", "-q", "--prune=now"]);
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&api)
+            .args(["cat-file", "-e", &format!("{indexed}^{{commit}}")])
+            .output()
+            .expect("cat-file")
+            .status
+            .success(),
+        "the clone must not hold the indexed commit"
+    );
+    rename_connected(root);
+    // The per-edit re-check first, as the test above does: the pass below
+    // reads the stubs it leaves.
+    let (code, text) = carrick_code(
+        root,
+        &[
+            "check",
+            CARRY_ROUTES,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(1), "{changed:#}");
+    assert!(changed["not_checked"].is_null(), "{changed:#}");
+    let kept = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&api)
+            .args(["rev-parse", "refs/carrick/indexed"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8");
+    assert_eq!(kept.trim(), indexed, "kept under the ref Carrick owns");
 }
 
 /// A carried answer is joined and never stored: it is keyed by this tree's

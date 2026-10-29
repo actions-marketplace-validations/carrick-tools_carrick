@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use super::row_calls::Reach;
 use super::values::ValueAt;
 use super::*;
-use crate::library_claims::{ExportClaims, applies, runtime_packages_of};
+use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_step};
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
@@ -155,6 +155,12 @@ pub struct SiteEnd {
     /// The call constructs its callee (`new m(…)`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
+    /// The scope member whose result the labelled call is made on, when its
+    /// op is claimed on that result (`instance:()>scope:at` is `at`;
+    /// carrick#1678). Only a call a verified op resolves to by its
+    /// declaration states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// One function a walk entered.
@@ -182,6 +188,12 @@ pub struct Discovery {
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
     pub counts: BTreeMap<String, usize>,
+    /// For each call recorded with no end (a stopped site or `missed_inside`),
+    /// by file and SWC span: the store keys of the packages the walk passed a
+    /// call into that the answer holds nothing for. A walk that passed one is
+    /// not final until the store answers it (carrick#2813): the fact layer
+    /// lists the call for the reader when the key is still pending.
+    pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
 }
 
 /// The labelled exports of the store's answer, by the store's package key
@@ -527,6 +539,10 @@ pub struct DeclaredOp {
     pub export: String,
     pub member: String,
     pub op: LibraryOp,
+    /// The scope member the receiver the op was asked on is the result of
+    /// (carrick#1678): the same member declared on another type is another
+    /// op.
+    pub scope: Option<String>,
 }
 
 /// The verify request the receiver trace sends: each labelled op claim whose
@@ -560,6 +576,26 @@ pub struct AskedScope {
 /// [`LibrarySite::receiver_ids`] names a site's.
 fn make_receiver(form: MakeForm, member: Option<&str>) -> String {
     super::library_sites::maker_receiver_id(form == MakeForm::New, member)
+}
+
+/// Every receiver a claim's `on` or `of` applies to among the export itself
+/// and the instances `claims`' makers build, sorted.
+pub(crate) fn claim_receivers(
+    claims: &[(String, &LibraryClaim)],
+    on: Option<ClaimOn>,
+    of: Option<&str>,
+) -> Vec<String> {
+    let mut all = vec!["export".to_string()];
+    for (_, claim) in claims {
+        if let LibraryClaim::Make { form, member, .. } = claim {
+            all.push(make_receiver(*form, member.as_deref()));
+        }
+    }
+    all.extend(of.map(str::to_string));
+    all.sort();
+    all.dedup();
+    all.retain(|receiver| applies(on, of, receiver));
+    all
 }
 
 /// The ask for the service `inputs` reads, under the store's answer
@@ -608,26 +644,16 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
             export: export.export.clone(),
             role: export.role,
             receiver: receiver.to_string(),
-            claim: claim.clone(),
+            claim: claim.without_result(),
         };
-        let mut receivers = vec!["export".to_string()];
         for (id, claim) in &claims {
-            if let LibraryClaim::Make { form, member, .. } = claim {
-                receivers.push(make_receiver(*form, member.as_deref()));
+            if matches!(claim, LibraryClaim::Make { .. }) {
                 ask.checks.push(check(id, "export", claim));
                 ask.ops.push(None);
                 ask.scopes.push(None);
             }
         }
-        // Every receiver a claim's `on` or `of` applies to.
-        let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| -> Vec<String> {
-            let mut all = receivers.clone();
-            all.extend(of.map(str::to_string));
-            all.sort();
-            all.dedup();
-            all.retain(|receiver| applies(on, of, receiver));
-            all
-        };
+        let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| claim_receivers(&claims, on, of);
         for (id, claim) in wanted {
             match claim {
                 LibraryClaim::Op {
@@ -644,6 +670,7 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                             export: export.export.clone(),
                             member: member.clone(),
                             op: *op,
+                            scope: scope_step(&receiver).map(|(_, step)| step.to_string()),
                         }));
                         ask.scopes.push(None);
                     }
@@ -853,6 +880,10 @@ struct Outcome<'a> {
     /// (one of [`Discovery::unfollowed`]'s reasons): a walk that found no
     /// site has not read everything the call runs (carrick#2613).
     missed: bool,
+    /// The store keys of every package the walk passed a call into that the
+    /// answer holds nothing for (`unanswered_package`), when that call's own
+    /// walk found nothing (carrick#2813).
+    unanswered: BTreeSet<String>,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
 }
@@ -949,6 +980,7 @@ impl<'a> Outcome<'a> {
             self.stop = other.stop;
         }
         self.missed |= other.missed;
+        self.unanswered.extend(other.unanswered);
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1044,6 +1076,59 @@ fn row_at<'a>(inputs: &'a RequestSummaryInputs, file: &Path, call: &CallIr) -> O
         .ok()
 }
 
+/// The binding `call`, written in `file`, is made on (carrick#2474 R1): the
+/// row at the object its member is read on, `ident` for a name, `member` for
+/// a member access, `call` for a call's value, and what holds it. A name is
+/// a parameter when a function of its declaring file binds that name at the
+/// line the row names. `None` for a call with no receiver. The decided
+/// sites read the receiver of a scope call the same way (carrick#1678).
+pub(super) fn receiver_at(
+    inputs: &RequestSummaryInputs,
+    file: &Path,
+    call: &CallIr,
+) -> Option<ReceiverAt> {
+    let (lo, hi, form) = call.receiver_object?;
+    let (kind, row_kind) = match form {
+        ObjectForm::Name => (ReceiverKind::Binding, Some(Kind::Ident)),
+        ObjectForm::Member => (ReceiverKind::Field, Some(Kind::Member)),
+        ObjectForm::Call => (ReceiverKind::CallResult, Some(Kind::Call)),
+        ObjectForm::Other => (ReceiverKind::Other, None),
+    };
+    let row = row_kind.and_then(|row_kind| {
+        let positions = inputs.positions.as_ref()?;
+        let ir = inputs.files.get(file)?;
+        positions
+            .lookup(file, ir.swc_start(lo), ir.swc_start(hi), row_kind)
+            .ok()
+    });
+    let parameter = form == ObjectForm::Name
+        && row.is_some_and(|row| {
+            if in_repo(row)
+                && let (Some(symbol), Some(decl_file), Some(line)) =
+                    (row.symbol(), row.decl_file(), row.decl_line())
+                && let Some(positions) = inputs.positions.as_ref()
+                && let Some(declared) = inputs.files.get(&positions.path_of(decl_file))
+            {
+                declared
+                    .declaration_lines
+                    .params
+                    .contains(&(line, symbol.to_string()))
+            } else {
+                false
+            }
+        });
+    Some(ReceiverAt {
+        symbol: row.and_then(|row| row.symbol()).map(str::to_string),
+        decl_file: row.and_then(|row| row.decl_file()).map(str::to_string),
+        decl_line: row.and_then(|row| row.decl_line()),
+        kind: if parameter {
+            ReceiverKind::Parameter
+        } else {
+            kind
+        },
+    })
+}
+
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     /// The run's other services, in declared order (carrick#2618): the walk
@@ -1132,11 +1217,19 @@ impl<'a> Walker<'a> {
         let op = (!invoke.construction)
             .then(|| {
                 claims.claims.iter().find_map(|claim| match claim {
+                    // An op claimed on what a scope member returns is read
+                    // only where a verified declaration says so
+                    // (carrick#1678), never by the member's name.
                     LibraryClaim::Op {
                         op,
                         member: claimed,
+                        of,
                         ..
-                    } if claimed.as_deref() == member => Some(*op),
+                    } if claimed.as_deref() == member
+                        && of.as_deref().is_none_or(|of| scope_step(of).is_none()) =>
+                    {
+                        Some(*op)
+                    }
                     _ => None,
                 })
             })
@@ -1152,6 +1245,7 @@ impl<'a> Walker<'a> {
             span_start: invoke.call.site.span_start,
             span_end: invoke.call.site.span_end,
             new: invoke.construction,
+            scope: None,
         }
     }
 
@@ -1160,52 +1254,9 @@ impl<'a> Walker<'a> {
         row_at(self.inputs_for(file), file, call)
     }
 
-    /// The binding `call` is made on (carrick#2474 R1): the row at the
-    /// object its member is read on, `ident` for a name, `member` for a
-    /// member access, `call` for a call's value, and what holds it. A name
-    /// is a parameter when a function of its declaring file binds that name
-    /// at the line the row names. `None` for a call with no receiver.
+    /// The binding `call` is made on ([`receiver_at`]).
     fn receiver_of(&self, file: &Path, call: &CallIr) -> Option<ReceiverAt> {
-        let (lo, hi, form) = call.receiver_object?;
-        let (kind, row_kind) = match form {
-            ObjectForm::Name => (ReceiverKind::Binding, Some(Kind::Ident)),
-            ObjectForm::Member => (ReceiverKind::Field, Some(Kind::Member)),
-            ObjectForm::Call => (ReceiverKind::CallResult, Some(Kind::Call)),
-            ObjectForm::Other => (ReceiverKind::Other, None),
-        };
-        let row = row_kind.and_then(|row_kind| {
-            let positions = self.inputs.positions.as_ref()?;
-            let ir = self.inputs.files.get(file)?;
-            positions
-                .lookup(file, ir.swc_start(lo), ir.swc_start(hi), row_kind)
-                .ok()
-        });
-        let parameter = form == ObjectForm::Name
-            && row.is_some_and(|row| {
-                if in_repo(row)
-                    && let (Some(symbol), Some(decl_file), Some(line)) =
-                        (row.symbol(), row.decl_file(), row.decl_line())
-                    && let Some(positions) = self.inputs.positions.as_ref()
-                    && let Some(declared) = self.inputs.files.get(&positions.path_of(decl_file))
-                {
-                    declared
-                        .declaration_lines
-                        .params
-                        .contains(&(line, symbol.to_string()))
-                } else {
-                    false
-                }
-            });
-        Some(ReceiverAt {
-            symbol: row.and_then(|row| row.symbol()).map(str::to_string),
-            decl_file: row.and_then(|row| row.decl_file()).map(str::to_string),
-            decl_line: row.and_then(|row| row.decl_line()),
-            kind: if parameter {
-                ReceiverKind::Parameter
-            } else {
-                kind
-            },
-        })
+        receiver_at(self.inputs, file, call)
     }
 
     /// The labelled export `call` is made on, when it is one, and how it
@@ -1373,6 +1424,7 @@ impl<'a> Walker<'a> {
                 Some((
                     SiteEnd {
                         op: Some(one.op),
+                        scope: one.scope.clone(),
                         ..end(&one.package, &one.export, Some(&one.member), claims)
                     },
                     ReachedBy::Declaration,
@@ -1660,12 +1712,30 @@ impl<'a> Walker<'a> {
             if self.misses(file, body, call, construction, &inner) {
                 inner.missed = true;
             }
+            if inner.ends.is_empty()
+                && inner.stop.is_none()
+                && self.unfollowed(file, call, construction) == Some(UNANSWERED_PACKAGE)
+            {
+                inner.unanswered.extend(self.unanswered_keys(file, call));
+            }
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
         }
         out
+    }
+
+    /// The store keys of `call`'s declaration that the answer holds nothing
+    /// for.
+    fn unanswered_keys(&self, file: &Path, call: &CallIr) -> Vec<String> {
+        let Some(row) = self.row(file, call) else {
+            return Vec::new();
+        };
+        store_keys(row, self.labels.exports)
+            .into_iter()
+            .filter(|key| self.labels.package_reason(key) == Some(UNANSWERED_PACKAGE))
+            .collect()
     }
 
     /// Whether `call`, whose walk gave `outcome` and found no site, passed
@@ -1732,8 +1802,24 @@ impl<'a> Walker<'a> {
                     reached: None,
                 };
             if outcome.ends.is_empty() {
+                if !outcome.unanswered.is_empty() {
+                    discovery.unanswered_at.insert(
+                        (self.rel(file), call.site.span_start, call.site.span_end),
+                        outcome.unanswered.clone(),
+                    );
+                }
+                // A walk that entered code (a value's functions included)
+                // and missed something inside is `missed_inside`, whatever
+                // the call's own row reads (carrick#2813): the row's hole
+                // would hide that the walk passed code it did not finish.
+                let entered_missed = outcome.missed && outcome.stop.is_none();
                 let Some((chain, stop)) = outcome.stop else {
-                    match self.unfollowed(file, call, construction) {
+                    let own = if entered_missed {
+                        None
+                    } else {
+                        self.unfollowed(file, call, construction)
+                    };
+                    match own {
                         Some(reason) => {
                             *discovery
                                 .counts
@@ -1844,6 +1930,7 @@ impl<'a> Walker<'a> {
             ir.nested
                 .iter()
                 .chain(&ir.detached)
+                .chain(&ir.param_functions)
                 .find_map(|inner| find(inner, start))
         }
         let ir = self.inputs_for(file).files.get(file)?;
@@ -1852,6 +1939,7 @@ impl<'a> Walker<'a> {
         keys.into_iter()
             .map(|key| &ir.functions[key])
             .chain(std::iter::once(&ir.module_level))
+            .chain(&ir.constructor_defaults)
             .find_map(|body| find(body, start))
     }
 
@@ -2756,6 +2844,194 @@ mod tests {
                 .iter()
                 .all(|site| site.end.is_none()),
             "a captured parameter inside a bound object is read one function out: {:?}",
+            discovery.sites
+        );
+    }
+
+    /// carrick#2813 S1: a walk that passed a call into a package the store has
+    /// not answered records the package, whether it ends at a wrapper chain
+    /// or at a value callee a parameter's fallback decides, and a walk that
+    /// read code and missed inside is `missed_inside` even when the call's
+    /// own row reads `value_callee`. A walk over answered packages, and a
+    /// site, record none. The answer key is
+    /// `tests/fixtures/discovery-pending-package/README.md`.
+    #[test]
+    fn a_walk_that_passed_a_package_the_store_has_not_answered_records_it() {
+        let Some(on) = walked(
+            "discovery-pending-package",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-pending-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text =
+                std::fs::read_to_string(fixture.join("repo/services/web/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (
+                format!("services/web/src/{file}"),
+                lo,
+                lo + needle.len() as u32,
+            )
+        };
+        let keys = |file: &str, needle: &str| -> Vec<String> {
+            discovery
+                .unanswered_at
+                .get(&span(file, needle))
+                .map(|keys| keys.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        let pending = vec!["fixture-pending".to_string()];
+        // A wrapper chain: `postEvent` -> `send` -> a call into the package.
+        assert_eq!(keys("events.ts", "send(\"/events\", body)"), pending);
+        // A value callee: `deps.send ?? sendViaClient`.
+        assert_eq!(keys("inject.ts", "doSend(\"/notify\", body)"), pending);
+        // Both are walks that read code and missed inside, never `finished`
+        // and never recorded as the call's own row.
+        for (file, needle) in [
+            ("events.ts", "send(\"/events\", body)"),
+            ("inject.ts", "doSend(\"/notify\", body)"),
+        ] {
+            assert!(
+                discovery.missed_inside.contains(&span(file, needle)),
+                "{file}: missed_inside {:?} unfollowed {:?} sites {:?}",
+                discovery.missed_inside,
+                discovery.unfollowed,
+                discovery.sites
+            );
+        }
+        // The controls: a walk over an answered package with no export, and
+        // a site, pass no unanswered package.
+        assert!(keys("answered.ts", "render(body)").is_empty());
+        assert!(
+            discovery
+                .finished
+                .contains(&span("answered.ts", "render(body)")),
+            "{:?}",
+            discovery.finished
+        );
+        assert!(keys("global.ts", "request(\"/items\")").is_empty());
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .any(|site| site.file == "services/web/src/global.ts" && site.end.is_some())
+        );
+        // A call inside the package's wrapper that goes straight to it is
+        // the direct call Rule 4 lists: it keeps its own record.
+        assert!(
+            !discovery
+                .unanswered_at
+                .contains_key(&span("client.ts", "transmit(path, body)")),
+            "a direct call records no passed package"
+        );
+    }
+
+    /// carrick#2813 slice S2: a function written as a parameter's default
+    /// (`doFetch = (url, init) => fetch(url, init)`), positional, at a
+    /// destructured key or on a constructor, is read as the value the
+    /// parameter holds. The call that invokes the value ends at the `fetch`
+    /// the default calls, through a value hop at the default's line. The
+    /// answer key is `tests/fixtures/discovery-default-function/README.md`.
+    #[test]
+    fn a_function_written_as_a_parameter_default_is_read_as_its_value() {
+        let Some(on) = walked(
+            "discovery-default-function",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-default-function/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        // (file, the call that invokes the value, the default's line)
+        for (file, call, default) in [
+            ("arrow.ts", 7, 5),
+            ("destructured.ts", 7, 5),
+            ("ctor.ts", 10, 6),
+            ("several.ts", 4, 3),
+        ] {
+            let [site] = at(file, call)[..] else {
+                panic!(
+                    "a site at {file}:{call}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib.dom", "fetch"),
+                "{file}"
+            );
+            assert_eq!(end.line, default, "{file}: the end is the default's call");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert!(
+                hops.contains(&(VALUE_HOP, default)),
+                "{file}: the chain goes through the default: {hops:?}"
+            );
+        }
+        // One caller fills nothing and another passes its own function: the
+        // other value decides, and an end is kept.
+        let [several] = at("several.ts", 4)[..] else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(several.stop.as_deref(), Some("several_values"));
+        // The control: the default is the global `fetch` itself, a site on
+        // main, and it stays one.
+        let [control] = at("control.ts", 4)[..] else {
+            panic!("a site at control.ts:4: {:?}", discovery.sites);
+        };
+        assert_eq!(
+            control.end.as_ref().map(|end| end.export.as_str()),
+            Some("fetch")
+        );
+        // The call inside a default is no site of its own: only the call that
+        // invokes the value is one (arrow.ts:5 has the default's call).
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("arrow.ts"))
+                .all(|site| site.callee != "fetch"),
+            "the default's own call is not walked as a site: {:?}",
+            discovery.sites
+        );
+        // A default that calls nothing labelled ends nowhere.
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("plain.ts"))
+                .all(|site| site.end.is_none()),
+            "{:?}",
             discovery.sites
         );
     }
@@ -4149,6 +4425,117 @@ export function listen(): void {
                 ("hole_entry_point".to_string(), 3),
                 ("mount_unverified".to_string(), 1),
             ])
+        );
+    }
+
+    /// carrick#1678: a verb called on the object a scope member returns
+    /// (`items.at("/items").get(list)`) is a route whose path is the scope
+    /// call's argument and whose instance is the scope call's receiver: the
+    /// scope's path is the route's own path, never also a prefix. The verb is
+    /// the scoped op's (`get` of `Route`), not the router's `get` of the same
+    /// name, which would read the handler as the path.
+    #[test]
+    fn a_route_on_the_object_a_scope_member_returns_is_composed_under_its_router() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-scopes-chain")
+        else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        // The scope's path is the route's own path, served under the
+        // router's mount. A path the code cannot read composes none.
+        let want = texts(&[
+            // Across lines: the site is the call, at the chain's first line.
+            "src/items.ts:27 <- /api/multi",
+            "src/items.ts:25 <- /api/items",
+            // A module-scope constant bound to the scope call.
+            "src/items.ts:32 <- /api/one",
+            // A helper's path parameter: each caller states one.
+            "src/items.ts:37 <- /api/p1",
+            "src/items.ts:38 <- /api/p2",
+            // The first verb of a chain of two; the second waits on slice B.
+            "src/items.ts:40 <- /api/items/:id",
+            "src/items.ts:56 <- ?",
+        ]);
+        let mut want = want;
+        want.sort();
+        assert_eq!(got, want, "{got:#?}");
+        // A constant local to a function, a `let` written twice and a result
+        // handed to a helper state no scope call: leads, never sites.
+        let leads: Vec<String> = decided
+            .leads
+            .iter()
+            .map(|lead| format!("{}:{} {:?}", lead.file, lead.line, lead.reason))
+            .collect();
+        assert_eq!(
+            leads,
+            texts(&[
+                "src/items.ts:40 NameNeverBound",
+                "src/items.ts:44 NameNeverBound",
+                "src/items.ts:49 NameNeverBound",
+                "src/items.ts:52 NameNeverBound",
+            ])
+        );
+        // The rows the trace writes: the verb is the scoped op's, the owner
+        // is the scope call's receiver (`items`, or `r` inside the helper),
+        // never the scope member (`at`), and the name is the scope call's
+        // argument, forced by the code with no call argument to ask for.
+        let labels = SiteLabel::from_exports(&exports);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        let routes = crate::site_rows::traced(&decided, &records);
+        let mut served: Vec<String> = routes
+            .routes
+            .iter()
+            .map(|route| {
+                format!(
+                    "{}:{} {} {} <- {} owner {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.path,
+                    route.full_paths.join(" "),
+                    route.owner.as_deref().unwrap_or("-"),
+                )
+            })
+            .collect();
+        served.sort();
+        assert_eq!(
+            served,
+            texts(&[
+                "src/items.ts:25 GET /items <- /api/items owner items",
+                "src/items.ts:27 POST /multi <- /api/multi owner items",
+                "src/items.ts:32 GET /one <- /api/one owner items",
+                "src/items.ts:37 GET /p1 <- /api/p1 owner r",
+                "src/items.ts:38 GET /p2 <- /api/p2 owner r",
+                "src/items.ts:40 GET /items/:id <- /api/items/:id owner items",
+            ]),
+            "{served:#?}"
+        );
+        let first = records
+            .iter()
+            .find(|record| record.state.point.at == "src/items.ts:25")
+            .expect("a record at the first chain");
+        assert_eq!(
+            first.state.forced.get(&crate::site_questions::Slot::Name),
+            Some(&"/items".to_string())
+        );
+        assert_eq!(
+            first.basis.get(&crate::site_questions::Slot::Name),
+            Some(&super::super::site_record::Basis::Code)
+        );
+        assert!(
+            !first
+                .state
+                .forced
+                .contains_key(&crate::site_questions::Slot::NameArgument)
+                && !first
+                    .state
+                    .asked
+                    .contains(&crate::site_questions::Slot::NameArgument),
+            "no argument of the verb holds the name"
         );
     }
 

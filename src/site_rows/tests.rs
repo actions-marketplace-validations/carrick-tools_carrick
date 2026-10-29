@@ -62,6 +62,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             line: LINE,
             span_start: 100,
             new: false,
+            scope: None,
             span_end: 130,
         },
         name: Vec::new(),
@@ -167,6 +168,7 @@ fn labels() -> Vec<SiteLabel> {
         runs: None,
         method: None,
         request: None,
+        scope: None,
     };
     vec![
         label("Server", Some("server")),
@@ -766,6 +768,251 @@ fn off_the_fold_changes_nothing() {
     let fold = fold_rows(&mut calls, &mut Vec::new(), &off, Path::new("."), make);
     assert_eq!(serde_json::to_vec(&calls).unwrap(), before);
     assert!(fold.stated.is_empty() && fold.leads.is_empty() && fold.withdrawn.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The graph (carrick#2795).
+
+fn graph_call(
+    method: &str,
+    path: &str,
+    file: &str,
+    source: ResolutionSource,
+) -> crate::mount_graph::DataFetchingCall {
+    serde_json::from_value(json!({
+        "method": method, "target_url": path, "canonical_path": path,
+        "client": "fetch", "file_location": format!("{file}:{LINE}"),
+        "line": LINE, "resolution_source": source,
+    }))
+    .unwrap()
+}
+
+/// A blob holding `calls` and a mount graph holding `graph`.
+fn blob_with_graph(
+    calls: Vec<ApiEndpointDetails>,
+    graph: Vec<crate::mount_graph::DataFetchingCall>,
+) -> CloudRepoData {
+    let mut data: CloudRepoData = serde_json::from_value(json!({
+        "repo_name": "acme/app", "endpoints": [], "calls": [], "mounts": [],
+        "apps": {}, "imported_handlers": [], "function_definitions": {},
+        "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234",
+        "mount_graph": { "nodes": {}, "mounts": [], "endpoints": [], "data_calls": [] }
+    }))
+    .unwrap();
+    data.calls = calls;
+    data.mount_graph.as_mut().unwrap().data_calls = graph;
+    data
+}
+
+/// [`rows`] with the forced HTTP send's call made through a function: its
+/// labelled call is written elsewhere.
+fn rows_through() -> SiteRows {
+    let (mut decided, records) = cases();
+    for site in &mut decided.sites {
+        if site.file == "src/forced-http.ts" {
+            site.end.span_start = 1;
+            site.end.span_end = 9;
+        }
+    }
+    of(&decided, &records, &labels(), &cassette())
+}
+
+fn fold_into(data: &mut CloudRepoData, site: &SiteRows) -> SiteFold {
+    fold(data, site, Path::new("."), make)
+}
+
+/// A fact the fold states joins the graph in place of the reader's row it
+/// replaced, the fact a request the cross-service pass can reach.
+#[test]
+fn a_fact_replaces_the_readers_graph_row() {
+    let file = "src/forced-http.ts";
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            OperationKey::http("GET", "/v1/item"),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )],
+        vec![
+            graph_call("GET", "/v1/item", file, ResolutionSource::Model),
+            // Another site's row stays.
+            graph_call("GET", "/other", "src/other.ts", ResolutionSource::Model),
+        ],
+    );
+    let site = rows();
+    fold_into(&mut data, &site);
+    let graph = &data.mount_graph.as_ref().unwrap().data_calls;
+    let at_file: Vec<_> = graph
+        .iter()
+        .filter(|call| call.file_location == format!("{file}:{LINE}"))
+        .collect();
+    assert_eq!(at_file.len(), 1, "{at_file:?}");
+    let row = at_file[0];
+    assert_eq!(
+        (row.method.as_str(), row.canonical_path.as_str()),
+        ("POST", "/v1/items")
+    );
+    assert_eq!(row.target_url, "/v1/items");
+    assert_eq!(
+        row.resolution_source,
+        Some(ResolutionSource::RequestSummary)
+    );
+    assert_eq!(row.line, Some(LINE));
+    assert_eq!(row.role, None, "the labelled call is the fact's own");
+    assert_eq!(row.reaches_request, None);
+    assert!(
+        graph.iter().any(|call| call.canonical_path == "/other"),
+        "a row at another site stays"
+    );
+    assert_eq!(graph.len(), 2);
+}
+
+/// A fact whose decided call is not its labelled call joins the graph as a
+/// call through.
+#[test]
+fn a_fact_at_a_call_through_a_function_joins_as_a_wrapper_call() {
+    let file = "src/forced-http.ts";
+    assert!(!row(&rows(), file).unwrap().through);
+    assert!(row(&rows_through(), file).unwrap().through);
+    let mut data = blob_with_graph(Vec::new(), Vec::new());
+    fold_into(&mut data, &rows_through());
+    let graph = &data.mount_graph.as_ref().unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(
+        graph[0].role,
+        Some(crate::mount_graph::ConsumerRole::WrapperCall)
+    );
+}
+
+/// The graph row of a fact keeps what the reader's row at the same call read
+/// about where it goes: the base a relative key resolves through, and the host
+/// of an absolute key, read off the key itself.
+#[test]
+fn a_fact_keeps_the_base_and_host_of_its_call() {
+    let file = "src/forced-http.ts";
+    let mut reader = graph_call("GET", "${API_URL}/v1/item", file, ResolutionSource::Model);
+    reader.base = Some(crate::call_base::CallBaseResolution {
+        written: "${process.env.API_URL}".to_string(),
+        kind: crate::call_base::CallBaseKind::Env,
+        env_var: Some("API_URL".to_string()),
+        fallback: None,
+        fallback_is_loopback: false,
+        declared_optional: None,
+    });
+    let reader_call = |path: &str| {
+        blob_row(
+            OperationKey::http("GET", path),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )
+    };
+    let relative = {
+        let mut data = blob_with_graph(
+            vec![reader_call("${API_URL}/v1/item")],
+            vec![reader.clone()],
+        );
+        fold_into(&mut data, &rows());
+        data.mount_graph.unwrap().data_calls
+    };
+    assert_eq!(relative.len(), 1, "{relative:?}");
+    assert_eq!(
+        relative[0]
+            .base
+            .as_ref()
+            .and_then(|base| base.env_var.as_deref()),
+        Some("API_URL")
+    );
+    assert_eq!(relative[0].host, None);
+
+    // The same call keyed by an absolute URL names its host and no base.
+    let mut absolute_rows = rows();
+    for site_row in &mut absolute_rows.rows {
+        if site_row.file == file {
+            site_row.key = OperationKey::http("POST", "https://api.vendor.test/v1/items");
+        }
+    }
+    let mut data = blob_with_graph(vec![reader_call("${API_URL}/v1/item")], vec![reader]);
+    fold_into(&mut data, &absolute_rows);
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(graph[0].host.as_deref(), Some("api.vendor.test"));
+    assert_eq!(graph[0].base, None);
+}
+
+/// The graph row of a fact keeps the reader's client and dispatch, as it
+/// keeps the host and base: they describe the call as written.
+#[test]
+fn a_fact_keeps_the_client_and_dispatch_of_its_call() {
+    let file = "src/forced-http.ts";
+    let mut reader = graph_call("GET", "/v1/item", file, ResolutionSource::Model);
+    reader.client = "axios".to_string();
+    let dispatch = crate::dispatch::Dispatch {
+        location: crate::dispatch::DispatchLocation::Body,
+        field: "action".to_string(),
+        value: "create".to_string(),
+    };
+    reader.dispatch = Some(dispatch.clone());
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            OperationKey::http("GET", "/v1/item"),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )],
+        vec![reader],
+    );
+    fold_into(&mut data, &rows());
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(graph[0].client, "axios");
+    assert_eq!(graph[0].dispatch, Some(dispatch));
+}
+
+/// A candidate replacement (an answer in the band) leaves the graph as it
+/// was: the reader's row stays, and nothing is added.
+#[test]
+fn a_candidate_leaves_the_graph_alone() {
+    let file = "src/http.ts";
+    let all = rows();
+    assert!(row(&all, file).unwrap().inference.is_some(), "a candidate");
+    let site = SiteRows {
+        enabled: true,
+        rows: all
+            .rows
+            .into_iter()
+            .filter(|row| row.file == file)
+            .collect(),
+        ..SiteRows::default()
+    };
+    let reader = |source| graph_call("GET", "/v1/read", file, source);
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            OperationKey::http("GET", "/v1/read"),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )],
+        vec![reader(ResolutionSource::Model)],
+    );
+    let before = serde_json::to_vec(&data.mount_graph).unwrap();
+    fold_into(&mut data, &site);
+    assert_eq!(serde_json::to_vec(&data.mount_graph).unwrap(), before);
+}
+
+/// Off, the graph is byte for byte what it was.
+#[test]
+fn off_the_fold_leaves_the_graph_untouched() {
+    let file = "src/forced-http.ts";
+    let mut data = blob_with_graph(
+        Vec::new(),
+        vec![graph_call("GET", "/v1/item", file, ResolutionSource::Model)],
+    );
+    let before = serde_json::to_vec(&data.mount_graph).unwrap();
+    let mut off = rows();
+    off.enabled = false;
+    fold_into(&mut data, &off);
+    assert_eq!(serde_json::to_vec(&data.mount_graph).unwrap(), before);
 }
 
 // ---------------------------------------------------------------------------

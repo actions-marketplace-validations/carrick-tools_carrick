@@ -108,6 +108,22 @@ export default factory;
 export declare function helper(): void;
 `;
 
+// A server package whose app hands back a route object: `at(path)` returns
+// a `Route` that the verbs are registered on (carrick#2774). The verbs take
+// handlers only, so the path is the one `at` was called with.
+const CHAIN_ROUTER = `export type Handler = (request: { body: unknown }, reply: { send(body: unknown): void }) => void;
+export interface Route {
+  get(...handlers: Handler[]): this;
+  post(...handlers: Handler[]): this;
+  delete(...handlers: Handler[]): this;
+}
+export interface App {
+  get(path: string, ...handlers: Handler[]): this;
+  at(path: string): Route;
+}
+export declare function app(): App;
+`;
+
 function writeTree(root: string, files: Record<string, string>): void {
   for (const [rel, text] of Object.entries(files)) {
     const file = path.join(root, rel);
@@ -127,7 +143,7 @@ interface Check {
 }
 interface Response {
   status: string;
-  verdicts?: Array<{ verdict: string; reason?: string }>;
+  verdicts?: Array<{ verdict: string; reason?: string; request_dropped?: string }>;
   errors?: string[];
 }
 
@@ -160,7 +176,13 @@ const route = (member: string, parts: Record<string, unknown>): Claim => ({
 
 function verdicts(response: Response): string[] {
   assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
-  return response.verdicts!.map(r => (r.verdict === 'verified' ? 'verified' : `${r.verdict} ${r.reason}`));
+  return response.verdicts!.map(r =>
+    r.verdict !== 'verified'
+      ? `${r.verdict} ${r.reason}`
+      : r.request_dropped === undefined
+        ? 'verified'
+        : `verified request_dropped ${r.request_dropped}`
+  );
 }
 
 describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
@@ -185,6 +207,12 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       'src/index.ts': 'export const service = 1;\n',
       'node_modules/fixture-server/package.json': JSON.stringify({ name: P, version: '1.0.0', types: 'index.d.ts' }),
       'node_modules/fixture-server/index.d.ts': SERVER,
+      'node_modules/fixture-chain-router/package.json': JSON.stringify({
+        name: 'fixture-chain-router',
+        version: '1.0.0',
+        types: 'index.d.ts',
+      }),
+      'node_modules/fixture-chain-router/index.d.ts': CHAIN_ROUTER,
       'node_modules/fixture-plugin-server/package.json': JSON.stringify({
         name: 'fixture-plugin-server',
         version: '1.0.0',
@@ -347,7 +375,56 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
         // Invalid: the handler's parameter there is the reply.
         onApp(route('get', { request: { param: 1, path: ['path'] } })),
       ]),
-      ['verified', 'verified', 'failed request_member_missing', 'failed request_member_missing', 'failed request_member_missing']
+      [
+        'verified',
+        'verified',
+        // A request member the declarations lack drops the request, never
+        // the route (carrick#2968).
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
+      ]
+    );
+  });
+
+  it('a wrong request member fails only the request: the route op stands, its own faults still fail it (carrick#2968)', async () => {
+    const wrong = { param: 0, path: ['pathname'] };
+    assert.deepStrictEqual(
+      await send([
+        // The route is right and its request wrong: the op verifies, the request is dropped.
+        onApp(route('get', { request: wrong })),
+        onRouter(route('post', { request: { param: 0, url: ['raw', 'href'] } })),
+        // The same route with no request: unchanged.
+        onApp(route('get', {})),
+        // The member is wrong as well: the op fails as it does without a request.
+        onApp(route('put', { request: wrong })),
+        onApp(route('put', {})),
+        // The name slot is wrong as well.
+        onApp(route('get', { name: { arg: 2 }, request: wrong })),
+        onApp(route('get', { name: { arg: 2 } })),
+        // The method is wrong as well.
+        onApp(route('get', { method: 'POST', request: wrong })),
+        onApp(route('get', { method: 'POST' })),
+        // The handler slot is past the overload as well.
+        onApp(route('get', { handler: { arg: 2 }, request: wrong })),
+        onApp(route('get', { handler: { arg: 2 } })),
+        // The handler takes no parameter there: not a member fault, so the op still fails.
+        onApp(route('get', { request: { param: 5, path: ['path'] } })),
+      ]),
+      [
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
+        'verified',
+        'failed member_missing',
+        'failed member_missing',
+        'failed param_missing',
+        'failed param_missing',
+        'failed method_not_member_verb',
+        'failed method_not_member_verb',
+        'failed param_missing',
+        'failed param_missing',
+        'failed param_missing',
+      ]
     );
   });
 
@@ -368,8 +445,8 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       [
         'verified',
         'verified',
-        'failed request_member_missing',
-        'failed request_member_missing',
+        'verified request_dropped request_member_missing',
+        'verified request_dropped request_member_missing',
         'unchecked claim_invalid',
         'verified',
       ]
@@ -385,6 +462,52 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       ]),
       ['unchecked claim_invalid', 'unchecked claim_invalid', 'unchecked claim_invalid']
     );
+  });
+
+  it('a route object a scope returns is the receiver its verbs are registered on (carrick#2774)', async () => {
+    const chain = (receiver: string, claim: Claim): Check => ({
+      claim_id: `c${sequence++}`,
+      package: 'fixture-chain-router',
+      export: 'app',
+      role: 'server_framework',
+      receiver,
+      claim,
+    });
+    const make = chain('export', { kind: 'make', form: 'call', member: null });
+    const at = chain('instance:()', { kind: 'scope', member: 'at', name: { arg: 0 }, of: 'instance:()' });
+    const SCOPE = 'instance:()>scope:at';
+    const verb = (member: string, name: Record<string, unknown> = { bound: 'scope' }) =>
+      chain(SCOPE, {
+        kind: 'op',
+        op: 'receive',
+        member,
+        name,
+        handler: { arg: 0 },
+        method: member.toUpperCase(),
+        of: SCOPE,
+      });
+    const ask = (checks: Check[]) =>
+      client.send<{ status: string; errors?: string[]; verdicts?: Array<{ verdict: string; reason?: string; declarations?: unknown }> }>(
+        { request_id: `routes-${requestId++}`, action: 'verify_library_claims', from_dir: root, checks },
+        60_000
+      );
+    // The scope claim and the verbs: all verified, each verb at `Route`'s member.
+    const held = await ask([make, at, verb('get'), verb('post'), verb('delete')]);
+    assert.deepStrictEqual(verdicts(held), ['verified', 'verified', 'verified', 'verified', 'verified']);
+    const file = 'node_modules/fixture-chain-router/index.d.ts';
+    const lineOf = (needle: string): number => CHAIN_ROUTER.split('\n').findIndex(line => line.includes(needle)) + 1;
+    assert.deepStrictEqual(
+      held.verdicts!.slice(2).map(each => each.declarations),
+      ['get(...', 'post(...', 'delete(...'].map(needle => [{ decl_file: file, decl_line: lineOf(needle) }])
+    );
+    // The verbs without the scope claim that builds their receiver are not read.
+    assert.deepStrictEqual(verdicts(await ask([make, verb('get')])), ['verified', 'unchecked scope_unverified']);
+    // A verb that names its path from its own first argument is refused: that argument is its handler.
+    assert.deepStrictEqual(verdicts(await ask([make, at, verb('get', { arg: 0 })])), [
+      'verified',
+      'verified',
+      'failed slots_overlap',
+    ]);
   });
 
   it('refuses a request whose route field is outside the shape', async () => {

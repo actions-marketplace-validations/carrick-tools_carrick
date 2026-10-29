@@ -46,6 +46,7 @@ import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
+import { substituteMachinePathImports } from './machine-paths.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
@@ -126,6 +127,7 @@ function fail(stubDir: string, packageName: string, errors: string[]): CaptureSt
     augmentation_files: [],
     specifier_rewrites: 0,
     bare_checkout: false,
+    unresolved_dependencies: [],
     ts_version: ts.version,
     errors,
   };
@@ -474,6 +476,22 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     entryDir,
   });
   const specifierRewrites = denoRewrites + placed.rewrites + rewritten.rewrites;
+  // What the rewrite could not map still names a machine path (carrick#2943).
+  const machinePaths = substituteMachinePathImports({
+    files: emittedFiles.map((rel) => path.join(typesDir, rel)),
+    surfaceAbsPath,
+    tree: stubGuard.narrow(typesDir),
+    labelRoot: opts.scanRoot ?? repoRoot,
+  });
+  if (machinePaths.size > 0) {
+    resolved = resolved.map((anchor) => {
+      const found = machinePaths.get(anchor.request.alias);
+      if (!found) return anchor;
+      const paths = [...new Set([...(anchor.unresolved?.paths ?? []), ...found.paths])];
+      const specifiers = [...new Set([...found.modules, ...(anchor.unresolved?.specifiers ?? [])])];
+      return { ...anchor, unresolved: { paths, specifiers } };
+    });
+  }
 
   // ---- Pin external deps: installed node_modules first, lockfile fallback ----
   // Externals are collected AFTER the rewrite pass: a rewritten paths
@@ -534,7 +552,24 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   );
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
-  const bareCheckout = !deno && !fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  const nodeModulesPresent = fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  const declared =
+    deno || !nodeModulesPresent
+      ? { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 }
+      : declaredDependencyResolution(dependencyRoot);
+  const unresolvedDependencies = declared.unresolved;
+  // Bare: no node_modules, or every declared runtime dependency dangles (a
+  // missing pnpm store). One missing package, or missing devDependencies,
+  // leaves the installed ones usable (carrick#2999).
+  const bareCheckout =
+    !deno &&
+    (!nodeModulesPresent || (declared.runtimeDeclared > 0 && declared.runtimeResolved === 0));
+  if (unresolvedDependencies.length > 0) {
+    console.error(
+      `[sidecar] capture ${packageName}: declared dependencies do not resolve` +
+        `${bareCheckout ? ' (bare checkout)' : ''}: ${unresolvedDependencies.join(', ')}`
+    );
+  }
 
   stubGuard.writeFile(
     path.join(stubDir, 'package.json'),
@@ -616,12 +651,68 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     augmentation_files: augmentationFiles.sort(),
     specifier_rewrites: specifierRewrites,
     bare_checkout: bareCheckout,
+    unresolved_dependencies: unresolvedDependencies,
     ts_version: ts.version,
     errors,
   };
 }
 
-/** What one declaration emit wrote, as text: nothing here is a compiler object. */
+/** How many unresolved packages a capture result names. */
+const UNRESOLVED_DEPENDENCIES_NAMED = 5;
+
+/**
+ * How `root/package.json` dependencies resolve from `root`: no
+ * `node_modules/<name>` in `root` or any parent directory means unresolved.
+ * `existsSync` follows links, so a pnpm link into a missing store reads as
+ * unresolved (carrick#2999). `unresolved` is the first few names across
+ * dependencies and devDependencies, sorted; the runtime counts cover
+ * `dependencies` only. Declared names only, one stat per ancestor.
+ */
+function declaredDependencyResolution(root: string): {
+  unresolved: string[];
+  runtimeDeclared: number;
+  runtimeResolved: number;
+} {
+  const none = { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 };
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  } catch {
+    return none;
+  }
+  if (manifest === null || typeof manifest !== 'object') return none;
+  const names = (field: string): string[] => {
+    const group = (manifest as Record<string, unknown>)[field];
+    return group !== null && typeof group === 'object' ? Object.keys(group) : [];
+  };
+  const resolves = (name: string): boolean => {
+    let dir = path.resolve(root);
+    for (;;) {
+      if (fs.existsSync(path.join(dir, 'node_modules', name))) return true;
+      const parent = path.dirname(dir);
+      if (parent === dir) return false;
+      dir = parent;
+    }
+  };
+  const runtime = new Set(names('dependencies'));
+  const all = new Set([...runtime, ...names('devDependencies')]);
+  let runtimeResolved = 0;
+  const unresolved: string[] = [];
+  for (const name of [...all].sort()) {
+    if (resolves(name)) {
+      if (runtime.has(name)) runtimeResolved++;
+    } else {
+      unresolved.push(name);
+    }
+  }
+  return {
+    unresolved: unresolved.slice(0, UNRESOLVED_DEPENDENCIES_NAMED),
+    runtimeDeclared: runtime.size,
+    runtimeResolved,
+  };
+}
+
+/** What one, as text: nothing here is a compiler object. */
 interface DeclarationEmit {
   /** Staging-absolute emitted file -> its text. */
   emitted: Map<string, string>;

@@ -175,8 +175,10 @@ impl ExportClaims {
     /// `<specifier>@<major>:<export>:<kind>:…`, the convention HTTP claim
     /// ids follow (`<package>@<major>:<export>:factory:<member>`). A claim id
     /// stated twice, differently, names nothing one can verify, so both are
-    /// dropped. Scope claims are left out: no reader reads the receivers a
-    /// scope returns yet (carrick#1678).
+    /// dropped. Scope claims are left out: the library check reads no
+    /// receiver a scope returns. The receiver trace does (carrick#1678): an
+    /// op claimed on `<base>>scope:<member>` is read at the call made on what
+    /// the scope member returned ([`scope_step`]).
     pub fn claims_by_id(&self) -> Vec<(String, &LibraryClaim)> {
         self.by_id(false)
     }
@@ -357,6 +359,8 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             hops(path, member.as_deref()),
             selector(on, of)
         )),
+        // Asked only beside the claim it sits on, under that claim's id.
+        LibraryClaim::Result { .. } => None,
         LibraryClaim::Reserved {
             member,
             name,
@@ -465,6 +469,13 @@ pub(crate) fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> 
     }
 }
 
+/// The base receiver and the scope member of a receiver id that names what a
+/// scope member returns (`instance:()>scope:at` is `instance:()` and `at`);
+/// `None` for any other id (carrick#1678).
+pub(crate) fn scope_step(receiver: &str) -> Option<(&str, &str)> {
+    receiver.split_once(">scope:")
+}
+
 /// The site API's selector for a claim's own `on`, `of`, `path` and
 /// `member`.
 fn selector<'a>(
@@ -513,7 +524,7 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
                         .filter(|receiver| applies(*on, of.as_deref(), receiver))
                         .collect()
                 }
-                LibraryClaim::Scope { .. } => Vec::new(),
+                LibraryClaim::Scope { .. } | LibraryClaim::Result { .. } => Vec::new(),
             };
             for receiver in on {
                 checks.push(LibraryCheck {
@@ -522,7 +533,7 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
                     export: export.export.clone(),
                     role: export.role,
                     receiver: receiver.to_string(),
-                    claim: claim.clone(),
+                    claim: claim.without_result(),
                 });
             }
         }
@@ -570,7 +581,7 @@ pub fn server_checks(exports: &[ExportClaims]) -> Vec<LibraryCheck> {
                     export: export.export.clone(),
                     role: export.role,
                     receiver,
-                    claim: claim.clone(),
+                    claim: claim.without_result(),
                 });
             }
         }
@@ -1121,6 +1132,59 @@ mod tests {
     ) -> Vec<LibraryRow> {
         let asked = std::cell::RefCell::new(Vec::new());
         read(sites, exports, verifier(&asked, verified)).rows
+    }
+
+    /// carrick#2819: a result label rides the claim it sits on, and no
+    /// check sends it: a labelled claim and the same claim unlabelled give
+    /// the same check payload, from `checks` and from `server_checks`.
+    #[test]
+    fn checks_send_claims_without_their_result() {
+        let labelled = |mut claim: serde_json::Value| {
+            claim["result"] = json!({ "whole": true });
+            claim
+        };
+        let bus_claims = vec![
+            json!({ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                "name": { "arg": 0 }, "payload": { "arg": 1 } }),
+            json!({ "kind": "make", "form": "call", "member": null }),
+        ];
+        let with = |claims: Vec<serde_json::Value>, role: &str, package: &str| {
+            export(json!({
+                "package": package, "version": "1.4.0", "specifier": package,
+                "export": "bus", "role": role, "claims": claims
+            }))
+        };
+        let payload = |checks: Vec<LibraryCheck>| serde_json::to_string(&checks).unwrap();
+
+        let sites = sites_of(&[("src/orders.ts", BUS_SERVICE)]);
+        let plain = with(bus_claims.clone(), "broker", "@fixture/bus");
+        let marked = with(
+            bus_claims.iter().cloned().map(labelled).collect(),
+            "broker",
+            "@fixture/bus",
+        );
+        assert!(marked.claims.iter().all(|c| c.result_check().is_some()));
+        let sent = checks(&sites, &[marked]);
+        assert!(!sent.is_empty());
+        assert!(!payload(sent.clone()).contains("\"result\""));
+        assert_eq!(payload(sent), payload(checks(&sites, &[plain])));
+
+        let server_claims = vec![
+            json!({ "kind": "make", "form": "call", "member": null }),
+            json!({ "kind": "op", "op": "send", "member": "json", "on": "export",
+                "payload": { "arg": 0 } }),
+        ];
+        let plain = with(server_claims.clone(), "server_framework", "fixture-server");
+        let marked = with(
+            server_claims.into_iter().map(labelled).collect(),
+            "server_framework",
+            "fixture-server",
+        );
+        assert!(marked.claims.iter().all(|c| c.result_check().is_some()));
+        let sent = server_checks(&[marked]);
+        assert!(!sent.is_empty());
+        assert!(!payload(sent.clone()).contains("\"result\""));
+        assert_eq!(payload(sent), payload(server_checks(&[plain])));
     }
 
     /// carrick#2674: the checks an `infer` request reads a route handler's

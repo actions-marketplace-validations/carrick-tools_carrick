@@ -291,6 +291,7 @@ const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
   'projected_value_only',
   'serialised_body_unread',
   'body_built_by_callee',
+  'reshaped_by_callback',
 ]);
 
 /** One response branch's payload, before branches are joined. */
@@ -608,6 +609,14 @@ interface CallResultUse {
   projectionOnly: boolean;
   /** The member reads themselves, so a caller can ask what they resolve to. */
   projections: Node[];
+  /**
+   * The call starts a chain, a callback in it is handed the body unread, and
+   * nothing in the chain states the body (carrick#3004). The terminal is the
+   * call itself: what the chain ends in is the value a callback built from
+   * the body, never the body, and where the call's own value is untyped the
+   * site states no response contract.
+   */
+  handedUnreadBody?: boolean;
 }
 
 /**
@@ -630,34 +639,61 @@ export interface TypeInferrerOptions {
    */
   repoRoot: string;
   /**
-   * How long the unwidened reading of one `infer` batch may take
-   * (carrick#1516). Defaults to `UNWIDENED_BUDGET_MS`.
+   * How much work the unwidened reading of one `infer` batch may do
+   * (carrick#2629). Each field defaults to its `UNWIDENED_*` constant.
    */
-  unwidenedBudgetMs?: number;
+  unwidenedLimits?: Partial<UnwidenedLimits>;
+  /**
+   * The clock the unwidened reading's last-resort time limit reads, in
+   * milliseconds. Defaults to `performance.now`; a test passes a slow one.
+   */
+  now?: () => number;
 }
 
 /**
- * How long the unwidened reading of one batch may take by default. The
- * reading adds a field and never an answer, so running out costs only the
- * readings not yet made; the rewrite is always undone. It reports no
- * progress, so this is also the longest a batch goes silent after its last
- * request: well inside the 900s the scanner allows between two signs of life.
+ * The bounds on one batch's unwidened reading (carrick#2629). The first two
+ * count work, so a batch reads the same on a quiet machine and a loaded one;
+ * the third is a wall-clock backstop for a reading that runs away.
  */
-const UNWIDENED_BUDGET_MS = 120_000;
+export interface UnwidenedLimits {
+  /** Readings (requests re-read in the rewrite) one batch may make. */
+  readings: number;
+  /** Files one batch may type-check before and after its rewrite. */
+  files: number;
+  /** The longest the reading may run, from its start, before it stops. */
+  backstopMs: number;
+}
+
 /**
- * No reading starts or continues past this long after the batch began. The
- * number dates from when the scanner allowed a whole request 900s; it now
- * allows that long between progress reports (carrick#1914), so a batch can
- * run past this and still be read. A batch that does publishes no unwidened
- * reading, as before.
+ * How many readings one batch may make (carrick#2629). A count, not a time,
+ * so whether a reading is made never depends on the machine's load: a reading
+ * a batch cannot make marks its response `unwidened_out_of_budget`, and the
+ * check then abstains on every mismatch against it (carrick#2100). Sized well
+ * above the largest batch measured; see the PR that set it.
  */
-const UNWIDENED_LATEST_MS = 600_000;
+const UNWIDENED_MAX_READINGS = 5_000;
+/** How many files one batch's reading may type-check (carrick#2629). */
+const UNWIDENED_MAX_FILES = 5_000;
+/**
+ * The last resort: a reading still running this long after it started stops
+ * and says so in the log. The reading reports progress after every file it
+ * checks and every request it re-reads, so the scanner's limit on silence
+ * never needs it; it is here for a reading that runs away.
+ */
+const UNWIDENED_BACKSTOP_MS = 30 * 60_000;
 
 /**
  * Called each time an `infer` batch is done with one of its requests,
  * whatever that request answered: skipped, refused, failed or inferred.
  */
 export type InferRequestDone = () => void;
+
+/**
+ * Called each time the unwidened reading finishes a unit of its work: a file
+ * type-checked or a request re-read (carrick#2629). The reading runs after
+ * every request is done, so this is what keeps a long one from going silent.
+ */
+export type UnwidenedStepDone = () => void;
 
 /**
  * Result of unwrapping a type
@@ -743,7 +779,8 @@ export class TypeInferrer {
    * unwidened reading re-reads from here (carrick#1516).
    */
   private readonly readNodes = new WeakMap<SourceLocation, Node>();
-  private readonly unwidenedBudgetMs: number;
+  private readonly unwidenedLimits: UnwidenedLimits;
+  private readonly now: () => number;
   /**
    * The files a request has named to this inferrer, as the requests named
    * them (carrick#1985). It lives as long as the project does, so the first
@@ -755,7 +792,12 @@ export class TypeInferrer {
     this.project = options.project;
     this.packageOf = options.packageOf;
     this.repoRoot = options.repoRoot;
-    this.unwidenedBudgetMs = options.unwidenedBudgetMs ?? UNWIDENED_BUDGET_MS;
+    this.unwidenedLimits = {
+      readings: options.unwidenedLimits?.readings ?? UNWIDENED_MAX_READINGS,
+      files: options.unwidenedLimits?.files ?? UNWIDENED_MAX_FILES,
+      backstopMs: options.unwidenedLimits?.backstopMs ?? UNWIDENED_BACKSTOP_MS,
+    };
+    this.now = options.now ?? (() => performance.now());
   }
 
   /**
@@ -778,6 +820,7 @@ export class TypeInferrer {
    * @param requests - Array of inference requests
    * @param extractionConfig - Agent-generated extraction config for payload unwrapping
    * @param onRequestDone - Called once per request, as the batch is done with it
+   * @param onUnwidenedStep - Called once per unit of the unwidened reading's work
    * @returns InferResult with inferred types or errors
    */
   infer(
@@ -785,9 +828,9 @@ export class TypeInferrer {
     extractionConfig?: ExtractionConfig,
     onRequestDone?: InferRequestDone,
     modelSymbols?: ModelSymbol[],
-    labels?: LabelledMembers
+    labels?: LabelledMembers,
+    onUnwidenedStep?: UnwidenedStepDone
   ): InferResult {
-    const started = performance.now();
     this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
     this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), bodies: new Set() });
     const inferredTypes: InferredType[] = [];
@@ -868,10 +911,14 @@ export class TypeInferrer {
     }
 
     try {
-      const deadline = Math.min(
-        performance.now() + this.unwidenedBudgetMs,
-        started + UNWIDENED_LATEST_MS
-      );
+      // One allowance for the batch: the responses draw on it first, the
+      // bodies on what they leave.
+      const work: UnwidenedWork = {
+        readings: this.unwidenedLimits.readings,
+        files: this.unwidenedLimits.files,
+        backstopAt: this.now() + this.unwidenedLimits.backstopMs,
+        step: onUnwidenedStep ?? (() => {}),
+      };
       // The responses' rewrite forgets every node of the files it touches, so
       // each body's read node is kept as its span, taken now and found again
       // in the restored file.
@@ -888,7 +935,7 @@ export class TypeInferrer {
         };
       });
       try {
-        this.addUnwidenedReadings(responses, extractionConfig, deadline, 'response');
+        this.addUnwidenedReadings(responses, extractionConfig, work, 'response');
       } catch (err) {
         // The reading only ever adds a field; it never costs an answer.
         this.logError(
@@ -896,16 +943,16 @@ export class TypeInferrer {
         );
       }
       try {
-        // Second, and in a rewrite of its own: the bodies' files never delay a
-        // response's reading, whose budget a spent deadline turns into an
-        // abstention (carrick#2100).
-        this.addUnwidenedReadings(bodySpans, extractionConfig, deadline, 'request_body');
+        // Second, and in a rewrite of its own: the bodies never take a
+        // response's share of the work, whose cap a spent allowance turns into
+        // an abstention (carrick#2100).
+        this.addUnwidenedReadings(bodySpans, extractionConfig, work, 'request_body');
       } catch (err) {
         this.logError(
           `Unwidened reading of request bodies failed: ${err instanceof Error ? err.message : String(err)}`
         );
         // carrick#2011: a body whose reading was not made is judged on its
-        // widened type alone, so it is marked the way a spent budget marks it
+        // widened type alone, so it is marked the way a spent work cap marks it
         // and its pair abstains on a mismatch rather than report one.
         for (const body of bodies) {
           if (body.result.unwidened_type_string === undefined) {
@@ -1040,23 +1087,28 @@ export class TypeInferrer {
    * and every file restored before returning, so the project other requests
    * read is the project the scan loaded.
    *
-   * Nothing is read past `deadline`: a batch that runs out keeps the readings
-   * it made and publishes none for the rest, and marks each of the rest
-   * `unwidened_out_of_budget` (carrick#2100). A request that never needed a
-   * reading (a declared return, nothing to mark) or lost it for a reason of
-   * its own (a marking that added a diagnostic) is never marked.
+   * The reading is bounded by work, not time (carrick#2629): a batch makes at
+   * most `UnwidenedLimits.readings` readings over at most `.files` files,
+   * taken in request order, the responses first. The first request past
+   * either cap and every request after it are marked
+   * `unwidened_out_of_budget` (carrick#2100) and publish no reading, on any
+   * machine. A reading still running at the wall-clock backstop stops the
+   * same way and says so in the log. A request that never needed a reading
+   * (a declared return, nothing to mark) or lost it for a reason of its own
+   * (a marking that added a diagnostic) is never marked.
    */
   private addUnwidenedReadings(
     responses: Array<{ request: InferRequestItem; result: InferredType; readSpan?: SavedSpan }>,
     extractionConfig: ExtractionConfig | undefined,
-    deadline: number,
+    work: UnwidenedWork,
     read: 'response' | 'request_body'
   ): void {
+    const started = this.now();
     const outOfTime = (stage: string, unread: ReadonlyArray<{ result: InferredType }>): boolean => {
-      if (performance.now() <= deadline) return false;
+      if (this.now() <= work.backstopAt) return false;
       this.log(
-        `Unwidened reading stopped ${stage}: it ran out of its budget, ` +
-          `${unread.length} reading(s) not made`
+        `Unwidened reading stopped ${stage}: it ran past its last-resort time limit ` +
+          `(${this.unwidenedLimits.backstopMs} ms), ${unread.length} reading(s) not made`
       );
       for (const plan of unread) plan.result.unwidened_out_of_budget = true;
       return true;
@@ -1066,12 +1118,12 @@ export class TypeInferrer {
       result: InferredType;
       read: { file: SourceFile; start: number; end: number };
       path: PathFunction[];
+      /** The markings on this request's path, by file. */
+      insertions: Array<[SourceFile, Insertion[]]>;
       /** Original span of the node an expression-text locator names. */
       locatedByText?: { start: number; end: number };
     }
-    const plans: Plan[] = [];
-    const insertionsByFile = new Map<SourceFile, Insertion[]>();
-    const checkedFiles = new Set<SourceFile>();
+    const planned: Plan[] = [];
 
     // Every position is read before the first rewrite: a rewrite forgets
     // every node of its file.
@@ -1083,22 +1135,19 @@ export class TypeInferrer {
         : this.readNodes.get(result.source_location);
       if (!readNode) continue;
       const functions = pathOf(readNode);
-      let marked = 0;
+      const planInsertions: Plan['insertions'] = [];
       for (const fn of functions) {
         const insertions = literalInsertions(fn, read === 'request_body' ? readNode : undefined);
-        marked += insertions.length;
         if (insertions.length === 0) continue;
-        const file = fn.getSourceFile();
-        insertionsByFile.set(file, [...(insertionsByFile.get(file) ?? []), ...insertions]);
+        planInsertions.push([fn.getSourceFile(), insertions]);
       }
       // Nothing on the path to mark: the reading would equal the published type.
-      if (marked === 0) continue;
+      if (planInsertions.length === 0) continue;
       const path = functions.map((fn) => ({
         file: fn.getSourceFile(),
         start: fn.getStart(),
         end: fn.getEnd(),
       }));
-      for (const fn of path) checkedFiles.add(fn.file);
       let locatedByText: Plan['locatedByText'];
       if (request.expression_text && request.span_start === undefined) {
         const sourceFile = this.getSourceFile(request.file_path);
@@ -1107,22 +1156,63 @@ export class TypeInferrer {
           : undefined;
         if (located) locatedByText = { start: located.getStart(), end: located.getEnd() };
       }
-      plans.push({
+      planned.push({
         request,
         result,
         read: { file: readNode.getSourceFile(), start: readNode.getStart(), end: readNode.getEnd() },
         path,
+        insertions: planInsertions,
         locatedByText,
       });
     }
-    if (plans.length === 0) return;
+    if (planned.length === 0) return;
 
+    // The work cap: requests are taken in order while both allowances last.
+    const checkedFiles = new Set<SourceFile>();
+    let taken = 0;
+    for (const plan of planned) {
+      const added = new Set(plan.path.map((fn) => fn.file).filter((f) => !checkedFiles.has(f)));
+      if (work.readings < 1 || added.size > work.files) break;
+      work.readings -= 1;
+      work.files -= added.size;
+      for (const file of added) checkedFiles.add(file);
+      taken += 1;
+    }
+    const plans = planned.slice(0, taken);
+    const capped = planned.slice(taken);
+    if (capped.length > 0) {
+      this.log(
+        `Unwidened reading stopped at its work cap (${this.unwidenedLimits.readings} readings, ` +
+          `${this.unwidenedLimits.files} files per batch): ${capped.length} reading(s) not made`
+      );
+      for (const plan of capped) plan.result.unwidened_out_of_budget = true;
+    }
+    /** Readings that came back narrower than the published type, and so were published. */
+    let narrower = 0;
+    const report = () =>
+      this.log(
+        `Unwidened reading of ${read === 'response' ? 'responses' : 'request bodies'}: ` +
+          `${planned.length} planned, ${plans.length} taken over ${checkedFiles.size} file(s), ` +
+          `${narrower} narrower than published, ${Math.round(this.now() - started)} ms`
+      );
+    if (plans.length === 0) {
+      report();
+      return;
+    }
+
+    const insertionsByFile = new Map<SourceFile, Insertion[]>();
+    for (const plan of plans) {
+      for (const [file, list] of plan.insertions) {
+        insertionsByFile.set(file, [...(insertionsByFile.get(file) ?? []), ...list]);
+      }
+    }
     const insertions = new Map<SourceFile, Insertion[]>();
     for (const [file, list] of insertionsByFile) insertions.set(file, normalise(list));
     const before = new Map<SourceFile, ReturnType<typeof fileDiagnostics>>();
     for (const file of checkedFiles) {
-      if (outOfTime('before the rewrite', plans)) return;
+      if (outOfTime('before the rewrite', plans)) return report();
       before.set(file, fileDiagnostics(file));
+      work.step();
     }
     const originals = new Map<SourceFile, string>();
     for (const file of insertions.keys()) originals.set(file, file.getFullText());
@@ -1137,9 +1227,11 @@ export class TypeInferrer {
       // holds it loses its reading.
       const tainted = new Set<Plan>();
       for (const file of checkedFiles) {
-        if (outOfTime('while checking the rewrite', plans)) return;
+        if (outOfTime('while checking the rewrite', plans)) return report();
         const list = insertions.get(file) ?? [];
-        for (const at of addedDiagnostics(before.get(file)!, fileDiagnostics(file), list)) {
+        const after = fileDiagnostics(file);
+        work.step();
+        for (const at of addedDiagnostics(before.get(file)!, after, list)) {
           const holders = plans.flatMap((plan) => plan.path).filter(
             (fn) => fn.file === file && fn.start <= at && at < fn.end
           );
@@ -1154,7 +1246,7 @@ export class TypeInferrer {
 
       for (const [at, plan] of plans.entries()) {
         if (outOfTime('while re-reading', plans.slice(at).filter((rest) => !tainted.has(rest)))) {
-          return;
+          return report();
         }
         if (tainted.has(plan)) {
           this.log(
@@ -1170,6 +1262,7 @@ export class TypeInferrer {
         } catch {
           again = null;
         }
+        work.step();
         if (!again || again.type_string === plan.result.type_string) continue;
         // An invariant, not a case: `mappedRequest` is what keeps the re-read
         // on the node the inference read, so no fixture reaches this. It is
@@ -1190,7 +1283,9 @@ export class TypeInferrer {
           continue;
         }
         plan.result.unwidened_type_string = again.type_string;
+        narrower += 1;
       }
+      report();
     } finally {
       for (const [file, text] of originals) file.replaceWithText(text);
     }
@@ -2837,7 +2932,11 @@ export class TypeInferrer {
       isExplicit = unwrapResult.isExplicit;
     }
 
-    const explicitType = this.extractExplicitTypeFromAncestor(terminalNode);
+    // carrick#3004: around a call whose body a chain callback reshapes, an
+    // annotation or a cast further out states the reshaped value.
+    const explicitType = use.handedUnreadBody
+      ? null
+      : this.extractExplicitTypeFromAncestor(terminalNode);
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
@@ -2847,7 +2946,8 @@ export class TypeInferrer {
     // source narrows the value later (`return json as { data: Item[] }`).
     // The narrowed statement is the body, and it is reported as stated, so a
     // model symbol naming an element inside it is not kept as the body.
-    const narrowed = func ? this.narrowedBodyStatement(terminalNode, func) : undefined;
+    const narrowed =
+      func && !use.handedUnreadBody ? this.narrowedBodyStatement(terminalNode, func) : undefined;
     if (narrowed) {
       typeString = narrowed.text;
       isExplicit = true;
@@ -3051,6 +3151,32 @@ export class TypeInferrer {
     // typed parameter. A function that converts the value into something new
     // states nothing about it, and neither does a use on a failure path.
     const untypedAnswer = typeString.trim() === 'any' || typeString.trim() === 'unknown';
+    // carrick#3004: the call's own value is untyped and a callback in its
+    // chain is handed it unread and builds a new value from it. The function
+    // around the call states that new value, not the body, so nothing here
+    // is a response contract. The decision rides the row: a plain answer is
+    // re-read by the capture's own locator, which publishes the chain end.
+    // A carrier's payload or a rule's that is itself a carrier of an untyped
+    // value (a transport response around `unknown`) is no read either.
+    const callPayload =
+      carrierPayload ??
+      (unwrapResult.wasUnwrapped && !untypedAnswer ? unwrapResult.payloadType : undefined) ??
+      returnType;
+    if (use.handedUnreadBody && (untypedAnswer || this.holdsTopTypeArgument(callPayload))) {
+      this.log(
+        `Call result at ${where} is untyped and handed unread to a callback that builds a ` +
+          'new value from it; this site states no response contract'
+      );
+      return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+        path: '',
+        kind: 'unknown',
+        reason: 'reshaped_by_callback',
+        detail:
+          "this call's result is handed unread to a callback in its chain that builds a new " +
+          'value from it, and nothing in the chain states the body, so the value the chain ' +
+          'ends in is not the response this call receives',
+      });
+    }
     if (untypedAnswer && func && !explicitType && !unwrapResult.wasUnwrapped && !carrierPayload) {
       const stated = this.statedInFunction(callExpr, func, {
         returned: true,
@@ -4002,9 +4128,14 @@ export class TypeInferrer {
     // the body unread and casts it. That cast is the body read, and it comes
     // before the return-statement answer below, which for a chain is the
     // value the caller computed from the body, not the body.
-    const chainRead = this.bodyReadInCallbackChain(callExpr);
-    if (chainRead) {
-      return { terminal: chainRead, projectionOnly: false, projections: [] };
+    const chain = this.bodyReadInCallbackChain(callExpr);
+    if (chain.read) {
+      return { terminal: chain.read, projectionOnly: false, projections: [] };
+    }
+    // carrick#3004: a callback is handed the body unread and nothing states
+    // it. The return below would answer the value that callback built.
+    if (chain.handedUnread) {
+      return { terminal: callExpr, projectionOnly: false, projections: [], handedUnreadBody: true };
     }
 
     // A return statement answers only for a call of the function it returns
@@ -5417,14 +5548,24 @@ export class TypeInferrer {
    * the chain ends in is what the caller computed from it, and publishing
    * that as the body is the false mismatch this rule exists for.
    *
-   * Exactly one such cast across the whole chain answers. None, or more than
+   * A call that narrows that parameter (a schema validates it, or a function
+   * returns it unchanged) states it the same way (carrick#3004).
+   *
+   * Exactly one such read across the whole chain answers. None, or more than
    * one (a callback on the failure side can be handed an `unknown` too), and
-   * the walk carries on as before. A parameter typed `any` is not read: an
-   * unresolved library types every callback that way, success and failure
-   * alike, so it says nothing about which one is the body.
+   * `handedUnread` says a callback was handed the body all the same: what it
+   * returns is a value built from the body (`.mapOk`, `.then`, `.andThen`,
+   * whatever the name), so the value the chain ends in is never the body
+   * (carrick#3004). A parameter typed `any` is not read: an unresolved
+   * library types every callback that way, success and failure alike, so it
+   * says nothing about which one is the body.
    */
-  private bodyReadInCallbackChain(callExpr: CallExpression): Node | undefined {
+  private bodyReadInCallbackChain(callExpr: CallExpression): {
+    read?: Node;
+    handedUnread: boolean;
+  } {
     const reads: Node[] = [];
+    let handedUnread = false;
     let receiver: Node = callExpr;
     for (let link = 0; link < 64; link++) {
       const access = receiver.getParent();
@@ -5441,35 +5582,62 @@ export class TypeInferrer {
       }
       for (const arg of call.getArguments()) {
         if (Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)) {
-          reads.push(...this.castsOfUnreadParameter(arg));
+          const statements = this.statementsOfUnreadParameter(arg);
+          if (statements) {
+            handedUnread = true;
+            reads.push(...statements);
+          }
         }
       }
       receiver = call;
     }
-    return reads.length === 1 ? reads[0] : undefined;
+    return reads.length === 1 ? { read: reads[0], handedUnread } : { handedUnread };
   }
 
   /**
-   * The casts of a callback's first parameter, when the compiler types that
-   * parameter `unknown`: `response as T` and `<T>response`, the operand being
-   * the parameter itself. A cast that leaves a position open states nothing
-   * about the body and is skipped.
+   * `type`, or a type argument it is instantiated with at any depth, is
+   * `any` or `unknown`: `Chain<unknown>`, `Task<Outcome<unknown, E>>`. The
+   * value such a carrier hands its callbacks is untyped (carrick#3004).
    */
-  private castsOfUnreadParameter(callback: ArrowFunction | FunctionExpression): Node[] {
+  private holdsTopTypeArgument(type: Type, depth = 0): boolean {
+    if (type.isAny() || type.isUnknown()) return true;
+    if (depth >= 6) return false;
+    const args = [...type.getTypeArguments(), ...type.getAliasTypeArguments()];
+    return args.some((arg) => this.holdsTopTypeArgument(arg, depth + 1));
+  }
+
+  /**
+   * What a callback states about its first parameter, when the compiler types
+   * that parameter `unknown`, or `undefined` when it is not handed one. A
+   * statement is a cast whose operand is the parameter itself (`response as
+   * T`, `<T>response`), or a call that narrows it (`callStatesItsArgument`:
+   * a schema validates it, or a function returns it unchanged). A cast that
+   * leaves a position open states nothing about the body and is skipped.
+   */
+  private statementsOfUnreadParameter(
+    callback: ArrowFunction | FunctionExpression
+  ): Node[] | undefined {
     const param = callback.getParameters()[0];
     const name = param?.getNameNode();
     if (!param || !name || !Node.isIdentifier(name) || !param.getType().isUnknown()) {
-      return [];
+      return undefined;
     }
     const symbol = name.getSymbol();
     if (!symbol) return [];
-    return callback.getDescendants().filter((node) => {
-      if (!Node.isAsExpression(node) && !Node.isTypeAssertion(node)) return false;
-      let operand: Node = node.getExpression();
+    const isParameter = (node: Node): boolean => {
+      let operand: Node = node;
       while (Node.isParenthesizedExpression(operand)) {
         operand = operand.getExpression();
       }
-      if (!Node.isIdentifier(operand) || operand.getSymbol() !== symbol) return false;
+      return Node.isIdentifier(operand) && operand.getSymbol() === symbol;
+    };
+    return callback.getDescendants().filter((node) => {
+      if (Node.isCallExpression(node)) {
+        const index = node.getArguments().findIndex(isParameter);
+        return index >= 0 && this.callStatesItsArgument(node, index);
+      }
+      if (!Node.isAsExpression(node) && !Node.isTypeAssertion(node)) return false;
+      if (!isParameter(node.getExpression())) return false;
       const stated = node.getType();
       const statedNode = node.getTypeNode();
       return (
@@ -11736,6 +11904,18 @@ export class TypeInferrer {
   private logError(message: string): void {
     console.error(`[sidecar:type-inferrer:error] ${message}`);
   }
+}
+
+/**
+ * What is left of one batch's unwidened reading allowance (carrick#2629),
+ * shared by the responses' rewrite and the bodies' after it.
+ */
+interface UnwidenedWork {
+  readings: number;
+  files: number;
+  /** The `now()` past which the reading stops: the wall-clock backstop. */
+  backstopAt: number;
+  step: UnwidenedStepDone;
 }
 
 /** A node kept by its place, for a reading made after its file was rewritten. */

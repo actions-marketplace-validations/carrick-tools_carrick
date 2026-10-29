@@ -253,6 +253,11 @@ type Outcome =
        */
       members?: readonly ts.Declaration[];
       bodyMembers?: readonly ts.Declaration[];
+      /**
+       * Stamped: why a receive op's `request` was dropped while the op
+       * itself verified (carrick#2968). Only `request_member_missing`.
+       */
+      requestDropped?: string;
     }
   | { verdict: 'failed' | 'unchecked'; reason: string };
 
@@ -475,6 +480,13 @@ export interface ModuleGraph {
 
 const NO_MODULE_GRAPH: ModuleGraph = { packageDirectoryOf: () => undefined, resolveModule: () => undefined };
 
+/**
+ * Test instrumentation, never on the wire: how many times the lister built a
+ * handler parameter's members and printed a type, since the caller last
+ * reset them (carrick#2977).
+ */
+export const surfaceReadCounts = { handlerMemberBuilds: 0, typePrints: 0 };
+
 export class LibraryClaimsVerifier {
   constructor(
     private readonly project: Project,
@@ -503,6 +515,7 @@ export class LibraryClaimsVerifier {
             receiver: check.receiver,
             verdict: 'verified',
             ...(outcome.declarations?.length ? { declarations: outcome.declarations } : {}),
+            ...(outcome.requestDropped === undefined ? {} : { request_dropped: outcome.requestDropped }),
           }
         : {
             claim_id: check.claim_id,
@@ -834,6 +847,8 @@ export class LibraryClaimsVerifier {
         const declarations: DeclaredAt[] = [];
         const members: ts.Declaration[] = [];
         const bodyMembers: ts.Declaration[] = [];
+        // A request one receiver does not hold is dropped for the op (carrick#2968).
+        let requestDropped: string | undefined;
         for (const receiver of receivers.value) {
           const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults, collectionsOf);
           if (result.outcome.verdict !== 'verified') return result;
@@ -841,11 +856,13 @@ export class LibraryClaimsVerifier {
           declarations.push(...(result.outcome.declarations ?? []));
           members.push(...(result.outcome.members ?? []));
           bodyMembers.push(...(result.outcome.bodyMembers ?? []));
+          requestDropped ??= result.outcome.requestDropped;
         }
         const verified: Outcome =
           declarations.length > 0 ? { verdict: 'verified', declarations: sortedDeclarations(declarations) } : { ...VERIFIED };
         if (verified.verdict === 'verified' && members.length > 0) verified.members = members;
-        if (verified.verdict === 'verified' && bodyMembers.length > 0) verified.bodyMembers = bodyMembers;
+        if (verified.verdict === 'verified' && requestDropped !== undefined) verified.requestDropped = requestDropped;
+        else if (verified.verdict === 'verified' && bodyMembers.length > 0) verified.bodyMembers = bodyMembers;
         return { outcome: verified, holding };
       };
 
@@ -901,7 +918,12 @@ export class LibraryClaimsVerifier {
     const outcomes: Record<string, number> = {};
     const observe = (check: LibraryCheck, outcome: Outcome): void => {
       if (check.claim.kind !== 'op') return;
-      const read = outcome.verdict === 'verified' ? 'verified' : `${outcome.verdict} ${outcome.reason}`;
+      const read =
+        outcome.verdict !== 'verified'
+          ? `${outcome.verdict} ${outcome.reason}`
+          : outcome.requestDropped === undefined
+            ? 'verified'
+            : `verified request_dropped ${outcome.requestDropped}`;
       outcomes[read] = (outcomes[read] ?? 0) + 1;
       if (outcome.verdict !== 'verified') return;
       if (check.claim.op === 'send' && check.claim.payload !== undefined) {
@@ -932,13 +954,25 @@ export class LibraryClaimsVerifier {
    * (`receiverExpression` on the export's `importLine`, read through
    * `DeclarationReader.returnOf`) and lists from it.
    *
+   * A member of an `instance:` receiver whose call returns another object
+   * that routes are registered on lists that object as its `scope_receiver`
+   * (carrick#2774), built as the verifier builds a scope step, under a cap of
+   * its own and left out of the hash.
+   *
+   * Each member's handler-parameter members (carrick#2674 S3) are listed
+   * only when `options.handlers` is set, and each signature's result
+   * candidates (carrick#2817) only when `options.resultCandidates` is
+   * (carrick#2966): on a large package either costs more than the rest of the
+   * listing.
+   *
    * `surface_sha256` is the full-surface hash (see `fullSurfaceSha256`).
    */
   listSurface(
     fromDir: string,
     packages: string[],
     maxEntries: number,
-    only: Readonly<Record<string, string[]>> = {}
+    only: Readonly<Record<string, string[]>> = {},
+    options: SurfaceOptions = {}
   ): ListedSurface {
     if (packages.length === 0) return { surfaces: [], surface_sha256: fullSurfaceSha256([]) };
     // Each specifier twice: as a namespace, which holds its named exports, and
@@ -970,10 +1004,12 @@ export class LibraryClaimsVerifier {
     const buildLines: string[] = [];
     const builtIndex = new Map<string, number>();
     packages.forEach((pkg, i) => {
-      for (const { export: name, receivers } of makers[i]) {
+      for (const { export: name, receivers, scopes } of makers[i]) {
         const local = `__carrick_e${importLines.length}`;
         importLines.push(probeLine(pkg, name, local));
-        for (const receiver of receivers) {
+        // The scope receivers a maker's members may return (carrick#2774) are
+        // built beside the makers, so `listPackage` reads them as it reads those.
+        for (const receiver of [...receivers, ...scopes]) {
           const expression = receiverExpression(local, receiver);
           if (expression === undefined) continue;
           builtIndex.set(builtKey({ package: pkg, export: name }, receiver), buildLines.length);
@@ -983,14 +1019,16 @@ export class LibraryClaimsVerifier {
     });
     const firstBuild = imports.length + importLines.length;
 
-    const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) =>
-      packages.map((pkg, i) =>
-        reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], (name, receiver) => {
+    const surfaces = this.readProbe(fromDir, [...imports, ...importLines, ...buildLines], (checker, reader, file) => {
+      // One budget for the whole call, spent across its specifiers: the answer is one line.
+      reader.startListing(options.maxHandlerMembers ?? HANDLER_LISTING_BUDGET);
+      return packages.map((pkg, i) =>
+        reader.listPackage(pkg, probeOf(file, i), maxEntries, only[pkg], options, (name, receiver) => {
           const index = builtIndex.get(builtKey({ package: pkg, export: name }, receiver));
           return index === undefined ? undefined : resolvedBuild(checker, file.statements[firstBuild + index]);
         })
-      )
-    );
+      );
+    });
     return { surfaces, surface_sha256: fullSurfaceSha256(surfaces) };
   }
 
@@ -1033,6 +1071,15 @@ interface ListedExport {
   type: ts.Type;
 }
 
+/** An instance receiver the surface lists, with what the scope pass reads its members on (carrick#2774). */
+interface ScopeSource {
+  export: string;
+  target: ts.Symbol;
+  type: ts.Type;
+  home: ReadonlySet<string>;
+  receiver: SurfaceReceiver;
+}
+
 /** A way an export makes a receiver, by receiver id, with the library signatures that make it. */
 interface Maker {
   receiver: string;
@@ -1064,8 +1111,8 @@ export interface ListedSurface {
  * array of `[package, exports]` for every surface that listed at least one
  * export, sorted by `package` (code unit order). A specifier that lists
  * nothing (unresolved, local, no value exports) is left out, so asking for a
- * subpath a version does not have changes nothing. Handler members are not
- * hashed. Type text already names
+ * subpath a version does not have changes nothing. Handler members, result
+ * candidates and scope receivers are not hashed. Type text already names
  * the request's directory as `<root>`.
  */
 export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
@@ -1073,11 +1120,12 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
     .filter(surface => surface.reason === undefined && surface.exports.length > 0)
     .map(surface => [surface.package, surface.exports] as const)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  // A member's `handlers` (carrick#2674) and a signature's `result_candidates`
-  // (carrick#2817) are out of the hash at every depth, so a package's key does
-  // not change when the lister learns to list them.
+  // A member's `handlers` (carrick#2674), a signature's `result_candidates`
+  // (carrick#2817) and a member's `scope_receiver` (carrick#2774) are out of
+  // the hash at every depth, so a package's key does not change when the
+  // lister learns to list them.
   const text = JSON.stringify(listed, (key, value) =>
-    key === 'handlers' || key === 'result_candidates' ? undefined : value
+    key === 'handlers' || key === 'result_candidates' || key === 'scope_receiver' ? undefined : value
   );
   return crypto.createHash('sha256').update(text).digest('hex');
 }
@@ -1251,6 +1299,18 @@ function receiverExpression(local: string, receiver: string): string | undefined
   return text;
 }
 
+/**
+ * The id of the receiver `member` of the receiver `receiver` returns when
+ * called with a path (carrick#2774): `receiver>scope:member`. Undefined for a
+ * receiver that is not an instance, or a member name the verifier's grammar
+ * does not read back as one scope step.
+ */
+function scopeReceiverId(receiver: string, member: string): string | undefined {
+  if (!receiver.startsWith('instance:') || receiver.includes('>') || /[>.\s]/.test(member)) return undefined;
+  const id = `${receiver}>scope:${member}`;
+  return parseReceiver(id)?.scope === member ? id : undefined;
+}
+
 /** The symbols that say who declared a type: its own, its alias's, its parts'. */
 function typeSymbols(type: ts.Type): (ts.Symbol | undefined)[] {
   const symbols: (ts.Symbol | undefined)[] = [type.getSymbol(), type.aliasSymbol];
@@ -1350,8 +1410,31 @@ class DeclarationReader {
   private currentPackage = '';
   /** `declaredProperties` per type, for `currentPackage` (its augmentations decide them). */
   private readonly declared = new Map<ts.Type, ts.Symbol[]>();
+  /**
+   * A handler parameter's listed members per type (`handlerMembersOf`), kept
+   * across every specifier of one package and cleared with `declared` when
+   * the package changes: a member's listing reads that package's
+   * augmentations (carrick#2977).
+   */
+  private readonly handlerMembers = new Map<ts.Type, { members: SurfaceHandlerMember[]; dropped: number }>();
+  /** `takesString` per signature, and `scopeMembers` per type and home: the same types recur across receivers. */
+  private readonly takesStringRead = new Map<ts.Signature, boolean>();
+  private readonly scopeMembersRead = new Map<ts.Type, Map<string, readonly string[]>>();
+  /** Handler-parameter members `HANDLER_MEMBER_CAP` and the listing's budget dropped in the package being listed. */
+  private handlersDropped = 0;
+  /** Handler-parameter members the rest of this `listSurface` call may still list (carrick#3016). */
+  private handlerBudget = HANDLER_LISTING_BUDGET;
+
+  /** Begin one `listSurface` call: its specifiers share `handlerBudget` handler-parameter members. */
+  startListing(handlerBudget: number): void {
+    this.handlerBudget = handlerBudget;
+  }
+  /** Whether the package being listed lists each signature's `result_candidates`. */
+  private listResultCandidates = false;
   /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
   private readonly printedRoots: readonly string[];
+  /** `printed` per type: its text reads nothing but the type and `printedRoots` (carrick#2977). */
+  private readonly printedTexts = new Map<ts.Type, string>();
 
   constructor(
     private readonly program: ts.Program,
@@ -2399,6 +2482,10 @@ class DeclarationReader {
     const labels = claim.key_labels ?? {};
     let best: RankedFailure | undefined;
     let held = false;
+    // An overload that holds but for a request member the declarations lack
+    // (carrick#2968): the op stands without its request, unless another
+    // overload holds the request too. Every other request fault fails the op.
+    let requestDropped: string | undefined;
     const bodyMembers: ts.Declaration[] = [];
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
@@ -2408,16 +2495,24 @@ class DeclarationReader {
       }
       if (result.rank === Infinity && claim.request !== undefined) {
         const read = this.requestOutcome(signature, claim.handler!, claim.request, bodyMembers);
+        if (read?.verdict === 'failed' && read.reason === 'request_member_missing') {
+          requestDropped = read.reason;
+          continue;
+        }
         if (read) result = { rank: 5, outcome: read };
       }
       if (result.rank === Infinity) {
         held = true;
+        requestDropped = undefined;
         break;
       }
       best = furthest(best, result.rank, result.outcome);
     }
-    if (!held) return best!.outcome;
-    if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
+    if (!held && requestDropped === undefined) return best!.outcome;
+    if (boundRuns) {
+      const ran = this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
+      return ran.verdict === 'verified' && requestDropped !== undefined ? { ...ran, requestDropped } : ran;
+    }
     const declarations = this.declarationsOf(callee);
     const members = callee.named
       ? (callee.named.property.declarations ?? [])
@@ -2427,6 +2522,7 @@ class DeclarationReader {
       ...(declarations.length > 0 ? { declarations } : {}),
       ...(members.length > 0 ? { members } : {}),
       ...(bodyMembers.length > 0 ? { bodyMembers } : {}),
+      ...(requestDropped === undefined ? {} : { requestDropped }),
     };
   }
 
@@ -3373,6 +3469,7 @@ class DeclarationReader {
     probe: SurfaceProbe,
     maxEntries: number,
     only: readonly string[] | undefined,
+    options: SurfaceOptions,
     built: (exportName: string, receiver: string) => ts.Signature | undefined
   ): LibrarySurface {
     this.setPackage(pkg);
@@ -3397,17 +3494,16 @@ class DeclarationReader {
       dropped += 1;
       return false;
     };
-    // Handler-parameter members (carrick#2674) have a cap of their own, so they
-    // take nothing from the main one: the listing, `truncated` and the hash are
-    // the ones the lister gave before handlers were listed.
-    let handlerBudget = maxEntries;
-    const takeHandler = (): boolean => {
-      if (handlerBudget <= 0) return false;
-      handlerBudget -= 1;
-      return true;
-    };
+    // Handler-parameter members (carrick#2674) take nothing from the main cap,
+    // so the listing, `truncated` and the hash are the ones the lister gave
+    // before handlers were listed; each parameter has a cap of its own
+    // (`HANDLER_MEMBER_CAP`, carrick#2966).
+    this.handlersDropped = 0;
+    this.listResultCandidates = options.resultCandidates === true;
+    const withHandlers = options.handlers === true;
     // Four passes: every export and receiver, then every member name, then the
-    // members of each handler's parameters (carrick#2674), then signatures.
+    // members of each handler's parameters (carrick#2674; only when asked,
+    // carrick#2966), then signatures.
     const names: Array<() => void> = [];
     const handlers: Array<() => void> = [];
     const fills: Array<() => void> = [];
@@ -3415,6 +3511,8 @@ class DeclarationReader {
     // What the package's default export names: a maker also exported by name
     // under this declaration is imported the same way, so it is read the same.
     const defaultTarget = exported.find(each => each.name === 'default')?.target;
+    // The instance receivers listed, for the scope pass (carrick#2774).
+    const instances: ScopeSource[] = [];
     for (const { name, target, type } of exported) {
       if (!take()) continue;
       const entry: SurfaceExport = { export: name, receivers: [] };
@@ -3423,7 +3521,11 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, takeHandler, names, handlers, fills));
+        const receiver = this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills);
+        entry.receivers.push(receiver);
+        if (receiverName.startsWith('instance:')) {
+          instances.push({ export: name, target, type: receiverType, home, receiver });
+        }
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
@@ -3442,27 +3544,216 @@ class DeclarationReader {
       }
     }
     for (const run of names) run();
-    for (const run of handlers) run();
+    if (withHandlers) for (const run of handlers) run();
     for (const fill of fills) fill();
+    this.listScopeReceivers(pkg, instances, maxEntries, withHandlers, built);
     surface.truncated = dropped;
+    if (withHandlers) surface.handlers_truncated = this.handlersDropped;
     return surface;
+  }
+
+  /**
+   * The fifth pass (carrick#2774): each own member of an instance receiver
+   * whose call returns the object routes are registered on lists it as
+   * `scope_receiver`, outlined as any receiver is. Everything it lists draws
+   * on one budget of its own, spent after every other pass, so the listing
+   * without it, `truncated` and the hash are the ones the lister gave before.
+   * One level: a scope receiver lists no scope receiver of its own.
+   */
+  private listScopeReceivers(
+    pkg: string,
+    sources: readonly ScopeSource[],
+    maxEntries: number,
+    withHandlers: boolean,
+    built: (exportName: string, receiver: string) => ts.Signature | undefined
+  ): void {
+    let budget = maxEntries;
+    const take = (): boolean => budget > 0 && (budget--, true);
+    const names: Array<() => void> = [];
+    const handlers: Array<() => void> = [];
+    const fills: Array<() => void> = [];
+    for (const source of sources) {
+      const holder = this.surfaceHolder(pkg, source.type, source.home);
+      for (const member of source.receiver.members) {
+        const id = member.own ? scopeReceiverId(source.receiver.receiver, member.name) : undefined;
+        if (id === undefined) continue;
+        const callee = this.ownCallee(holder, [], member.name, 'call');
+        if (!('signatures' in callee)) continue;
+        if (!callee.signatures.some(signature => this.takesString(signature))) continue;
+        const type = this.scopeTypeOf(callee.signatures, built(source.export, id), source.type, source.home);
+        if (type === undefined || !take()) continue;
+        const home = this.homeOf(pkg, [source.target, ...typeSymbols(type)]);
+        member.scope_receiver = this.outlineReceiver(pkg, id, type, home, take, names, handlers, fills);
+      }
+    }
+    for (const run of names) run();
+    if (withHandlers) for (const run of handlers) run();
+    for (const fill of fills) fill();
   }
 
   /**
    * The receivers each export of a specifier can make, by receiver id, for
    * the probe statements that build them (see `LibraryClaimsVerifier.listSurface`).
    */
-  makersOf(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): { export: string; receivers: string[] }[] {
+  makersOf(
+    pkg: string,
+    probe: SurfaceProbe,
+    only: readonly string[] | undefined
+  ): { export: string; receivers: string[]; scopes: string[] }[] {
     this.setPackage(pkg);
     const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
     if (moduleRead?.reason) return [];
     return (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
-      .map(({ name, target, type }) => ({
-        export: name,
-        receivers: this.makers(pkg, target, type).map(maker => maker.receiver),
-      }))
+      .map(({ name, target, type }) => {
+        const makers = this.makers(pkg, target, type);
+        return {
+          export: name,
+          receivers: makers.map(maker => maker.receiver),
+          scopes: this.scopeCandidates(pkg, target, makers),
+        };
+      })
       .filter(({ receivers }) => receivers.length > 0);
+  }
+
+  /**
+   * The `R>scope:m` receivers an export's `instance:` makers may have
+   * (carrick#2774): for each object type a maker's overloads declare as their
+   * return, each own member that `scopeTypeOf` lists at its declared return.
+   * A superset of the listing, which reads each at the type the probe's build
+   * resolves; the second program builds these so `listPackage` can.
+   */
+  private scopeCandidates(pkg: string, target: ts.Symbol, makers: readonly Maker[]): string[] {
+    const found = new Set<string>();
+    for (const maker of makers) {
+      if (!maker.receiver.startsWith('instance:')) continue;
+      const types = new Set(maker.signatures.map(sig => this.checker.getReturnTypeOfSignature(sig)));
+      for (const type of types) {
+        if (this.returnSaysNothing(type) || !this.isObjectType(type)) continue;
+        const home = this.homeOf(pkg, [target, ...typeSymbols(type)]);
+        for (const name of this.scopeMembers(pkg, type, home)) {
+          const id = scopeReceiverId(maker.receiver, name);
+          if (id !== undefined) found.add(id);
+        }
+      }
+    }
+    return [...found];
+  }
+
+  /** The members of `type` that list a scope receiver at their declared return, read once per type and home. */
+  private scopeMembers(pkg: string, type: ts.Type, home: ReadonlySet<string>): readonly string[] {
+    const key = [...home].sort().join('\u0000');
+    let byHome = this.scopeMembersRead.get(type);
+    if (byHome === undefined) this.scopeMembersRead.set(type, (byHome = new Map()));
+    const read = byHome.get(key);
+    if (read !== undefined) return read;
+    const names: string[] = [];
+    const holder = this.surfaceHolder(pkg, type, home);
+    for (const property of sortedByName(this.namedProperties(type))) {
+      if (!this.mayScope(property)) continue;
+      const callee = this.ownCallee(holder, [], property.getName(), 'call');
+      if ('signatures' in callee && this.scopeTypeOf(callee.signatures, undefined, type, home) !== undefined) {
+        names.push(property.getName());
+      }
+    }
+    byHome.set(key, names);
+    return names;
+  }
+
+  /** Some library signature of the member takes a string: the cheap superset of what `scopeTypeOf` asks first. */
+  private mayScope(property: ts.Symbol): boolean {
+    return this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call').some(signature =>
+      this.takesString(signature)
+    );
+  }
+
+  /**
+   * The object a scope member returns, as the verifier reads a scope step
+   * (carrick#2774): what a route is registered on when the member is called
+   * with a path. Undefined unless:
+   * - some own signature takes a string, positionally or at a key of an
+   *   object parameter;
+   * - the returns (at `built`'s defaults, less those that say nothing) are
+   *   all object types, none thenable, sharing one declared symbol that is
+   *   declared in the receiver's home and has a callable member of its own;
+   * - that symbol and the receiver's share no declaration in the home
+   *   (`family`): the receiver itself (`basePath(): this`), a sibling or a
+   *   wrapper of one base is a builder's next link, not an object routes
+   *   are registered on.
+   * The type is the return of the overload `built` resolves, when that is
+   * one of the signatures that take a string, else the first of them.
+   */
+  private scopeTypeOf(
+    signatures: readonly ts.Signature[],
+    built: ts.Signature | undefined,
+    receiver: ts.Type,
+    home: ReadonlySet<string>
+  ): ts.Type | undefined {
+    const takers = signatures.filter(signature => this.takesString(signature));
+    const returns = takers
+      .map(signature => ({ signature, type: this.returnOf(signature, built) }))
+      .filter(({ type }) => !this.returnSaysNothing(type));
+    if (returns.length === 0) return undefined;
+    const symbolOf = (type: ts.Type): ts.Symbol | undefined => type.getSymbol() ?? type.aliasSymbol;
+    const symbol = symbolOf(returns[0].type);
+    if (symbol === undefined) return undefined;
+    // The receiver itself, a sibling of it, or a wrapper built from the same
+    // base (a fluent builder's `.default(x)`) is the same kind of thing, not
+    // an object routes are registered on: abstain.
+    const mine = this.family(receiver, home);
+    if ([...this.family(returns[0].type, home)].some(each => mine.has(each))) return undefined;
+    for (const { type } of returns) {
+      if (!this.isObjectType(type) || symbolOf(type) !== symbol || this.isThenable(type)) return undefined;
+    }
+    if (!(symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))) return undefined;
+    const chosen = returns.find(({ signature }) => built !== undefined && this.instantiates(built, signature)) ?? returns[0];
+    const callable = this.namedProperties(chosen.type).some(
+      member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
+    );
+    return callable ? chosen.type : undefined;
+  }
+
+  /** The type's own declaration and every base it extends or implements that its home declares. */
+  private family(type: ts.Type, home: ReadonlySet<string>): Set<ts.Symbol> {
+    const found = new Set<ts.Symbol>();
+    const visit = (each: ts.Type, depth: number): void => {
+      const target = ((each as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference ? (each as ts.TypeReference).target : each;
+      const symbol = target.getSymbol();
+      if (symbol === undefined || found.has(symbol) || depth > 12) return;
+      if (!(symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))) return;
+      found.add(symbol);
+      if (((target as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.ClassOrInterface) {
+        for (const base of this.checker.getBaseTypes(target as ts.InterfaceType)) visit(base, depth + 1);
+      }
+    };
+    visit(type, 0);
+    return found;
+  }
+
+  /** A parameter of the signature accepts a string, positionally or at a key of its object. */
+  private takesString(signature: ts.Signature): boolean {
+    let read = this.takesStringRead.get(signature);
+    if (read === undefined) this.takesStringRead.set(signature, (read = this.readTakesString(signature)));
+    return read;
+  }
+
+  private readTakesString(signature: ts.Signature): boolean {
+    const count = signature.getParameters().length;
+    for (let index = 0; index < count; index++) {
+      const slot = this.keyParameterAt(signature, index);
+      if (slot === undefined || slot === VARIADIC) continue;
+      if (this.acceptsString(this.throughConditional(slot))) return true;
+      if (this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
+        if (this.listKeys(slot, () => true).some(key => key.accepts_string)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** The type has a callable `then`: awaiting it gives something else. */
+  private isThenable(type: ts.Type): boolean {
+    const then = this.checker.getPropertyOfType(type, 'then');
+    return then !== undefined && this.checker.getNonNullableType(this.checker.getTypeOfSymbol(then)).getCallSignatures().length > 0;
   }
 
   /**
@@ -3610,7 +3901,6 @@ class DeclarationReader {
     type: ts.Type,
     home: ReadonlySet<string>,
     take: () => boolean,
-    takeHandler: () => boolean,
     names: Array<() => void>,
     handlers: Array<() => void>,
     fills: Array<() => void>
@@ -3639,7 +3929,7 @@ class DeclarationReader {
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
         handlers.push(() => {
-          const listed = this.listHandlers(own ? callee.signatures : library, takeHandler);
+          const listed = this.listHandlers(own ? callee.signatures : library);
           if (listed.length > 0) member.handlers = listed;
         });
         fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
@@ -3655,13 +3945,13 @@ class DeclarationReader {
    * A parameter that declares no member lists nothing, and so does a handler
    * none of whose parameters do.
    */
-  private listHandlers(signatures: readonly ts.Signature[], take: () => boolean): SurfaceHandler[] {
+  private listHandlers(signatures: readonly ts.Signature[]): SurfaceHandler[] {
     const listed: SurfaceHandler[] = [];
     const seen = new Set<string>();
     const add = (arg: number, key: string | undefined, slot: ts.Type): void => {
       const place = JSON.stringify([arg, key ?? null]);
       if (seen.has(place)) return;
-      const params = this.listHandlerParams(slot, take);
+      const params = this.listHandlerParams(slot);
       if (params.length === 0) return;
       seen.add(place);
       listed.push(key === undefined ? { arg, params } : { arg, key, params });
@@ -3689,8 +3979,8 @@ class DeclarationReader {
     return listed;
   }
 
-  /** The parameters of a function type's first signature that declare members, each member counting against the cap. */
-  private listHandlerParams(handler: ts.Type, take: () => boolean): SurfaceHandlerParam[] {
+  /** The parameters of a function type's first signature that declare members, each with its members (`handlerMembersOf`). */
+  private listHandlerParams(handler: ts.Type): SurfaceHandlerParam[] {
     const slot = this.throughConditional(this.throughConstraint(handler));
     if (slot === VARIADIC) return [];
     const signature = this.parts(slot)
@@ -3700,31 +3990,79 @@ class DeclarationReader {
     const listed: SurfaceHandlerParam[] = [];
     signature.getParameters().forEach((parameter, index) => {
       const type = this.checker.getTypeOfSymbol(parameter);
-      if (this.namedProperties(type).length === 0 || !take()) return;
-      const members: SurfaceHandlerMember[] = [];
-      this.listMembers(type, [], members, take);
+      if (this.namedProperties(type).length === 0) return;
+      const { members, dropped } = this.handlerMembersOf(type);
+      this.handlersDropped += dropped;
+      // Past the listing's budget a parameter is left out whole and counted (carrick#3016).
+      if (members.length > this.handlerBudget) {
+        this.handlersDropped += members.length;
+        return;
+      }
+      this.handlerBudget -= members.length;
       listed.push({ param: index, name: parameter.getName(), type: this.printed(type), members });
     });
     return listed;
   }
 
-  /** A type's declared members by path, parents before children, each level sorted by name, down to `HANDLER_MEMBER_DEPTH`. */
-  private listMembers(type: ts.Type, prefix: string[], into: SurfaceHandlerMember[], take: () => boolean): void {
-    for (const property of sortedByName(this.namedProperties(type))) {
-      if (!take()) continue;
-      const memberType = this.checker.getTypeOfSymbol(property);
-      const path = [...prefix, property.getName()];
-      const callable = this.librarySignatures(memberType, 'call').length > 0;
-      into.push({
-        path,
-        type: this.printed(memberType),
-        optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
-        function: callable,
-      });
-      if (!callable && path.length < HANDLER_MEMBER_DEPTH && this.isObjectType(memberType)) {
-        this.listMembers(memberType, path, into, take);
+  /**
+   * A handler parameter's declared members by path, down to
+   * `HANDLER_MEMBER_DEPTH`, at most `HANDLER_MEMBER_CAP` of them (carrick#2966).
+   * The cap keeps every top-level member before any nested one, so a wide
+   * parameter loses its deepest members, never a top-level one a later member
+   * name sorts after. Kept members come back parents before children, each
+   * level sorted by name. Read once per type in a package, across its
+   * specifiers: a type many handlers share is listed once.
+   */
+  private handlerMembersOf(type: ts.Type): { members: SurfaceHandlerMember[]; dropped: number } {
+    const known = this.handlerMembers.get(type);
+    if (known) return known;
+    surfaceReadCounts.handlerMemberBuilds += 1;
+    interface Node { member: SurfaceHandlerMember; children: Node[] }
+    const roots: Node[] = [];
+    let kept = 0;
+    let dropped = 0;
+    // Breadth first: a level is kept whole, in name order, before the next.
+    let level: Array<{ type: ts.Type; prefix: string[]; into: Node[] }> = [{ type, prefix: [], into: roots }];
+    while (level.length > 0) {
+      const next: typeof level = [];
+      for (const { type: holder, prefix, into } of level) {
+        for (const property of sortedByName(this.namedProperties(holder))) {
+          if (kept >= HANDLER_MEMBER_CAP) {
+            dropped += 1;
+            continue;
+          }
+          kept += 1;
+          const memberType = this.checker.getTypeOfSymbol(property);
+          const path = [...prefix, property.getName()];
+          const callable = this.librarySignatures(memberType, 'call').length > 0;
+          const node: Node = {
+            member: {
+              path,
+              type: this.printed(memberType),
+              optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
+              function: callable,
+            },
+            children: [],
+          };
+          into.push(node);
+          if (!callable && path.length < HANDLER_MEMBER_DEPTH && this.isObjectType(memberType)) {
+            next.push({ type: memberType, prefix: path, into: node.children });
+          }
+        }
       }
+      level = next;
     }
+    const members: SurfaceHandlerMember[] = [];
+    const emit = (nodes: Node[]): void => {
+      for (const node of nodes) {
+        members.push(node.member);
+        emit(node.children);
+      }
+    };
+    emit(roots);
+    const listed = { members, dropped };
+    this.handlerMembers.set(type, listed);
+    return listed;
   }
 
   private listSignatures(signatures: readonly ts.Signature[], holder: ts.Type, take: () => boolean): SurfaceSignature[] {
@@ -3759,7 +4097,7 @@ class DeclarationReader {
         params.push(param);
       }
       const entry: SurfaceSignature = { params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) };
-      const candidates = resultCandidatesOf(this.checker, signature);
+      const candidates = this.listResultCandidates ? resultCandidatesOf(this.checker, signature) : undefined;
       if (candidates !== undefined) entry.result_candidates = candidates;
       listed.push(entry);
     }
@@ -3810,9 +4148,14 @@ class DeclarationReader {
    * so where the cut falls does not depend on where the package is installed.
    */
   private printed(type: ts.Type): string {
+    const known = this.printedTexts.get(type);
+    if (known !== undefined) return known;
+    surfaceReadCounts.typePrints += 1;
     const node = this.checker.typeToTypeNode(type, undefined, PRINT_FLAGS);
     const text = node === undefined ? this.checker.typeToString(type) : printTypeNode(this.orderUnions(node));
-    return truncate(this.scrubbed(text));
+    const listed = truncate(this.scrubbed(text));
+    this.printedTexts.set(type, listed);
+    return listed;
   }
 
   /** `text` with the service root written as `<root>`. */
@@ -3995,7 +4338,10 @@ class DeclarationReader {
   /** Judge the next check as a claim about `pkg`. */
   setPackage(pkg: string): void {
     const named = packageNameOf(pkg);
-    if (named !== this.currentPackage) this.declared.clear();
+    if (named !== this.currentPackage) {
+      this.declared.clear();
+      this.handlerMembers.clear();
+    }
     this.currentPackage = named;
   }
 
@@ -4315,6 +4661,32 @@ class DeclarationReader {
  */
 /** The longest member path a handler parameter's members are listed to (`['raw', 'url']`). */
 const HANDLER_MEMBER_DEPTH = 2;
+/**
+ * The most members one handler parameter lists (carrick#2966), top-level
+ * first. The store's server question shows at most 300 of them in the same
+ * order, so this must stay at least that.
+ */
+const HANDLER_MEMBER_CAP = 500;
+
+/**
+ * The most handler-parameter members one `listSurface` call lists, across all
+ * its specifiers (carrick#3016). The answer is one JSON line and a string
+ * passes V8's limit at about 512 MiB; a member costs about 150 bytes, so this
+ * keeps the handlers near 75 MB beside an export listing of tens of MB. A
+ * server framework handing 50 distinct request types to thousands of members
+ * listed 8.99 million of them (1.3 GB) before it.
+ */
+const HANDLER_LISTING_BUDGET = 500_000;
+
+/** What a surface listing adds beyond the hashed surface, each only when asked (carrick#2966). */
+export interface SurfaceOptions {
+  /** Each member's `handlers` (carrick#2674 S3). */
+  handlers?: boolean;
+  /** Each signature's `result_candidates` (carrick#2817). */
+  resultCandidates?: boolean;
+  /** Handler-parameter members the whole call may list (default `HANDLER_LISTING_BUDGET`, carrick#3016). */
+  maxHandlerMembers?: number;
+}
 
 const PRINT_FLAGS =
   ts.NodeBuilderFlags.AllowUniqueESSymbolType |

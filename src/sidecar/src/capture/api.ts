@@ -255,6 +255,11 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    into a function that builds the request body from it, and the body that
  *    function builds cannot be typed, so the argument is not the body and no
  *    contract is published (carrick#2628).
+ *  - `reshaped_by_callback`: a consumer call's untyped result is handed
+ *    unread to a callback in its chain (`.mapOk`, `.then`, `.andThen`, any
+ *    name) that builds a new value from it, and nothing in the chain states
+ *    the body, so the value the chain ends in is not the response the call
+ *    receives and no contract is published (carrick#3004).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -270,6 +275,7 @@ export type TypeProvenanceReason =
   | 'projected_value_only'
   | 'serialised_body_unread'
   | 'body_built_by_callee'
+  | 'reshaped_by_callback'
   | 'result_member_missing'
   | 'not_recorded';
 
@@ -418,8 +424,12 @@ export interface CaptureStubResult {
   /** Number of emitted specifiers rewritten by the post-emit pass
    * (tsconfig-paths mappings and absolute internal import types). */
   specifier_rewrites: number;
-  /** True when the source repo had no node_modules at capture time. */
+  /** True when the source repo had no node_modules at capture time, or a
+   * dependency its package.json declares does not resolve from the service
+   * root (carrick#2999). */
   bare_checkout: boolean;
+  /** The first few declared dependencies that did not resolve, sorted. */
+  unresolved_dependencies: string[];
   ts_version: string;
   errors: string[];
 }
